@@ -38,7 +38,7 @@ impl ContextId {
         }
     }
 
-    pub fn id(&self) -> u64 {
+    pub fn hash(&self) -> u64 {
         self.id
     }
 }
@@ -148,8 +148,8 @@ mod tests {
         let a = root.new_child();
         let b = a.new_child();
         let c = b.new_child();
-        assert_ne!(a.id(), b.id());
-        assert_ne!(b.id(), c.id());
-        assert_ne!(a.id(), c.id());
+        assert_ne!(a.hash(), b.hash());
+        assert_ne!(b.hash(), c.hash());
+        assert_ne!(a.hash(), c.hash());
     }
 }

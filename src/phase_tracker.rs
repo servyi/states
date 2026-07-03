@@ -30,7 +30,7 @@ where
     P: PartialEq + Debug + Clone + Send + Sync,
 {
     fn advance(&self, ctx: &ContextId, from: Option<P>, to: P) {
-        let id = ctx.id();
+        let id = ctx.hash();
         let _ = self
             .phases
             .entry(id)
@@ -55,7 +55,7 @@ where
     }
 
     fn expect_any_and_set(&self, ctx: &ContextId, valid_from: &[P], to: P) {
-        let id = ctx.id();
+        let id = ctx.hash();
         self.phases
             .entry(id)
             .and_modify(|phase| {
@@ -71,7 +71,7 @@ where
     }
 
     fn get_phase(&self, ctx: &ContextId) -> Option<P> {
-        self.phases.get(&ctx.id()).map(|g| (*g.value()).clone())
+        self.phases.get(&ctx.hash()).map(|g| (*g.value()).clone())
     }
 }
 
