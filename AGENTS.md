@@ -9,7 +9,7 @@
 ## ContextId Rules
 
 - **`ContextId` Clone is illegal.** Cloning resets `child_counter`, producing duplicate child IDs. There is no `Clone` impl and there must never be one.
-- **`PhaseTracker` uses `u64` keys** (from `ctx.id()`), not `&ContextId`.
+- **`PhaseTracker` uses `u64` keys** (from `ctx.hash()`), not `&ContextId`.
 
 ## Tracing Rules
 

@@ -83,3 +83,68 @@ where
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context_id::ContextId;
+
+    #[test]
+    fn test_advance_from_none() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let ctx = root.new_child();
+        tracker.advance(&ctx, None, "open");
+        assert_eq!(tracker.get_phase(&ctx), Some("open"));
+    }
+
+    #[test]
+    fn test_advance_with_correct_from() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let ctx = root.new_child();
+        tracker.advance(&ctx, None, "open");
+        tracker.advance(&ctx, Some("open"), "closed");
+        assert_eq!(tracker.get_phase(&ctx), Some("closed"));
+    }
+
+    #[test]
+    #[should_panic(expected = "expected phase")]
+    fn test_advance_wrong_from_panics() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let ctx = root.new_child();
+        tracker.advance(&ctx, None, "open");
+        tracker.advance(&ctx, Some("wrong"), "closed");
+    }
+
+    #[test]
+    fn test_expect_any_and_set() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let ctx = root.new_child();
+        tracker.advance(&ctx, None, "open");
+        tracker.expect_any_and_set(&ctx, &["open", "retry"], "done");
+        assert_eq!(tracker.get_phase(&ctx), Some("done"));
+    }
+
+    #[test]
+    fn test_get_phase_absent() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let ctx = root.new_child();
+        assert_eq!(tracker.get_phase(&ctx), None);
+    }
+
+    #[test]
+    fn test_multiple_contexts_independent() {
+        let tracker = DefaultPhaseTracker::<&str>::new();
+        let root = ContextId::root();
+        let a = root.new_child();
+        let b = root.new_child();
+        tracker.advance(&a, None, "phase_a");
+        tracker.advance(&b, None, "phase_b");
+        assert_eq!(tracker.get_phase(&a), Some("phase_a"));
+        assert_eq!(tracker.get_phase(&b), Some("phase_b"));
+    }
+}

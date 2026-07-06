@@ -6,24 +6,13 @@ use dashmap::DashMap;
 use tracing::field::Visit;
 use tracing_subscriber::layer::Layer;
 
+#[derive(Clone)]
 pub struct LogEntry {
     pub seq: u64,
     pub level: tracing::Level,
     pub target: String,
     pub message: String,
     pub fields: Vec<(String, String)>,
-}
-
-impl Clone for LogEntry {
-    fn clone(&self) -> Self {
-        Self {
-            seq: self.seq,
-            level: self.level,
-            target: self.target.clone(),
-            message: self.message.clone(),
-            fields: self.fields.clone(),
-        }
-    }
 }
 
 pub struct MessageLog {
@@ -119,23 +108,28 @@ impl Visit for EventVisitor {
     }
 
     fn record_u64(&mut self, field: &tracing::field::Field, value: u64) {
-        self.fields.push((field.name().to_string(), value.to_string()));
+        let name = normalize_field_name(field.name());
+        self.fields.push((name.to_string(), value.to_string()));
     }
 
     fn record_i64(&mut self, field: &tracing::field::Field, value: i64) {
-        self.fields.push((field.name().to_string(), value.to_string()));
+        let name = normalize_field_name(field.name());
+        self.fields.push((name.to_string(), value.to_string()));
     }
 
     fn record_bool(&mut self, field: &tracing::field::Field, value: bool) {
-        self.fields.push((field.name().to_string(), value.to_string()));
+        let name = normalize_field_name(field.name());
+        self.fields.push((name.to_string(), value.to_string()));
     }
 
     fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
-        self.fields.push((field.name().to_string(), value.to_string()));
+        let name = normalize_field_name(field.name());
+        self.fields.push((name.to_string(), value.to_string()));
     }
 
     fn record_bytes(&mut self, field: &tracing::field::Field, value: &[u8]) {
-        self.fields.push((field.name().to_string(), format!("{:?}", value)));
+        let name = normalize_field_name(field.name());
+        self.fields.push((name.to_string(), format!("{:?}", value)));
     }
 }
 

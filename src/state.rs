@@ -63,3 +63,49 @@ where
     let results = try_join_all(futures).await?;
     state.collect(results).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Increment(u32);
+    #[async_trait]
+    impl State<u32> for Increment {
+        async fn execute(self: Box<Self>) -> Result<Step<u32>> {
+            if self.0 > 0 {
+                Ok(Step::Continue(Box::new(Increment(self.0 - 1))))
+            } else {
+                Ok(Step::Done(42))
+            }
+        }
+    }
+
+    #[test]
+    fn test_run_to_completion_linear() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(run_to_completion(Box::new(Increment(3))));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[test]
+    fn test_run_to_completion_immediate() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(run_to_completion(Box::new(Increment(0))));
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    struct FailState;
+    #[async_trait]
+    impl State<()> for FailState {
+        async fn execute(self: Box<Self>) -> Result<Step<()>> {
+            anyhow::bail!("intentional failure")
+        }
+    }
+
+    #[test]
+    fn test_state_error_propagates() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(run_to_completion::<()>(Box::new(FailState)));
+        assert!(result.is_err());
+    }
+}
