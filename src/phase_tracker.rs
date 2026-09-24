@@ -47,8 +47,7 @@ where
             .or_insert_with(|| {
                 assert!(
                     from.is_none(),
-                    "{ctx} expected phase {:?} but was absent",
-                    from.as_ref().unwrap(),
+                    "{ctx} expected phase {from:?} but was absent",
                 );
                 to
             });
@@ -56,7 +55,8 @@ where
 
     fn expect_any_and_set(&self, ctx: &ContextId, valid_from: &[P], to: P) {
         let id = ctx.hash();
-        self.phases
+        let _entry = self
+            .phases
             .entry(id)
             .and_modify(|phase| {
                 assert!(
