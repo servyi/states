@@ -498,7 +498,8 @@ where
             // already running and dereferencing their own leases; what
             // makes that sound is that split items are disjoint, not any
             // sequencing here.
-            #[allow(clippy::dropping_reference)] // deliberate: marks the borrow's end for readers and from_raw's contract
+            #[allow(unknown_lints)]
+            #[allow(clippy::dropping_references)] // deliberate: marks the borrow's end for readers and from_raw's contract
             drop(child);
             // SAFETY: `raw` derives from the dropped exclusive borrow; the
             // pair's pointer is only read through child guards while the
