@@ -63,7 +63,7 @@ impl MessageLog {
     }
 
     pub fn set_status(&self, context_id: String, status: String) {
-        self.statuses.insert(context_id, status);
+        let _previous = self.statuses.insert(context_id, status);
     }
 
     pub fn get_status(&self, context_id: &str) -> Option<String> {

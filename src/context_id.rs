@@ -23,7 +23,7 @@ impl ContextId {
 
     pub fn new_child(&self) -> ContextId {
         let child_num = {
-            let mut counter = self.child_counter.lock().unwrap();
+            let mut counter = self.child_counter.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let val = *counter;
             *counter += 1;
             val
