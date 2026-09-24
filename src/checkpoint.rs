@@ -434,6 +434,14 @@ impl<'n, T> Handle<'n, T> {
 // -----------------------------------------------------------------------------
 // Fan-out
 
+/// Consume a split item's `&mut T` and hand back the raw pointer it
+/// leases: the borrow provably ends when this call returns (the parameter
+/// is taken by value and dropped here), which is the explicit
+/// end-of-borrow `Handle::from_raw`'s contract demands.
+fn end_of_borrow<T>(child: &mut T) -> *mut T {
+    child as *mut T
+}
+
 /// Nested-fan-out entry point: like [`fanout`], but the node is behind a
 /// handle leased to this thread by an enclosing fanout. Materializing the
 /// `&mut N` is sound because this thread holds the exclusive lease (the
@@ -490,17 +498,14 @@ where
         let mut joins: Vec<Option<thread::ScopedJoinHandle<'_, R>>> = Vec::new();
         for child in split(node) {
             // One raw pointer is the entire bridge: the pair's read view
-            // and the worker's lease both derive from it.
-            let raw: *mut T = child;
-            // The `&mut T` must be DROPPED — not merely unused — before the
-            // worker can reference through its handle, hence the explicit
-            // drop BEFORE the spawn. Workers from earlier iterations are
-            // already running and dereferencing their own leases; what
-            // makes that sound is that split items are disjoint, not any
-            // sequencing here.
-            #[allow(unknown_lints)]
-            #[allow(clippy::dropping_references)] // deliberate: marks the borrow's end for readers and from_raw's contract
-            drop(child);
+            // and the worker's lease both derive from it. Consume the
+            // `&mut T` through a by-value parameter: the borrow is DROPPED
+            // at the end of that call — explicitly, before the spawn —
+            // which is from_raw's contract. Workers from earlier
+            // iterations are already running and dereferencing their own
+            // leases; what makes that sound is that split items are
+            // disjoint, not any sequencing here.
+            let raw: *mut T = end_of_borrow(child);
             // SAFETY: `raw` derives from the dropped exclusive borrow; the
             // pair's pointer is only read through child guards while the
             // child is parked, and the lease outlives the worker only

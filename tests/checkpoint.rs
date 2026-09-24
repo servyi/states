@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used, clippy::panic, unused_results)]
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -172,10 +173,10 @@ fn drive(
     checkpoint: Option<(Duration, std::path::PathBuf)>,
 ) {
     let mut cp = Checkpointer::new();
+    let node_ptr = machine as *const Machine;
     // SAFETY: `machine` is borrowed for the whole of `drive`, and the only
     // mutators are this thread (between `safepoint` calls) and, during
     // fan-outs, parked subtasks. The requester dies with this frame.
-    let node_ptr = machine as *const Machine;
     let requester = unsafe { CheckpointRequester::from_node_ptr(node_ptr, &cp) };
     let req = requester.clone();
 
@@ -247,6 +248,8 @@ fn snapshotter_reads_live_tree_through_guard() {
     let mut machine = 41u32;
     let mut cp = Checkpointer::new();
     let raw = &machine as *const u32;
+    // SAFETY: `machine` is only mutated by the scoped mutifier thread,
+    // which parks at its safepoints while the guard below is live.
     let req = unsafe { CheckpointRequester::from_node_ptr(raw, &cp) };
     let (observed, final_v) = std::thread::scope(|scope| {
         let mutifier = scope.spawn(|| {
