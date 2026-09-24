@@ -83,6 +83,10 @@ use serde::Serialize;
 
 struct Shared {
     pending_request: AtomicBool,
+    /// Set when the owning (child) checkpointer is dropped: a child that
+    /// finishes never parks, and a parent waiting to park it must see this
+    /// instead of blocking forever.
+    closed: AtomicBool,
     /// Poisoning invariant: only pure bool stores/loads and condvar waits
     /// run under this lock — no code that can panic ever holds it, so the
     /// lock cannot be poisoned and the `expect`s below are unreachable.
@@ -95,6 +99,7 @@ impl Shared {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             pending_request: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
             parked: Mutex::new(false),
             park_cv: Condvar::new(),
             resume_cv: Condvar::new(),
@@ -118,6 +123,41 @@ impl Shared {
     fn wait_resume<'g>(&self, parked: std::sync::MutexGuard<'g, bool>) -> std::sync::MutexGuard<'g, bool> {
         self.resume_cv.wait(parked).expect("parked handshake: see lock_parked's invariant")
     }
+
+    /// Request a stop and wait until this side parks — or until it closes
+    /// (a finished child never parks). Returns false when closed.
+    fn request_until_parked_or_closed(&self) -> bool {
+        self.pending_request.store(true, Ordering::SeqCst);
+        let mut parked = self.lock_parked();
+        loop {
+            if self.closed.load(Ordering::SeqCst) {
+                return false;
+            }
+            if *parked {
+                return true;
+            }
+            parked = self.wait_park(parked);
+        }
+    }
+
+    /// Release a request: wake the parked side and wait until it has
+    /// resumed. Shared by the guard's drop and by parents releasing their
+    /// children (see lock_parked's invariant).
+    fn release_request(&self) {
+        let mut parked = self.lock_parked();
+        self.pending_request.store(false, Ordering::SeqCst);
+        self.resume_cv.notify_all();
+        while *parked && !self.closed.load(Ordering::SeqCst) {
+            parked = self.wait_park(parked);
+        }
+    }
+
+    /// Mark this side closed and wake anyone waiting for it to park.
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        let _guard = self.lock_parked();
+        self.park_cv.notify_all();
+    }
 }
 
 /// Mutator side of the pair. Stays with the thread that owns or leases the
@@ -126,6 +166,10 @@ impl Shared {
 /// while parked (they are all tied to borrows of the checkpointer).
 pub struct Checkpointer<'n> {
     shared: Arc<Shared>,
+    /// Subtree pairs registered by an enclosing `fanout`: parking this
+    /// checkpointer first parks (or deregisters, once closed) every child
+    /// subtree, so a guard at this level sees a fully quiesced tree.
+    children: Vec<Arc<Shared>>,
     _brand: PhantomData<fn() -> &'n ()>,
 }
 
@@ -137,7 +181,14 @@ impl<'n> Default for Checkpointer<'n> {
 
 impl<'n> Checkpointer<'n> {
     fn from_shared(shared: Arc<Shared>) -> Self {
-        Self { shared, _brand: PhantomData }
+        Self { shared, children: Vec::new(), _brand: PhantomData }
+    }
+
+    /// Register a child subtree's pair: `safepoint`/`park_self` on this
+    /// checkpointer will stop the child first. Deregistered automatically
+    /// once the child closes (its worker finished).
+    fn register_child(&mut self, child: Arc<Shared>) {
+        self.children.push(child);
     }
 
     pub fn new() -> Self {
@@ -158,6 +209,11 @@ impl<'n> Checkpointer<'n> {
     }
 
     fn park_self(&mut self) {
+        // Stop the world bottom-up: request+wait every open child subtree
+        // first (children that already finished are deregistered), then
+        // park this thread. A guard taken at this level therefore sees the
+        // whole subtree quiesced.
+        self.children.retain(|child| child.request_until_parked_or_closed());
         let mut parked = self.shared.lock_parked();
         *parked = true;
         self.shared.park_cv.notify_all();
@@ -166,12 +222,19 @@ impl<'n> Checkpointer<'n> {
         }
         *parked = false;
         self.shared.park_cv.notify_all();
+        // Resume the children only after this thread is running again.
+        for child in &self.children {
+            child.release_request();
+        }
     }
 
-    /// The shared read accessor of the pair: shared borrow blocks the
+
+/// The shared read accessor of the pair: shared borrow blocks the
     /// snapshotter on this thread (a guard's `&T` and a worker's use of the
     /// same checkpointer are mutually exclusive through `Shared`).
     pub fn block_and_get<'a, T>(&'a self, h: &'a Handle<'n, T>) -> &'a T {
+        // SAFETY: the guard proving every mutator is parked borrows this
+        // checkpointer; a live `&Handle` means its worker is parked too.
         unsafe { &*h.ptr }
     }
 
@@ -179,6 +242,8 @@ impl<'n> Checkpointer<'n> {
     /// checkpointer is needed: exclusivity comes from the `&'a mut Handle<T>`
     /// (exactly one exists per child).
     pub fn block_and_get_mut<'a, T>(&'a self, h: &'a mut Handle<'n, T>) -> &'a mut T {
+        // SAFETY: same parking proof as `block_and_get`; the `&mut Handle`
+        // is the unique lease, so the returned `&mut` is exclusive.
         unsafe { &mut *h.ptr }
     }
 }
@@ -196,7 +261,10 @@ pub struct CheckpointRequester<'a, T> {
 // or sharing the requester itself touches no node data, so no `T` bounds
 // are needed. Concurrent `request`s still require external mutual
 // exclusion (see `request` docs).
+// SAFETY: see the block comment above — the pointer is only dereferenced
+// through a guard; moving/sharing the requester touches no node data.
 unsafe impl<'a, T> Send for CheckpointRequester<'a, T> {}
+// SAFETY: as Send above.
 unsafe impl<'a, T> Sync for CheckpointRequester<'a, T> {}
 
 impl<'a, T> Clone for CheckpointRequester<'a, T> {
@@ -243,6 +311,11 @@ impl<'a, T> CheckpointRequester<'a, T> {
     /// Like [`request`](Self::request), but gives up after `timeout`. Giving
     /// up is safe: a mutator that saw the request parks only while the stop
     /// flag is set, and re-checks it before waiting.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the handshake lock is poisoned — see the invariant
+    /// on `Shared::parked` (nothing that can panic holds it).
     pub fn request_timeout(&self, timeout: Duration) -> Option<CheckpointGuard<'_, T>> {
         self.shared.pending_request.store(true, Ordering::SeqCst);
         let mut parked = self.shared.lock_parked();
@@ -288,21 +361,15 @@ impl<'a, T> CheckpointGuard<'a, T> {
     /// provably holds no references, and `node` outlives the requester's
     /// `'a` brand.
     pub fn node(&self) -> &'a T {
+        // SAFETY: a live guard proves every mutator that could reach the
+        // node is parked; the node outlives the requester's `'a` brand.
         unsafe { &*self.node }
     }
 }
 
 impl<'a, T> Drop for CheckpointGuard<'a, T> {
     fn drop(&mut self) {
-        // Flag update and notify must be atomic with the parked thread's
-        // check-then-wait (both under the `parked` mutex), otherwise the
-        // wakeup can be lost between the waiter's check and its wait.
-        let mut parked = self.shared.lock_parked();
-        self.shared.pending_request.store(false, Ordering::SeqCst);
-        self.shared.resume_cv.notify_all();
-        while *parked {
-            parked = self.shared.wait_park(parked);
-        }
+        self.shared.release_request();
     }
 }
 
@@ -330,24 +397,37 @@ pub struct Handle<'s, T> {
     _brand: PhantomData<fn(&'s mut ()) -> &'s T>,
 }
 
+// SAFETY: closing only touches atomics; it must wake, not touch data.
+impl Drop for Checkpointer<'_> {
+    fn drop(&mut self) {
+        // A parent waiting to park this subtree must observe the close
+        // instead of blocking on a park that will never come.
+        self.shared.close();
+    }
+}
+
+// SAFETY: the handle's pointer is only dereferenced by its owning worker
+// (one lease per split item); moving it to that worker touches no data.
 unsafe impl<'s, T: Send> Send for Handle<'s, T> {}
 
 impl<'n, T> Handle<'n, T> {
-    /// The unsafe bridge from the design: turn a freshly split `&mut T` into
-    /// a Handle by mapping over a `*mut T`. There is no constructor from a
-    /// bare `*mut T`.
+    /// The unsafe bridge from the design: turn a raw pointer derived from
+    /// a split item into a Handle. Crate-internal on purpose — the safety
+    /// argument (the `&mut T` is explicitly dropped before the worker can
+    /// reference through the handle, and split items are disjoint) is made
+    /// at the `fanout` call site where those facts are visible.
     ///
     /// # Safety
     ///
-    /// - The original `&mut T` must be **dropped** — not merely unused —
-    ///   before any reference is obtained through the returned `Handle`.
+    /// - `ptr` must derive from a split item whose `&mut T` has been
+    ///   **dropped** — not merely unused — before the handle is referenced.
     /// - The child may be reached through the parent node or another path
     ///   only while the `Handle` provably holds no live reference (i.e.,
     ///   outside any `block_and_get` / `block_and_get_mut` borrow).
     /// - `'s` must not outlive the lease; `fanout` instantiates it as its
     ///   thread scope.
-    unsafe fn from_split_child<'s>(child: &mut T) -> Handle<'s, T> {
-        Handle { ptr: child as *mut T, _brand: PhantomData }
+    pub(crate) unsafe fn from_raw<'s>(ptr: *mut T) -> Handle<'s, T> {
+        Handle { ptr, _brand: PhantomData }
     }
 }
 
@@ -371,6 +451,9 @@ where
     T: Serialize + Send + 'n,
     R: Send + Serialize,
 {
+    // SAFETY: this thread holds the exclusive lease (the enclosing fanout
+    // will not touch the node until this subtask returns); materializing
+    // the `&mut N` from the raw pointer is the lease's whole purpose.
     let node: &'n mut N = unsafe { &mut *h.ptr };
     fanout(node, cp, split, action)
 }
@@ -385,6 +468,10 @@ where
 /// requests on its own checkpointer: it parks the whole subtree (taking
 /// guards on the child requesters) before parking itself, so the
 /// snapshotter's guard sees a fully quiesced tree.
+/// # Panics
+///
+/// Propagates (re-unwinds) a panicked child subtask, and panics only if a
+/// handshake lock is poisoned — see the invariant on `Shared::parked`.
 pub fn fanout<'n, N, I, T, R, F>(
     node: &'n mut N,
     cp: &mut Checkpointer<'_>,
@@ -402,21 +489,28 @@ where
         let mut child_requesters: Vec<CheckpointRequester<'n, T>> = Vec::new();
         let mut joins: Vec<Option<thread::ScopedJoinHandle<'_, R>>> = Vec::new();
         for child in split(node) {
-            // Pair for the child, built from a raw pointer so no shared
-            // borrow of `child` is held (the child stays exclusively
-            // borrowed by the split item for the handle bridge below).
+            // One raw pointer is the entire bridge: the pair's read view
+            // and the worker's lease both derive from it.
+            let raw: *mut T = child;
+            // The `&mut T` must be DROPPED — not merely unused — before the
+            // worker can reference through its handle, hence the explicit
+            // drop BEFORE the spawn. Workers from earlier iterations are
+            // already running and dereferencing their own leases; what
+            // makes that sound is that split items are disjoint, not any
+            // sequencing here.
+            #[allow(clippy::dropping_reference)] // deliberate: marks the borrow's end for readers and from_raw's contract
+            drop(child);
+            // SAFETY: `raw` derives from the dropped exclusive borrow; the
+            // pair's pointer is only read through child guards while the
+            // child is parked, and the lease outlives the worker only
+            // inside this thread scope.
+            let h: Handle<'_, T> = unsafe { Handle::from_raw(raw) };
             let shared = Shared::new();
             let child_cp = Checkpointer::from_shared(shared.clone());
-            child_requesters.push(CheckpointRequester::from_raw_parts(
-                child as *const T,
-                shared,
-            ));
-            // SAFETY: `child` (the iterator item) is converted to the lease
-            // here and dropped with this iteration; the `&mut T` is gone
-            // before any reference through the handle exists. The
-            // `&const`-typed raw pointer above is only dereferenced via
-            // child guards that exist exclusively while the child is parked.
-            let h: Handle<'_, T> = unsafe { Handle::from_split_child(child) };
+            child_requesters.push(CheckpointRequester::from_raw_parts(raw, shared.clone()));
+            // Parking THIS checkpointer now parks the child subtree first;
+            // a child that finishes closes its pair and is deregistered.
+            cp.register_child(shared);
             joins.push(Some(scope.spawn(move || action(h, child_cp))));
         }
 
@@ -424,20 +518,10 @@ where
         let mut results: Vec<Option<R>> = (0..n).map(|_| None).collect();
         loop {
             if cp.is_stop_requested() {
-                let mut guards = Vec::new();
-                for (i, creq) in child_requesters.iter().enumerate() {
-                    if results[i].is_none() {
-                        if let Some(g) = wait_child_park(creq, &mut joins[i]) {
-                            guards.push(g);
-                        } else {
-                            let r =
-                                joins[i].take().expect("present").join().expect("child panicked");
-                            results[i] = Some(r);
-                        }
-                    }
-                }
+                // Parking this checkpointer stops the whole subtree first
+                // (children are registered above); results collection stays
+                // purely completion-driven below.
                 cp.park_self();
-                drop(guards);
                 continue;
             }
 
@@ -446,8 +530,15 @@ where
                 if results[i].is_none() {
                     if let Some(h) = j.as_mut() {
                         if h.is_finished() {
-                            results[i] =
-                                Some(j.take().expect("present").join().expect("child panicked"));
+                            if let Some(handle) = j.take() {
+                                results[i] = match handle.join() {
+                                    Ok(r) => Some(r),
+                                    // A panicked child must unwind the
+                                    // parent too — the snapshot protocol
+                                    // has no sane way to continue.
+                                    Err(payload) => std::panic::resume_unwind(payload),
+                                };
+                            }
                         }
                     }
                 }
@@ -460,27 +551,9 @@ where
             }
             thread::sleep(Duration::from_millis(1));
         }
-        results.into_iter().map(|r| r.expect("collected")).collect()
+        results
+            .into_iter()
+            .map(|r| r.expect("the all_done exit guarantees every slot was filled"))
+            .collect()
     })
 }
-
-/// Collect a child's park guard, tolerating the child having finished (and
-/// therefore never parking): bounded requests, re-checking thread liveness
-/// on timeout. Giving up a request is wakeup-safe (the child re-checks the
-/// stop flag before waiting).
-fn wait_child_park<'r, T, R>(
-    creq: &'r CheckpointRequester<'_, T>,
-    j: &mut Option<thread::ScopedJoinHandle<'_, R>>,
-) -> Option<CheckpointGuard<'r, T>> {
-    loop {
-        if let Some(h) = j.as_ref() {
-            if h.is_finished() {
-                return None;
-            }
-        }
-        if let Some(g) = creq.request_timeout(Duration::from_millis(20)) {
-            return Some(g);
-        }
-    }
-}
-
