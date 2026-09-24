@@ -18,7 +18,7 @@ impl Io {
         Self { calls: Arc::new(AtomicUsize::new(0)), step_delay: Duration::from_millis(0) }
     }
 
-    fn step(&self, id: u32) {
+    fn step(&self, _id: u32) {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if !self.step_delay.is_zero() {
             std::thread::sleep(self.step_delay);
@@ -175,8 +175,8 @@ fn drive(
     // SAFETY: `machine` is borrowed for the whole of `drive`, and the only
     // mutators are this thread (between `safepoint` calls) and, during
     // fan-outs, parked subtasks. The requester dies with this frame.
-    let requester =
-        unsafe { CheckpointRequester::from_node_ptr(machine as *const Machine, &cp) };
+    let node_ptr = machine as *const Machine;
+    let requester = unsafe { CheckpointRequester::from_node_ptr(node_ptr, &cp) };
     let req = requester.clone();
 
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -246,7 +246,8 @@ fn freeze_window_allows_access_then_safepoint() {
 fn snapshotter_reads_live_tree_through_guard() {
     let mut machine = 41u32;
     let mut cp = Checkpointer::new();
-    let req = unsafe { CheckpointRequester::from_node_ptr(&machine as *const u32, &cp) };
+    let raw = &machine as *const u32;
+    let req = unsafe { CheckpointRequester::from_node_ptr(raw, &cp) };
     let (observed, final_v) = std::thread::scope(|scope| {
         let mutifier = scope.spawn(|| {
             for _ in 0..50 {

@@ -83,6 +83,9 @@ use serde::Serialize;
 
 struct Shared {
     stop: AtomicBool,
+    /// Poisoning invariant: only pure bool stores/loads and condvar waits
+    /// run under this lock — no code that can panic ever holds it, so the
+    /// lock cannot be poisoned and the `expect`s below are unreachable.
     parked: Mutex<bool>,
     park_cv: Condvar,
     resume_cv: Condvar,
@@ -137,11 +140,11 @@ impl<'n> Checkpointer<'n> {
     }
 
     fn park_self(&mut self) {
-        let mut parked = self.shared.parked.lock().unwrap();
+        let mut parked = self.shared.parked.lock().expect("parked handshake lock: see invariant on Shared::parked");
         *parked = true;
         self.shared.park_cv.notify_all();
         while self.shared.stop.load(Ordering::SeqCst) {
-            parked = self.shared.resume_cv.wait(parked).unwrap();
+            parked = self.shared.resume_cv.wait(parked).expect("parked handshake lock: see invariant on Shared::parked");
         }
         *parked = false;
         self.shared.park_cv.notify_all();
@@ -212,9 +215,9 @@ impl<'a, T> CheckpointRequester<'a, T> {
     /// other's resume.
     pub fn request(&self) -> CheckpointGuard<'_, T> {
         self.shared.stop.store(true, Ordering::SeqCst);
-        let mut parked = self.shared.parked.lock().unwrap();
+        let mut parked = self.shared.parked.lock().expect("parked handshake lock: see invariant on Shared::parked");
         while !*parked {
-            parked = self.shared.park_cv.wait(parked).unwrap();
+            parked = self.shared.park_cv.wait(parked).expect("parked handshake lock: see invariant on Shared::parked");
         }
                 CheckpointGuard { node: self.node, shared: &self.shared, _brand: PhantomData }
     }
@@ -224,7 +227,7 @@ impl<'a, T> CheckpointRequester<'a, T> {
     /// flag is set, and re-checks it before waiting.
     pub fn request_timeout(&self, timeout: Duration) -> Option<CheckpointGuard<'_, T>> {
         self.shared.stop.store(true, Ordering::SeqCst);
-        let mut parked = self.shared.parked.lock().unwrap();
+        let mut parked = self.shared.parked.lock().expect("parked handshake lock: see invariant on Shared::parked");
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if *parked {
@@ -245,7 +248,7 @@ impl<'a, T> CheckpointRequester<'a, T> {
                 .shared
                 .park_cv
                 .wait_timeout(parked, deadline - now)
-                .unwrap();
+                .expect("parked handshake lock: see invariant on Shared::parked");
             parked = g;
         }
     }
@@ -276,11 +279,11 @@ impl<'a, T> Drop for CheckpointGuard<'a, T> {
         // Flag update and notify must be atomic with the parked thread's
         // check-then-wait (both under the `parked` mutex), otherwise the
         // wakeup can be lost between the waiter's check and its wait.
-        let mut parked = self.shared.parked.lock().unwrap();
+        let mut parked = self.shared.parked.lock().expect("parked handshake lock: see invariant on Shared::parked");
         self.shared.stop.store(false, Ordering::SeqCst);
         self.shared.resume_cv.notify_all();
         while *parked {
-            parked = self.shared.park_cv.wait(parked).unwrap();
+            parked = self.shared.park_cv.wait(parked).expect("parked handshake lock: see invariant on Shared::parked");
         }
     }
 }
