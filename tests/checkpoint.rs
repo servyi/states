@@ -223,7 +223,9 @@ fn drive(
             cp.safepoint();
         }
         if let Some((t, _)) = timer {
-            let _joined = t.join();
+            if let Err(payload) = t.join() {
+                std::panic::resume_unwind(payload);
+            }
         }
     });
 }
