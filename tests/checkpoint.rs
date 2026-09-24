@@ -41,22 +41,22 @@ struct AnalyzeState {
     done: Option<String>,
 }
 
-fn run_analyze<'n>(mut h: Handle<'n, AnalyzeState>, mut cp: Checkpointer<'_>, io: &Io) {
+fn run_analyze<'n>(mut h: Handle<'n, AnalyzeState>, mut cp: Checkpointer, io: &Io) {
     loop {
         cp.safepoint();
         let (id, steps) = {
-            let st = h.get();
+            let st = &*h;
             (st.item.id, st.item.steps)
         };
         io.step(id);
         cp.safepoint();
         let finished = {
-            let st = h.get();
+            let st = &mut *h;
             st.step += 1;
             st.step >= steps
         };
         if finished {
-            h.get().done = Some(format!("v{id}"));
+            h.done = Some(format!("v{id}"));
             return;
         }
     }
@@ -69,7 +69,7 @@ struct Group {
 }
 
 
-fn run_group(h: Handle<'_, Group>, mut cp: Checkpointer<'_>, io: &Io) {
+fn run_group<'n>(h: Handle<'n, Group>, mut cp: Checkpointer, io: &Io) {
     fanout_handle(h, &mut cp, |g: &mut Group| g.children.iter_mut(), |a, acp| {
         run_analyze(a, acp, io)
     });
@@ -111,7 +111,7 @@ impl AnalyzeState {
     }
 }
 
-fn step(m: &mut Machine, cp: &mut Checkpointer<'_>, io: &Io) -> bool {
+fn step(m: &mut Machine, cp: &mut Checkpointer, io: &Io) -> bool {
     let mut next: Option<Stage> = None;
     let keep_going = match &mut m.stage {
         Stage::Seq { step } => {
@@ -132,7 +132,9 @@ fn step(m: &mut Machine, cp: &mut Checkpointer<'_>, io: &Io) -> bool {
         }
         Stage::Scatter { children } => {
             fanout(children, cp, |c| c.iter_mut(), |h, c| run_analyze(h, c, io));
-            m.done.extend(children.iter().map(AnalyzeState::result));
+            let collected: Vec<(u32, String)> =
+                children.iter().map(AnalyzeState::result).collect();
+            m.done.extend(collected);
             next = Some(Stage::Nested {
                 groups: vec![
                     Group {
@@ -159,7 +161,8 @@ fn step(m: &mut Machine, cp: &mut Checkpointer<'_>, io: &Io) -> bool {
         }
         Stage::Nested { groups } => {
             fanout(groups, cp, |g| g.iter_mut(), |h, c| run_group(h, c, io));
-            m.done.extend(groups.iter().map(Group::result));
+            let collected: Vec<(u32, String)> = groups.iter().map(Group::result).collect();
+            m.done.extend(collected);
             let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
             m.result = format!("done: {}", ids.join(","));
             next = Some(Stage::Done);
@@ -241,10 +244,9 @@ fn freeze_window_allows_access_then_safepoint() {
     let mut cp = Checkpointer::new();
     let mut children = vec![7u32];
     fanout(&mut children, &mut cp, |c| c.iter_mut(), |mut h, mut ccp| {
-        let a = *h.get();
-        assert_eq!(a, 7);
+        assert_eq!(*h, 7);
         ccp.safepoint();
-        *h.get() += 1;
+        *h += 1;
     });
     assert_eq!(children, vec![8]);
 }
@@ -283,6 +285,46 @@ fn snapshotter_reads_live_tree_through_guard() {
         assert!(w[0] <= w[1], "monotonic guard observations: {observed:?}");
     }
     assert!(observed.iter().all(|v| (41..=91).contains(v)));
+}
+
+#[test]
+fn concurrent_requesters_serialize_instead_of_deadlocking() {
+    let mut machine = 0u32;
+    let mut cp = Checkpointer::new();
+    let raw: *const u32 = &machine;
+    // SAFETY: `machine` is only mutated by the scoped mutifier thread,
+    // which parks at its safepoints under this checkpointer while the
+    // guards below are live; the requester dies before `machine`.
+    let req = unsafe { CheckpointRequester::from_node_ptr(raw, &cp) };
+    let mutifier_done = std::sync::atomic::AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let _mutifier = scope.spawn(|| {
+            for _ in 0..200 {
+                cp.safepoint();
+                machine += 1;
+            }
+            mutifier_done.store(true, Ordering::SeqCst);
+        });
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut last = 0;
+                    for _ in 0..20 {
+                        if let Some(guard) = req.request_timeout(Duration::from_millis(500)) {
+                            let v = *guard.node();
+                            drop(guard);
+                            assert!(v >= last, "observations must be monotonic per reader");
+                            last = v;
+                        }
+                    }
+                })
+            })
+            .collect();
+        for r in readers {
+            r.join().expect("reader");
+        }
+        assert!(mutifier_done.load(Ordering::SeqCst), "mutator must not be starved");
+    });
 }
 
 #[test]
