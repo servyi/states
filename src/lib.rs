@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod context_id;
 pub mod message_log;
 pub mod phase_tracker;
