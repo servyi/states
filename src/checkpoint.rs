@@ -236,9 +236,12 @@ pub struct CheckpointRequester<'a, T> {
 // exists exclusively while every mutator is parked (see `request`);
 // moving or sharing the requester itself touches no node data. Concurrent
 // `request`s still require external mutual exclusion (see `request` docs).
-unsafe impl<'a, T> Send for CheckpointRequester<'a, T> {}
+// SAFETY: the guard reads `T` on the requester's thread while every
+// mutator is parked — the data crosses threads, so `T` must be `Send`.
+unsafe impl<'a, T: Send> Send for CheckpointRequester<'a, T> {}
 // SAFETY: as Send above — the requester itself touches no node data.
-unsafe impl<'a, T> Sync for CheckpointRequester<'a, T> {}
+// SAFETY: as Send — sharing the requester shares no node data.
+unsafe impl<'a, T: Send> Sync for CheckpointRequester<'a, T> {}
 
 impl<'a, T> Clone for CheckpointRequester<'a, T> {
     fn clone(&self) -> Self {
@@ -350,10 +353,11 @@ impl<'a, T> CheckpointGuard<'a, T> {
     /// The top-level node, quiesced: every mutator that could reach it is
     /// parked at a safepoint where it provably holds no references, and
     /// the node outlives the requester's `'a` brand.
-    pub fn node(&self) -> &'a T {
+    pub fn node(&self) -> &T {
         // SAFETY: the guard exists only while the handshake proved every
-        // mutator parked; the node pointer came from the paired
-        // checkpointer's node and outlives `'a`.
+        // mutator parked. The reference is tied to the GUARD (not the
+        // requester's brand): it cannot outlive the guard, so the world
+        // cannot resume underneath it.
         unsafe { &*self.node }
     }
 }
