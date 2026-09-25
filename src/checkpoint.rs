@@ -171,9 +171,9 @@ impl Checkpointer {
     /// the whole tree quiesced. Deregistered automatically once the child
     /// is dropped (a finished worker never parks).
     pub fn create_child(&mut self) -> Checkpointer {
-        let shared = Shared::new();
-        self.children.push(shared.clone());
-        Checkpointer { shared, children: Vec::new() }
+        let child = Self::new();
+        self.children.push(Arc::clone(&child.shared));
+        child
     }
 
     /// Park while a checkpoint has been requested, then return. Call only
@@ -200,7 +200,7 @@ impl Checkpointer {
         let mut parked = self.shared.lock_parked();
         *parked = true;
         self.shared.park_cv.notify_all();
-        while self.shared.is_pending() {
+        while self.is_stop_requested() {
             parked = self.shared.wait_resume(parked);
         }
         *parked = false;
@@ -267,8 +267,9 @@ impl<'a, T> CheckpointRequester<'a, T> {
     /// (the top mutator parks its subtree first) and return a guard with
     /// direct `&T` access to the top-level node. Blocks until parked.
     ///
-    /// Returns `None` if the mutator side is gone (its checkpointer was
-    /// dropped — nothing will ever park). Concurrent `request`s serialize
+    /// A closed pair (mutator side dropped) hands out the guard at once:
+    /// nothing will ever mutate again. Returns `None` only on
+    /// `request_timeout` expiry. Concurrent `request`s serialize
     /// internally: a second request blocks until the first guard is
     /// dropped and the world resumed — no external mutex needed.
     pub fn request(&self) -> Option<CheckpointGuard<'_, T>> {
@@ -288,6 +289,24 @@ impl<'a, T> CheckpointRequester<'a, T> {
     /// The one implementation: take the requester lock (for the whole
     /// lifetime of the returned guard), then run the handshake.
     fn request_impl(&self, timeout: Option<Duration>) -> Option<CheckpointGuard<'_, T>> {
+        // Closed is not a failure: the mutator side is gone and will never
+        // mutate again, so access is free — hand out the guard at once.
+        if self.shared.closed.load(Ordering::SeqCst) {
+            let request_lock = self
+                .shared
+                .request_lock
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if self.shared.is_pending() {
+                self.shared.release_request();
+            }
+            return Some(CheckpointGuard {
+                node: self.node,
+                shared: &self.shared,
+                request_lock,
+                _brand: PhantomData,
+            });
+        }
         // A poisoned lock means a requester panicked mid-guard; the only
         // state under it is the pending flag and the handshake, both plain
         // bools — recover, and reset the world in case it is still stopped
@@ -301,13 +320,13 @@ impl<'a, T> CheckpointRequester<'a, T> {
             self.shared.release_request();
         }
         let guard = match self.shared.request_until_parked(timeout) {
-            Handshake::Parked => CheckpointGuard {
+            Handshake::Parked | Handshake::Closed => CheckpointGuard {
                 node: self.node,
                 shared: &self.shared,
                 request_lock,
                 _brand: PhantomData,
             },
-            Handshake::Closed | Handshake::TimedOut => {
+            Handshake::TimedOut => {
                 drop(request_lock);
                 return None;
             }
@@ -377,20 +396,15 @@ pub struct Handle<'n, T> {
 // data, and `T: Send` covers the data itself.
 unsafe impl<'n, T: Send> Send for Handle<'n, T> {}
 
-impl<'n, T> std::ops::Deref for Handle<'n, T> {
-    type Target = T;
-    fn deref(&self) -> &T {
+impl<'n, T> Handle<'n, T> {
+    /// The leased child, mutably: the exclusive reborrow is tied to
+    /// `&mut self` (the handle's test shape) — no `Deref`/`DerefMut`,
+    /// which would spread access through coercion and let references
+    /// escape into patterns the parking protocol cannot see.
+    pub fn get(&mut self) -> &mut T {
         // SAFETY: `ptr` derives from the exclusive `&'n mut T` consumed in
-        // `new`; the handle is the only remaining path to the child, so a
-        // shared reborrow is unique to this handle.
-        unsafe { &*self.ptr }
-    }
-}
-
-impl<'n, T> std::ops::DerefMut for Handle<'n, T> {
-    fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as `Deref`, but exclusive — only one `&mut self` exists
-        // at a time.
+        // `new`; each call hands out one exclusive reborrow, and the
+        // handle is the only remaining path to the child.
         unsafe { &mut *self.ptr }
     }
 }

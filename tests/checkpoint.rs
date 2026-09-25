@@ -45,18 +45,18 @@ fn run_analyze<'n>(mut h: Handle<'n, AnalyzeState>, mut cp: Checkpointer, io: &I
     loop {
         cp.safepoint();
         let (id, steps) = {
-            let st = &*h;
+            let st = h.get();
             (st.item.id, st.item.steps)
         };
         io.step(id);
         cp.safepoint();
         let finished = {
-            let st = &mut *h;
+            let st = h.get();
             st.step += 1;
             st.step >= steps
         };
         if finished {
-            h.done = Some(format!("v{id}"));
+            h.get().done = Some(format!("v{id}"));
             return;
         }
     }
@@ -244,9 +244,9 @@ fn freeze_window_allows_access_then_safepoint() {
     let mut cp = Checkpointer::new();
     let mut children = vec![7u32];
     fanout(&mut children, &mut cp, |c| c.iter_mut(), |mut h, mut ccp| {
-        assert_eq!(*h, 7);
+        assert_eq!(*h.get(), 7);
         ccp.safepoint();
-        *h += 1;
+        *h.get() += 1;
     });
     assert_eq!(children, vec![8]);
 }
