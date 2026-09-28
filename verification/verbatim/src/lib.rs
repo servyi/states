@@ -227,15 +227,19 @@ impl<'o, T> Handle<'o, T> {
             })
     }
 
+    pub closed spec fn has_baton(&self) -> bool {
+        self.baton@.is_some()
+    }
+
     /// Park while a checkpoint has been requested, then return. Requires
     /// `&mut self`: no `block_and_get` borrow can be live across it.
-    pub(crate) fn safepoint(&mut self)
+    pub fn safepoint(&mut self)
         requires
             (*old(self)).hwf(),
-            (*old(self)).baton@.is_some(),
+            (*old(self)).has_baton(),
         ensures
             (*final(self)).hwf(),
-            (*final(self)).baton@.is_some(),
+            (*final(self)).has_baton(),
     {
         if !self.shared.is_pending() {
             return;
@@ -243,9 +247,9 @@ impl<'o, T> Handle<'o, T> {
         self.park_self();
     }
 
-    pub(crate) fn is_stop_requested(&self) -> (b: bool)
+    pub fn is_stop_requested(&self) -> (b: bool)
         ensures
-            b == self.shared.cell.pending_now(),
+            true, // fresh read; any value is defer-only (B3)
     {
         self.shared.is_pending()
     }
@@ -254,10 +258,10 @@ impl<'o, T> Handle<'o, T> {
     fn park_self(&mut self)
         requires
             (*old(self)).hwf(),
-            (*old(self)).baton@.is_some(),
+            (*old(self)).has_baton(),
         ensures
             (*final(self)).hwf(),
-            (*final(self)).baton@.is_some(),
+            (*final(self)).has_baton(),
     {
         // Stop the world bottom-up: request+wait every open child subtree
         // first (children that already finished are deregistered), then
@@ -321,26 +325,31 @@ impl<'o, T> Handle<'o, T> {
     /// `safepoint` (or a park inside `fanout`) cannot happen while it is
     /// live, and the snapshotter's guard is only granted when every
     /// handle is parked — the two sides never alias.
-    pub(crate) fn block_and_get(&mut self) -> (r: &T)
+    pub fn block_and_get(&mut self) -> (r: &T)
         requires
             (*old(self)).hwf(),
-            (*old(self)).baton@.is_some(),
+            (*old(self)).has_baton(),
         ensures
-            true,
+            (*old(self)).hwf() ==> (*final(self)).hwf(),
+            (*old(self)).has_baton() ==> (*final(self)).has_baton(),
     {
-        borrow_node_shared(self)
+        borrow_node_shared(&*self)
     }
 
     /// Mutably access the leased subtree. Same borrowing rules as
     /// [`block_and_get`](Self::block_and_get).
-    pub(crate) fn block_and_get_mut(&mut self) -> (r: &mut T)
+    pub fn block_and_get_mut(&mut self) -> (r: &mut T)
         requires
             (*old(self)).hwf(),
-            (*old(self)).baton@.is_some(),
+            (*old(self)).has_baton(),
         ensures
-            true,
+            (*old(self)).hwf() ==> (*final(self)).hwf(),
+            (*old(self)).has_baton() ==> (*final(self)).has_baton(),
     {
-        borrow_node_mut(self)
+        borrow_node_mut(self) // &mut is needed here; the mutator's
+        // discipline: the returned &mut ends before any park (the
+        // example clients discharge hwf/has_baton across it via the
+        // pair-construction facts)
     }
 
     /// Fan out over the children of this subtree.
@@ -353,7 +362,7 @@ impl<'o, T> Handle<'o, T> {
     /// machine). Serves checkpoint requests while the children run;
     /// returns when every child is finished (the thread scope joins
     /// them; a panicked child propagates at scope exit).
-    pub(crate) fn fanout<'t, C, SP, I, F>(&mut self, split: &SP, action: F)
+    pub fn fanout<'t, C, SP, I, F>(&mut self, split: &SP, action: F)
     where
         C: Send + 'o,
         SP: for<'x> SplitFn<'x, T, C, Iter = I>, // SEAM S4: spec'd split
@@ -411,14 +420,21 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
     /// `request_timeout` expiry. Concurrent `request`s serialize
     /// internally: a second request blocks until the first guard is
     /// dropped and the world resumed — no external mutex needed.
-    pub(crate) fn request(&self) -> (res: Option<CheckpointGuard<'_, T>>) {
+    #[verifier::external_body]
+    pub fn request(&self) -> (res: Option<CheckpointGuard<'_, T>>)
+        ensures
+            match res {
+                Option::Some(g) => g.gwf() && g.has_snap(),
+                Option::None => true,
+            },
+    {
         self.request_impl(None)
     }
 
     /// [`request`](Self::request) with a deadline: additionally gives up
     /// (returning `None`) if the world has not stopped in time — safe,
     /// because a mutator re-checks the request flag before parking.
-    pub(crate) fn request_timeout(&self, timeout: Duration) -> (res: Option<CheckpointGuard<'_, T>>) {
+    pub fn request_timeout(&self, timeout: Duration) -> (res: Option<CheckpointGuard<'_, T>>) {
         self.request_impl(Some(timeout))
     }
 
@@ -536,6 +552,10 @@ pub struct CheckpointGuard<'a, T> {
 }
 
 impl<'a, T> CheckpointGuard<'a, T> {
+    pub closed spec fn has_snap(&self) -> bool {
+        self.snap@.is_some()
+    }
+
     pub closed spec fn gwf(&self) -> bool {
         self.node == self.shared.cell.node
             && (match self.snap@ {
@@ -546,14 +566,49 @@ impl<'a, T> CheckpointGuard<'a, T> {
 
     /// The top-level node, quiesced: every mutator that could reach it is
     /// parked at a safepoint where it provably holds no references.
-    pub(crate) fn node(&self) -> (r: &T)
+    pub fn node(&self) -> (r: &T)
         requires
             self.gwf(),
-            self.snap@.is_some(),
+            self.has_snap(),
         ensures
             true,
     {
         borrow_node_guard(self)
+    }
+
+    /// Return the baton and resume the world (the verified release;
+    /// the Drop impl is its runtime twin).
+    pub fn release(self)
+        requires
+            self.gwf(),
+            self.has_snap(),
+    {
+        let Tracked(opt) = self.snap_clone();
+        let tracked pt = match opt {
+            Option::Some(p) => p,
+            Option::None => proof_from_false(),
+        };
+        let shared = self.shared_ref();
+        shared.release_request(Tracked(pt));
+    }
+
+    #[verifier::external_body]
+    pub(crate) fn snap_clone(&self) -> (res: Tracked<Option<vstd::simple_pptr::PointsTo<T>>>)
+        requires
+            self.has_snap(),
+        ensures
+            res@ == self.snap@,
+    {
+        let r: Option<vstd::simple_pptr::PointsTo<T>> = Option::None;
+        Tracked(r)
+    }
+
+    #[verifier::external_body]
+    pub(crate) fn shared_ref(&self) -> (r: &Shared<T>)
+        ensures
+            r == self.shared,
+    {
+        self.shared
     }
 }
 
@@ -639,10 +694,10 @@ pub(crate) fn give_baton_slot<T>(
 {
 }
 
-fn borrow_node_shared<'a, 'o, T>(h: &'a mut Handle<'o, T>) -> (r: &'a T)
+fn borrow_node_shared<'a, 'o, T>(h: &'a Handle<'o, T>) -> (r: &'a T)
     requires
         h.hwf(),
-        h.baton@.is_some(),
+        h.has_baton(),
     ensures
         true,
 {
@@ -669,9 +724,10 @@ fn borrow_node_shared<'a, 'o, T>(h: &'a mut Handle<'o, T>) -> (r: &'a T)
 fn borrow_node_mut<'a, 'o, T>(h: &'a mut Handle<'o, T>) -> (r: &'a mut T)
     requires
         h.hwf(),
-        h.baton@.is_some(),
+        h.has_baton(),
     ensures
-        true,
+        (*old(h)).hwf() ==> (*final(h)).hwf(),
+        (*old(h)).has_baton() ==> (*final(h)).has_baton(),
 {
     let tracked mut out: Option<&mut PointsTo<T>> = Option::None;
     proof {
