@@ -19,11 +19,29 @@ interface (`substrate.rs`), each with an unverified std-backed impl:
 `block_and_get(_mut)`, `CheckpointGuard::node`, and the borrow
 discipline (T1: the mutator's `&mut` and the guard's `&` cannot alias).
 
-Open obligations (documented at their sites):
+## Examples: every user-side assumption instantiated
+
+- `examples/split_vec.rs` — `SplitFn` for the canonical shape
+  (`T = Vec<C>`, `iter_mut`): disjoint children with per-child
+  permissions (std slice disjointness as the trusted basis), plus a
+  verified client round trip discharging every `Handle`/guard
+  obligation (`hwf`, `has_baton`, `gwf`, `has_snap`) against the same
+  contracts the shipped code was verified with. 4 verified.
+- `examples/scope_seq.rs` — `ScopeSpec` fully instantiated: a
+  sequential scope where spawns run inline and join before return
+  (trivially satisfying the spec), with a verified client. 3 verified.
+
+Together with `verification/checkpoint`'s `verified_lock` (the lock
+spec from pure atomics), every seam's spec now has a concrete,
+machine-checked instantiation.
+
+## Open obligations (documented at their sites)
+
 - `fanout`'s body: Verus frontend limits (closures capturing `&mut`
   across the scope, `Vec::retain`, ref-to-ptr casts); body is
   `assume(false)`-gated; the serve loop's parking is the same verified
-  `park_self`; split/join facts are the S4/S5 specs.
+  `park_self`; split/join facts are the S4/S5 specs (now instantiated
+  by the examples).
 - `request_impl`'s grant step: two `assume`s for the cross-guard
   ghost-threading (the Parked-exit view facts); argument given in the
   comment (give_baton set guards:=0/banked; requester holds
