@@ -466,4 +466,88 @@ pub open spec fn get_some_baton<T>(o: Option<PointsTo<T>>) -> PointsTo<T> {
 
 fn main() {}
 
+
+// =====================================================================
+// VCondvar: a standalone, fully verified condvar implementing the
+// assumed condvar spec (the same one the protocol substrate uses):
+//
+//   SPEC:  wait(guard) = unlock + [block] + lock;  the state
+//   afterwards is arbitrary but invariant-consistent (a superset of
+//   any real condvar — soundness holds even for total wakeup loss).
+//   notify_all is observationally a no-op (wakeups are hints).
+//
+// Implementation: the obvious one — `put_back` (unlock, discharging
+// the spec's precondition into the invariant) followed by `lock`
+// (re-acquire, whose ensures IS the spec's postcondition). Every
+// obligation is discharged by the two verified lock ops; nothing is
+// trusted. [DEVIATION from the obvious *real* condvar: see the
+// module notes in the final report — this wait never blocks and
+// notify_all does nothing; both are the immediate-spurious-wakeup
+// refinement of a futex condvar.]
+// =====================================================================
+
+pub struct VCondvar {
+    _nothing: (), // the verified model needs no state
+}
+
+impl VCondvar {
+    pub fn new() -> Self {
+        VCondvar { _nothing: () }
+    }
+
+    /// THE condvar spec, on the verified lock's guard.
+    #[verifier::exec_allows_no_decreases_clause]
+    pub fn wait<'a, T>(&self, g: VGuard<'a, T>) -> (g2: VGuard<'a, T>)
+        requires
+            g.wf(),
+            guarded_inv(&g@),
+        ensures
+            g2.lock_ref == g.lock_ref,
+            guarded_inv(&g2@),
+            g2.wf(),
+    {
+        let lock_ref = g.lock_ref; // &'a VLock is Copy
+        g.put_back(); // unlock — the spec's [release] half
+        lock_ref.lock() // re-acquire — ensures guarded_inv (the spec)
+    }
+
+    /// `notify_all`: observationally a no-op (the spec allows any
+    /// wakeup timing, including none; liveness is out of scope).
+    pub fn notify_all(&self)
+    {
+    }
+
+    /// A predicate-filtered wait — the shape the protocol's resume
+    /// side actually needs. [DEVIATION: this is NOT the obvious
+    /// one-liner; the parked-preservation clause forces a re-acquire
+    /// retry loop. See the final report.]
+    #[verifier::exec_allows_no_decreases_clause]
+    pub fn wait_until_parked<'a, T>(&self, g: VGuard<'a, T>) -> (g2: VGuard<'a, T>)
+        requires
+            g.wf(),
+            guarded_inv(&g@),
+        ensures
+            g2.lock_ref == g.lock_ref,
+            g2.wf(),
+            guarded_inv(&g2@),
+            g2@.parked,
+    {
+        let lock_ref = g.lock_ref;
+        g.put_back();
+        loop
+            invariant
+                lock_ref == g.lock_ref,
+                lock_ref.wf(),
+        {
+            let g0 = lock_ref.lock();
+            let (parked, g1) = g0.parked();
+            if parked {
+                assert(g1.lock_ref == lock_ref);
+                return g1;
+            }
+            g1.put_back();
+        }
+    }
+}
+
 } // verus!
