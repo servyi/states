@@ -1,0 +1,151 @@
+=== THREADS ===
+ 719820 futex_do_wait                    repro
+ 719822 -                                repro
+=== FULL BT ===
+Thread 6 (Thread 0x7feda7fb46c0 (LWP 719822) "repro"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000564a3150373b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  0x0000564a314c4a03 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x564a62583e50, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/pois
+#4  0x0000564a314d1534 in repro::checkpoint::Shared::request_until_parked (self=0x564a62583e40, timeout=...) at src/checkpoint.rs:124
+        parked = std::sync::poison::mutex::MutexGuard<bool> {lock: 0x564a62583e48, poison: std::sync::poison::Guard {panicking: false}}
+#5  0x0000564a314be0e0 in repro::checkpoint::CheckpointRequester<repro::Machine>::request_impl<repro::Machine> (self=0x7feda7fb3a30, timeout=...) at src/checkpoint.rs:381
+#6  0x0000564a314be98f in repro::checkpoint::CheckpointRequester<repro::Machine>::request_timeout<repro::Machine> (self=0x7feda7fb3a30, timeout=...) at src/checkpoint.rs:344
+#7  0x0000564a314cf328 in repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure#0} () at src/main.rs:92
+#8  0x0000564a314c4d16 in std::sys::backtrace::__rust_begin_short_backtrace<repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d8
+#9  0x0000564a314c2a42 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c5099
+#10 0x0000564a314ca7f0 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::drive::{closure#0}::{closure#0}::{closure#0}::
+#11 0x0000564a314c3e35 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::drive::{closure#
+#12 0x0000564a314c2dcb in __rust_try ()
+#13 0x0000564a314c20f9 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::drive::{closure#0}::{
+#14 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::drive::{closure#0}::{closure#0}::{closure#0}::{clos
+#15 std::thread::lifecycle::spawn_unchecked::{closure#1}<repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure_env#0}, ()> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src
+#16 0x0000564a314d961e in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure_env#0}, ()>, ()>
+#17 0x0000564a31517dbf in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2319
+#18 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+#19 0x00007feda8082b84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#20 0x00007feda810fecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+Thread 5 (Thread 0x7feda7db36c0 (LWP 730621) "repro"):
+#0  0x00007feda80d2bdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7feda7db2828, rem=0x7feda7db2828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a31514327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a314b8a52 in repro::Io::step (self=0x7ffd273c64b0, _id=1) at src/main.rs:14
+#5  0x0000564a314b73e3 in repro::run_analyze (h=..., io=0x7ffd273c64b0) at src/main.rs:26
+#6  0x0000564a314cfafd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a314bada0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#
+#8  0x0000564a314c4cb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::It
+#9  0x0000564a314c2633 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core:
+#10 0x0000564a314ca790 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{cl
+#11 0x0000564a314c3dd5 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{imp
+#12 0x0000564a314c2dcb in __rust_try ()
+#13 0x0000564a314c1970 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}:
+#14 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure
+#15 std::thread::lifecycle::spawn_unchecked::{closure#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::Analyz
+#16 0x0000564a314d95de in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machi
+#17 0x0000564a31517dbf in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2319
+#18 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+#19 0x00007feda8082b84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#20 0x00007feda810fecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+Thread 4 (Thread 0x7feda7bb26c0 (LWP 730622) "repro"):
+#0  0x00007feda80d2bdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7feda7bb1828, rem=0x7feda7bb1828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a31514327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a314b8a52 in repro::Io::step (self=0x7ffd273c64b0, _id=2) at src/main.rs:14
+#5  0x0000564a314b73e3 in repro::run_analyze (h=..., io=0x7ffd273c64b0) at src/main.rs:26
+#6  0x0000564a314cfafd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a314bada0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#
+#8  0x0000564a314c4cb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::It
+#9  0x0000564a314c2633 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core:
+#10 0x0000564a314ca790 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{cl
+#11 0x0000564a314c3dd5 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{imp
+#12 0x0000564a314c2dcb in __rust_try ()
+#13 0x0000564a314c1970 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}:
+#14 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure
+#15 std::thread::lifecycle::spawn_unchecked::{closure#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::Analyz
+#16 0x0000564a314d95de in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machi
+#17 0x0000564a31517dbf in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2319
+#18 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+#19 0x00007feda8082b84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#20 0x00007feda810fecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+Thread 3 (Thread 0x7feda79ae6c0 (LWP 730623) "repro"):
+#0  0x00007feda80d2bdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7feda79ad828, rem=0x7feda79ad828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a31514327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a314b8a52 in repro::Io::step (self=0x7ffd273c64b0, _id=3) at src/main.rs:14
+#5  0x0000564a314b73e3 in repro::run_analyze (h=..., io=0x7ffd273c64b0) at src/main.rs:26
+#6  0x0000564a314cfafd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a314bada0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#
+#8  0x0000564a314c4cb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::It
+#9  0x0000564a314c2633 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core:
+#10 0x0000564a314ca790 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{cl
+#11 0x0000564a314c3dd5 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{imp
+#12 0x0000564a314c2dcb in __rust_try ()
+#13 0x0000564a314c1970 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}:
+#14 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure
+#15 std::thread::lifecycle::spawn_unchecked::{closure#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::Analyz
+#16 0x0000564a314d95de in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machi
+#17 0x0000564a31517dbf in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2319
+#18 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+#19 0x00007feda8082b84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#20 0x00007feda810fecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+Thread 2 (Thread 0x7feda77ad6c0 (LWP 730624) "repro"):
+#0  0x00007feda80d2bdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7feda77ac828, rem=0x7feda77ac828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a31514327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a314b8a52 in repro::Io::step (self=0x7ffd273c64b0, _id=4) at src/main.rs:14
+#5  0x0000564a314b73e3 in repro::run_analyze (h=..., io=0x7ffd273c64b0) at src/main.rs:26
+#6  0x0000564a314cfafd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a314bada0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#
+#8  0x0000564a314c4cb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::It
+#9  0x0000564a314c2633 in std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core:
+#10 0x0000564a314ca790 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{cl
+#11 0x0000564a314c3dd5 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{imp
+#12 0x0000564a314c2dcb in __rust_try ()
+#13 0x0000564a314c1970 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}:
+#14 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::lifecycle::spawn_unchecked::{closure#1}::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure
+#15 std::thread::lifecycle::spawn_unchecked::{closure#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::Analyz
+#16 0x0000564a314d95de in core::ops::function::FnOnce::call_once<std::thread::lifecycle::spawn_unchecked::{closure_env#1}<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machi
+#17 0x0000564a31517dbf in alloc::boxed::{impl#31}::call_once<(), (dyn core::ops::function::FnOnce<(), Output=()> + core::marker::Send), alloc::alloc::Global> () at library/alloc/src/boxed.rs:2319
+#18 std::sys::thread::unix::{impl#2}::new::thread_start () at library/std/src/sys/thread/unix.rs:123
+#19 0x00007feda8082b84 in start_thread (arg=<optimized out>) at ./nptl/pthread_create.c:447
+#20 0x00007feda810fecc in clone3 () at ../sysdeps/unix/sysv/linux/x86_64/clone3.S:78
+Thread 1 (Thread 0x7feda7fb5780 (LWP 719820) "repro"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000564a31503805 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait () at library/std/src/sys/sync/condvar/futex.rs:33
+#4  0x0000564a314c4bb5 in std::sync::poison::condvar::Condvar::wait<bool> (self=0x564a625b2760, guard=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:128
+#5  0x0000564a314d25e7 in repro::checkpoint::Shared::wait_park (self=0x564a625b2750, parked=...) at src/checkpoint.rs:84
+#6  0x0000564a314d13da in repro::checkpoint::Shared::request_until_parked (self=0x564a625b2750, timeout=...) at src/checkpoint.rs:113
+        parked = std::sync::poison::mutex::MutexGuard<bool> {lock: 0x564a625b2758, poison: std::sync::poison::Guard {panicking: false}}
+#7  0x0000564a314baf1d in repro::checkpoint::{impl#2}::park_self::{closure#0}<repro::Machine> (child=0x564a625860d0) at src/checkpoint.rs:199
+#8  0x0000564a314d5d46 in alloc::vec::{impl#1}::retain::{closure#0}<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc::Global>, alloc::alloc::Global, repro::checkpoint::{impl#2}::park_self::{cl
+#9  0x0000564a314d50a0 in alloc::vec::Vec<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc::Global>, alloc::alloc::Global>::retain_mut<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc:
+#10 0x0000564a314d5273 in alloc::vec::Vec<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc::Global>, alloc::alloc::Global>::retain<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc::Glo
+#11 0x0000564a314bd34d in repro::checkpoint::Handle<repro::Machine>::park_self<repro::Machine> (self=0x7ffd273c5750) at src/checkpoint.rs:198
+#12 0x0000564a314ba585 in repro::checkpoint::{impl#2}::fanout::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> (scope=0x
+#13 0x0000564a314d3cc5 in std::thread::scoped::scope::{closure#0}<repro::checkpoint::{impl#2}::fanout::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeSta
+#14 0x0000564a314ca6c0 in core::panic::unwind_safe::{impl#23}::call_once<(), std::thread::scoped::scope::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure_env#0}<repro::Machine, repro::Ana
+#15 0x0000564a314c3cb1 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure_env
+#16 0x0000564a314d3dfb in __rust_try ()
+#17 0x0000564a314d3123 in std::panicking::catch_unwind<(), core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure_env#0}<r
+#18 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::checkpoint::{impl#2}::fanout::{closure_env#0}<repro::Machine, repro::AnalyzeS
+#19 std::thread::scoped::scope<repro::checkpoint::{impl#2}::fanout::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}>,
+#20 0x0000564a314b9b00 in repro::checkpoint::Handle<repro::Machine>::fanout<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> (self=0x
+#21 0x0000564a314b82f6 in repro::step (h=..., io=0x7ffd273c64b0) at src/main.rs:62
+#22 0x0000564a314cf814 in repro::drive::{closure#0}::{closure#0} (scope=0x7ffd273c5b90) at src/main.rs:103
+#23 0x0000564a314d3d4d in std::thread::scoped::scope::{closure#0}<repro::drive::{closure#0}::{closure_env#0}, repro::Machine> () at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thre
+#24 0x0000564a314ca72f in core::panic::unwind_safe::{impl#23}::call_once<repro::Machine, std::thread::scoped::scope::{closure_env#0}<repro::drive::{closure#0}::{closure_env#0}, repro::Machine>> (self=
+#25 0x0000564a314c3d27 in std::panicking::catch_unwind::do_call<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::drive::{closure#0}::{closure_env#0}, repro
+#26 0x0000564a314d3dfb in __rust_try ()
+#27 0x0000564a314d39b0 in std::panicking::catch_unwind<repro::Machine, core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::drive::{closure#0}::{closure_env#0}
+#28 std::panic::catch_unwind<core::panic::unwind_safe::AssertUnwindSafe<std::thread::scoped::scope::{closure_env#0}<repro::drive::{closure#0}::{closure_env#0}, repro::Machine>>, repro::Machine> (f=...
+#29 std::thread::scoped::scope<repro::drive::{closure#0}::{closure_env#0}, repro::Machine> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/thread/scoped.rs:158
+#30 0x0000564a314cfe10 in repro::drive::{closure#0} (h=..., req=...) at src/main.rs:86
+#31 0x0000564a314b9dc1 in repro::checkpoint::with_checkpoint_pair<repro::Machine, repro::Machine, repro::drive::{closure_env#0}> (node=..., f=...) at src/checkpoint.rs:458
+#32 0x0000564a314b88dc in repro::drive (machine=..., io=0x7ffd273c64b0, checkpoint=...) at src/main.rs:83
+#33 0x0000564a314b7adf in repro::main () at src/main.rs:121

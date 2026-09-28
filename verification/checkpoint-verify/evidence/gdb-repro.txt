@@ -1,0 +1,75 @@
+[New LWP 697969]
+[New LWP 697968]
+[New LWP 697967]
+[New LWP 697966]
+[New LWP 687053]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/lib/x86_64-linux-gnu/libthread_db.so.1".
+syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+
+Thread 6 (Thread 0x7fd68f8ad6c0 (LWP 687053) "repro"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000564a1910d73b in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  0x0000564a190cea03 in std::sync::poison::condvar::Condvar::wait_timeout<bool> (self=0x564a27b8de50, guard=..., dur=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:330
+#4  0x0000564a190db534 in repro::checkpoint::Shared::request_until_parked (self=0x564a27b8de40, timeout=...) at src/checkpoint.rs:124
+#5  0x0000564a190c80e0 in repro::checkpoint::CheckpointRequester<repro::Machine>::request_impl<repro::Machine> (self=0x7fd68f8aca30, timeout=...) at src/checkpoint.rs:381
+#6  0x0000564a190c898f in repro::checkpoint::CheckpointRequester<repro::Machine>::request_timeout<repro::Machine> (self=0x7fd68f8aca30, timeout=...) at src/checkpoint.rs:344
+#7  0x0000564a190d9328 in repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure#0} () at src/main.rs:92
+#8  0x0000564a190ced16 in std::sys::backtrace::__rust_begin_short_backtrace<repro::drive::{closure#0}::{closure#0}::{closure#0}::{closure_env#0}, ()> (f=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 5 (Thread 0x7fd68f0a66c0 (LWP 697966) "repro"):
+#0  0x00007fd68f9cbbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7fd68f0a5828, rem=0x7fd68f0a5828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a1911e327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a190c2a52 in repro::Io::step (self=0x7ffc404c6370, _id=1) at src/main.rs:14
+#5  0x0000564a190c13e3 in repro::run_analyze (h=..., io=0x7ffc404c6370) at src/main.rs:26
+#6  0x0000564a190d9afd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a190c4da0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> () at src/checkpoint.rs:278
+#8  0x0000564a190cecb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}>, ()> (f=<error reading variable: Cannot access memory at address 0x1>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 4 (Thread 0x7fd68f2a76c0 (LWP 697967) "repro"):
+#0  0x00007fd68f9cbbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7fd68f2a6828, rem=0x7fd68f2a6828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a1911e327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a190c2a52 in repro::Io::step (self=0x7ffc404c6370, _id=2) at src/main.rs:14
+#5  0x0000564a190c13e3 in repro::run_analyze (h=..., io=0x7ffc404c6370) at src/main.rs:26
+#6  0x0000564a190d9afd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a190c4da0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> () at src/checkpoint.rs:278
+#8  0x0000564a190cecb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}>, ()> (f=<error reading variable: Cannot access memory at address 0x1>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 3 (Thread 0x7fd68f4ab6c0 (LWP 697968) "repro"):
+#0  0x00007fd68f9cbbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7fd68f4aa828, rem=0x7fd68f4aa828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a1911e327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a190c2a52 in repro::Io::step (self=0x7ffc404c6370, _id=3) at src/main.rs:14
+#5  0x0000564a190c13e3 in repro::run_analyze (h=..., io=0x7ffc404c6370) at src/main.rs:26
+#6  0x0000564a190d9afd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a190c4da0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> () at src/checkpoint.rs:278
+#8  0x0000564a190cecb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}>, ()> (f=<error reading variable: Cannot access memory at address 0x1>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 2 (Thread 0x7fd68f6ac6c0 (LWP 697969) "repro"):
+#0  0x00007fd68f9cbbdf in __GI___clock_nanosleep (clock_id=1, flags=0, req=0x7fd68f6ab828, rem=0x7fd68f6ab828) at ../sysdeps/unix/sysv/linux/clock_nanosleep.c:78
+#1  0x0000564a1911e327 in std::sys::thread::unix::sleep::nanosleep () at library/std/src/sys/thread/unix.rs:566
+#2  std::sys::thread::unix::sleep () at library/std/src/sys/thread/unix.rs:592
+#3  std::thread::functions::sleep () at library/std/src/thread/functions.rs:293
+#4  0x0000564a190c2a52 in repro::Io::step (self=0x7ffc404c6370, _id=4) at src/main.rs:14
+#5  0x0000564a190c13e3 in repro::run_analyze (h=..., io=0x7ffc404c6370) at src/main.rs:26
+#6  0x0000564a190d9afd in repro::step::{closure#2} (a=...) at src/main.rs:62
+#7  0x0000564a190c4da0 in repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}> () at src/checkpoint.rs:278
+#8  0x0000564a190cecb6 in std::sys::backtrace::__rust_begin_short_backtrace<repro::checkpoint::{impl#2}::fanout::{closure#0}::{closure_env#0}<repro::Machine, repro::AnalyzeState, core::slice::iter::IterMut<repro::AnalyzeState>, repro::step::{closure_env#2}>, ()> (f=<error reading variable: Cannot access memory at address 0x1>) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sys/backtrace.rs:166
+
+Thread 1 (Thread 0x7fd68f8ae780 (LWP 687051) "repro"):
+#0  syscall () at ../sysdeps/unix/sysv/linux/x86_64/syscall.S:38
+#1  0x0000564a1910d805 in std::sys::pal::unix::futex::futex_wait () at library/std/src/sys/pal/unix/futex.rs:73
+#2  std::sys::sync::condvar::futex::Condvar::wait_optional_timeout () at library/std/src/sys/sync/condvar/futex.rs:49
+#3  std::sys::sync::condvar::futex::Condvar::wait () at library/std/src/sys/sync/condvar/futex.rs:33
+#4  0x0000564a190cebb5 in std::sync::poison::condvar::Condvar::wait<bool> (self=0x564a27b98b20, guard=...) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/std/src/sync/poison/condvar.rs:128
+#5  0x0000564a190dc5e7 in repro::checkpoint::Shared::wait_park (self=0x564a27b98b10, parked=...) at src/checkpoint.rs:84
+#6  0x0000564a190db3da in repro::checkpoint::Shared::request_until_parked (self=0x564a27b98b10, timeout=...) at src/checkpoint.rs:113
+#7  0x0000564a190c4f1d in repro::checkpoint::{impl#2}::park_self::{closure#0}<repro::Machine> (child=0x564a27b8fa30) at src/checkpoint.rs:199
+#8  0x0000564a190dfd46 in alloc::vec::{impl#1}::retain::{closure#0}<alloc::sync::Arc<repro::checkpoint::Shared, alloc::alloc::Global>, alloc::alloc::Global, repro::checkpoint::{impl#2}::park_self::{closure_env#0}<repro::Machine>> (elem=0x564a27b8fa30) at /rustc/48a229ceaefd4985c50990b14116b6d856af0985/library/alloc/src/vec/mod.rs:2492
+[Inferior 1 (process 687051) detached]
