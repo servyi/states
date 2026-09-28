@@ -517,35 +517,40 @@ impl VCondvar {
     {
     }
 
-    /// A predicate-filtered wait — the shape the protocol's resume
-    /// side actually needs. [DEVIATION: this is NOT the obvious
-    /// one-liner; the parked-preservation clause forces a re-acquire
-    /// retry loop. See the final report.]
+    /// CONSUMER-SIDE derivation (not part of the condvar spec): the
+    /// substrate's stronger `wait_resume` clause (`ensures parked`)
+    /// obtained from the PLAIN condvar spec above by a retry loop —
+    /// showing that clause assumes nothing more about the condvar.
     #[verifier::exec_allows_no_decreases_clause]
-    pub fn wait_until_parked<'a, T>(&self, g: VGuard<'a, T>) -> (g2: VGuard<'a, T>)
+    pub fn wait_until_parked<'a, T>(&self, g0: VGuard<'a, T>) -> (g2: VGuard<'a, T>)
         requires
-            g.wf(),
-            guarded_inv(&g@),
+            g0.wf(),
+            guarded_inv(&g0@),
         ensures
-            g2.lock_ref == g.lock_ref,
+            g2.lock_ref == g0.lock_ref,
             g2.wf(),
             guarded_inv(&g2@),
             g2@.parked,
     {
-        let lock_ref = g.lock_ref;
-        g.put_back();
+        let lock_ref = g0.lock_ref; // Copy; the loop preserves it
+        let mut g = g0;
         loop
             invariant
-                lock_ref == g.lock_ref,
-                lock_ref.wf(),
+                lock_ref == g0.lock_ref,
+                g.wf(),
+                g.lock_ref == lock_ref,
+                guarded_inv(&g@),
         {
-            let g0 = lock_ref.lock();
-            let (parked, g1) = g0.parked();
+            let g1 = self.wait(g); // ONLY the condvar's public spec
+            let (parked, g2) = g1.parked();
             if parked {
-                assert(g1.lock_ref == lock_ref);
-                return g1;
+                // wait: g1.lock_ref == g.lock_ref; invariant: == lock_ref;
+                // entry: lock_ref == g0.lock_ref; parked(): g2.lock_ref == g1.lock_ref
+                assert(lock_ref == g0.lock_ref);
+                assert(g2.lock_ref == g0.lock_ref);
+                return g2;
             }
-            g1.put_back();
+            g = g2;
         }
     }
 }
