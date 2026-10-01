@@ -391,8 +391,11 @@ fn mid_run_snapshot_resumes() {
         ..Machine::default()
     };
     std::thread::scope(|s| {
-        s.spawn(|| drive(m, &io, Some((Duration::from_millis(3), path.clone()))));
+        let runner = s.spawn(|| drive(m, &io, Some((Duration::from_millis(3), path.clone()))));
         std::thread::sleep(Duration::from_millis(60));
+        if let Err(payload) = runner.join() {
+            std::panic::resume_unwind(payload);
+        }
     });
 
     let snap = std::fs::read_to_string(&path).expect("mid-run snapshot exists");
