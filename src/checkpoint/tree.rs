@@ -87,3 +87,7 @@ pub(crate) fn resume_children(children: &[Arc<dyn ChildPair>]) {
         child.release_request_dyn();
     }
 }
+
+/// The trusted tree level's child registry (plain Rust: the dyn trait
+/// object is what the Verus frontend cannot parse).
+pub(crate) type ChildRegistry = Vec<Arc<dyn ChildPair>>;

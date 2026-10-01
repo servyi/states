@@ -20,7 +20,7 @@
 //! (implemented by `std::sync::Mutex`) and a condvar spec (`wait` =
 //! unlock + "block" + lock; implemented by `std::sync::Condvar`).
 //! Both specs are also implemented from pure vstd atomics with zero
-//! trust in `verified_lock` (built under `cargo-verus`; see the
+//! trust in `checkpoint::validation` (built under `cargo-verus`)
 //! verification README on the branch history) — the specs assume
 //! nothing beyond a lock/condvar.
 //!
@@ -35,7 +35,7 @@
 //! liveness (condvar wakeups are hints in the spec).
 
 #[cfg(verus_only)]
-pub mod verified_lock;
+pub mod validation;
 #[cfg_attr(verus_only, verifier::external)]
 pub(crate) mod tree;
 
@@ -492,7 +492,7 @@ pub struct Handle<'o, T> {
     /// Child subtrees created by `fanout` (the tree/children level is
     /// the trusted scope B6/B7: parking a handle stops its registered
     /// open children bottom-up; a finished child deregisters).
-    pub(crate) children: Vec<std::sync::Arc<dyn ChildPair>>,
+    pub(crate) children: crate::checkpoint::tree::ChildRegistry,
     #[cfg_attr(not(verus_only), allow(dead_code))] // ghost: read in proofs only
     pub(crate) tracked baton: Tracked<Option<PointsTo<T>>>,
     pub(crate) _brand: PhantomData<&'o ()>,

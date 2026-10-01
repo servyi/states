@@ -168,7 +168,19 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
     let m = h.block_and_get_mut();
     let mut collected: Vec<(u32, String)> = Vec::new();
     match &m.stage {
-        Stage::Scatter { children } => collected.extend(children.iter().map(AnalyzeState::result)),
+        Stage::Scatter { children } => {
+            collected.extend(children.iter().map(AnalyzeState::result));
+            // Scatter finished: pair the finished analyses into the two
+            // groups the Nested stage runs (100, 200).
+            let kids: Vec<AnalyzeState> =
+                children.iter().map(|c| AnalyzeState { item: c.item.clone(), step: 0, done: None }).collect();
+            m.stage = Stage::Nested {
+                groups: vec![
+                    Group { gid: 100, children: vec![kids[0].clone(), kids[1].clone()] },
+                    Group { gid: 200, children: vec![kids[2].clone(), kids[3].clone()] },
+                ],
+            };
+        }
         Stage::Nested { groups } => {
             collected.extend(groups.iter().map(Group::result));
             let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
