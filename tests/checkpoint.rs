@@ -169,15 +169,47 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
     let mut collected: Vec<(u32, String)> = Vec::new();
     match &m.stage {
         Stage::Scatter { children } => collected.extend(children.iter().map(AnalyzeState::result)),
-        Stage::Nested { groups } => {
-            collected.extend(groups.iter().map(Group::result));
-            let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
-            m.result = format!("done: {}", ids.join(","));
-            m.stage = Stage::Done;
-        }
+        Stage::Nested { groups } => collected.extend(groups.iter().map(Group::result)),
         _ => {}
     }
+    // Stage transitions live with the collection they follow: Scatter
+    // results feed the Nested groups (take/skip split, gids 100/200),
+    // Nested results finish the machine. Dropped in the 7a03762
+    // redesign — restored from 0acc997's semantics.
+    let next: Option<Stage> = match &m.stage {
+        Stage::Scatter { .. } => Some(Stage::Nested {
+            groups: vec![
+                Group {
+                    gid: 100,
+                    children: m
+                        .items
+                        .iter()
+                        .take(2)
+                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
+                        .collect(),
+                },
+                Group {
+                    gid: 200,
+                    children: m
+                        .items
+                        .iter()
+                        .skip(2)
+                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
+                        .collect(),
+                },
+            ],
+        }),
+        Stage::Nested { .. } => {
+            let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
+            m.result = format!("done: {}", ids.join(","));
+            Some(Stage::Done)
+        }
+        _ => None,
+    };
     m.done.extend(collected);
+    if let Some(n) = next {
+        m.stage = n;
+    }
     (h, true)
 }
 
