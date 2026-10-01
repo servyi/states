@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: build
+        run: cargo build --workspace
+      - name: test
+        run: cargo test --workspace
+
+  lint-policy:
+    # Shared Servyi policy (servyi/lints): clippy under the shared
+    # flag list, the unsafe_scope driver, rustdoc links — in this
+    # job's environment.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: servyi/lints/.github/actions/lint-policy@main

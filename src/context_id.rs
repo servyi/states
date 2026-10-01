@@ -23,7 +23,14 @@ impl ContextId {
 
     pub fn new_child(&self) -> ContextId {
         let child_num = {
-            let mut counter = self.child_counter.lock().unwrap();
+            // Poisoning (a debug-build overflow panic inside this block)
+            // cannot leave the counter broken: the increment either
+            // happened or not, and any u64 is a valid next id — recover
+            // and keep allocating children instead of panicking here too.
+            let mut counter = self
+                .child_counter
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let val = *counter;
             *counter += 1;
             val
