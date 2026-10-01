@@ -1,3 +1,6 @@
+#![feature(register_tool)]
+#![register_tool(servyi)]
+
 pub mod checkpoint;
 pub mod context_id;
 pub mod message_log;

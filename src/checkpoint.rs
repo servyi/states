@@ -147,21 +147,46 @@ impl Shared {
 /// unforgeable: it only arises inside [`with_checkpoint_pair`]'s
 /// higher-ranked closure, so no unrelated checkpointer can ever name it
 /// (which is what prevents unlocking a handle through a foreign pair).
+///
+/// TYPE INVARIANT (what every construction site must establish, and what
+/// the unsafe blocks below rely on): the raw `node` pointer derives from
+/// an exclusive `&mut` borrows of storage that NO other live reference
+/// aliases — one handle, one disjoint piece of the tree, for the handle's
+/// whole life. Creating `&T`/`&mut T` through the handle is then valid
+/// (pointer valid, no aliasing) whenever the handle is not parked.
+///
+/// SAFETY (constructor): the struct literal takes a raw pointer and can
+/// alias storage that other references still name — construction is
+/// unsound from safe code unless the site proves the TYPE INVARIANT
+/// above (a fresh, disjoint, exclusive piece of the tree).
+#[servyi::unsound_constructor]
 pub struct Handle<'o, T> {
     node: *mut T,
     shared: Arc<Shared>,
     /// Child subtrees created by `fanout`: parking this handle stops the
     /// children first (bottom-up). Deregistered automatically once a
-    /// child closes (a finished worker never parks).
-    children: Vec<Arc<Shared>>,
+    /// child closes (a finished worker never parks). Mutex-wrapped: the
+    /// rayon job registers children while the parent serves requests.
+    /// Poisoning invariant: only push/retain over shared refs — nothing
+    /// that can panic holds it.
+    children: Mutex<Vec<Arc<Shared>>>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign lifetime.
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-// SAFETY: the node pointer is only dereferenced through the handle's own
-// borrows, and the handle crosses to its (one) owning worker thread —
-// `T: Send` covers the data itself.
+// SAFETY: `Send`'s requirement is that transferring the value to another
+// thread cannot cause data races. The handle carries no shared state
+// beyond atomics/locks, and the TYPE INVARIANT (exactly one handle per
+// disjoint piece of the tree, unforgeable brand) means wherever it goes,
+// no other reference to that storage exists — with `T: Send` the data
+// itself may safely cross. (Which thread it "should" go to is a protocol
+// matter, not part of Send's contract.)
 unsafe impl<'o, T: Send> Send for Handle<'o, T> {}
+
+// SAFETY: sharing a handle only shares atomics and mutexes; every node
+// access needs `&mut self`, so no shared access to `T` exists through a
+// shared handle.
+unsafe impl<'o, T: Send> Sync for Handle<'o, T> {}
 
 impl<'o, T> Handle<'o, T> {
     /// Park while a checkpoint has been requested, then return. Requires
@@ -178,25 +203,7 @@ impl<'o, T> Handle<'o, T> {
     }
 
     fn park_self(&mut self) {
-        // Stop the world bottom-up: request+wait every open child subtree
-        // first (children that already finished are deregistered), then
-        // park this thread. A guard taken at this level therefore sees the
-        // whole subtree quiesced.
-        self.children.retain(|child| {
-            !matches!(child.request_until_parked(None), Handshake::Closed)
-        });
-        let mut parked = self.shared.lock_parked();
-        *parked = true;
-        self.shared.park_cv.notify_all();
-        while self.is_stop_requested() {
-            parked = self.shared.wait_resume(parked);
-        }
-        *parked = false;
-        self.shared.park_cv.notify_all();
-        // Resume the children only after this thread is running again.
-        for child in &self.children {
-            child.release_request();
-        }
+        park_self_fields(&self.shared, &self.children);
     }
 
     /// Read the leased subtree. The borrow is tied to `&mut self`: a
@@ -204,77 +211,129 @@ impl<'o, T> Handle<'o, T> {
     /// live, and the snapshotter's guard is only granted when every
     /// handle is parked — the two sides never alias.
     pub fn block_and_get(&mut self) -> &T {
-        // SAFETY: exclusive access to the subtree flows only through this
-        // handle (the unforgeable brand prevents foreign pairs), and the
-        // borrow ends before any park can occur.
+        // SAFETY: creating a `&T` from a raw pointer requires the pointer
+        // to be valid and not mutably aliased. Valid: it was derived from
+        // an exclusive `&mut` at construction. Not mutably aliased: the
+        // TYPE INVARIANT (one handle per disjoint piece; brand is
+        // unforgeable). The reference is tied to `&mut self`, so no park
+        // (which needs `&mut self`) can occur while it lives.
         unsafe { &*self.node }
     }
 
     /// Mutably access the leased subtree. Same borrowing rules as
     /// [`block_and_get`](Self::block_and_get).
     pub fn block_and_get_mut(&mut self) -> &mut T {
-        // SAFETY: as `block_and_get`, but exclusive.
+        // SAFETY: creating a `&mut T` requires the pointer to be valid,
+        // aligned, and NOT ALIASED by any other live reference (shared or
+        // mutable) for the reference's whole life. Valid/aligned: derived
+        // from an exclusive `&mut` at construction. Un-aliased: the TYPE
+        // INVARIANT plus `&mut self` exclusivity — no other handle and no
+        // parked guard can coexist with this borrow (guards exist only
+        // while this handle is parked, which needs `&mut self`).
         unsafe { &mut *self.node }
     }
 
     /// Fan out over the children of this subtree.
     ///
-    /// `split` enumerates the children (disjoint `&mut` items of a local
-    /// reborrow); each item becomes a child [`Handle`] moved to its
-    /// scoped-thread worker, registered on this handle so parking stops
-    /// bottom-up. The action stores its results INSIDE the node (there is
-    /// no return path — ownership of results stays with the state
+    /// `split` yields the children as a rayon `ParallelIterator` of
+    /// DISJOINT `&mut` items (rayon's split guarantees non-overlapping
+    /// borrows of one producer's output — the aliasing hazard of a
+    /// hand-rolled split returning the same reference twice is the
+    /// constructor precondition the `// SAFETY` comment at the handle
+    /// construction below argues about); each item becomes a child
+    /// [`Handle`] consumed by its rayon worker, registered on this handle
+    /// so parking stops bottom-up. The action stores its results INSIDE
+    /// the node (no return path — ownership stays with the state
     /// machine). Serves checkpoint requests while the children run;
-    /// returns when every child is finished (the thread scope joins
-    /// them; a panicked child propagates at scope exit).
-    pub fn fanout<'t, C, I, F>(&mut self, split: fn(&'t mut T) -> I, action: F)
+    /// returns when they are all finished (the rayon scope joins them; a
+    /// panicked child propagates at scope exit).
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panicked child subtask, and panics only if a handshake
+    /// lock is poisoned — see the invariant on `Shared::parked`.
+    pub fn fanout<'t, C, P, F>(&'t mut self, split: fn(&'t mut T) -> P, action: F)
     where
+        T: Send,
         C: Send + 'o,
-        I: Iterator<Item = &'t mut C>,
+        P: rayon::iter::ParallelIterator<Item = &'t mut C>,
         F: Fn(Handle<'o, C>) + Sync,
         'o: 't,
     {
         let action = &action;
-        // The split runs on a LOCAL reborrow; the item borrows end when
-        // each is consumed into its child handle.
-        let node: *mut T = self.node;
-        let this: *mut Self = self;
-        thread::scope(move |scope| {
-            let mut join_handles: Vec<thread::ScopedJoinHandle<'_, ()>> = Vec::new();
-            // SAFETY: `self` is mutably borrowed for the whole fan-out
-            // (this method holds `&mut self`); deriving the split
-            // reborrow from the node pointer is the same borrow.
-            let items = split(unsafe { &mut *node });
-            for child in items {
-                let child_shared = Shared::new();
-                // SAFETY: `this` is our own `&mut self`, valid for the
-                // scope of this method.
-                unsafe { &mut *this }.children.push(child_shared.clone());
-                // The item's `&mut C` is consumed into the child handle:
-                // its borrow ends here, and the child is exclusively
-                // reachable through the handle (disjoint split items make
-                // concurrent workers sound).
-                let h: Handle<'o, C> = Handle {
-                    node: std::ptr::from_mut(child),
-                    shared: child_shared,
-                    children: Vec::new(),
-                    _brand: PhantomData,
-                };
-                join_handles.push(scope.spawn(move || action(h)));
-            }
-
+        let registry = &self.children;
+        // SAFETY (shared across the rayon job): a raw pointer is not
+        // `Send`, but this one is the handle's exclusive lease — it is
+        // dereferenced only inside the single spawned job, and the parent
+        // blocks in this scope until that job finishes, so no concurrent
+        // access through it exists. Wrapping it for the move makes that
+        // explicit instead of relying on closure capture inference.
+        struct NodeLease<T>(*mut T);
+        // SAFETY: one job, joined before the parent proceeds.
+        unsafe impl<T> Send for NodeLease<T> {}
+        // SAFETY: as Send — the job holds it by value; sharing touches no data.
+        unsafe impl<T> Sync for NodeLease<T> {}
+        let node = NodeLease(self.node);
+        let done = AtomicBool::new(false);
+        rayon::scope(|scope| {
+            scope.spawn(|_| {
+                let node = node;
+                // SAFETY: the TYPE INVARIANT — `node` is this handle's
+                // exclusive storage, and the reborrow handed to `split`
+                // lives exactly inside this job, which the parent waits
+                // out before returning.
+                let items = split(unsafe { &mut *node.0 });
+                items.for_each(|child| {
+                    let child_shared = Shared::new();
+                    registry
+                        .lock()
+                        .expect("children lock: pure ops only")
+                        .push(Arc::clone(&child_shared));
+                    // SAFETY (Handle constructor): the TYPE INVARIANT
+                    // holds here — rayon's parallel iteration yields each
+                    // `&mut C` item exactly once, disjointly; this handle
+                    // is therefore the only reference to that child for
+                    // its whole life.
+                    let h: Handle<'o, C> = Handle {
+                        node: std::ptr::from_mut(child),
+                        shared: child_shared,
+                        children: Mutex::new(Vec::new()),
+                        _brand: PhantomData,
+                    };
+                    action(h);
+                });
+                done.store(true, Ordering::SeqCst);
+            });
             loop {
-                // SAFETY: as above — our own `&mut self`.
-                let me: &mut Self = unsafe { &mut *this };
-                if me.is_stop_requested() {
-                    me.park_self();
+                if self.is_stop_requested() {
+                    park_self_fields(&self.shared, registry);
                 }
-                if join_handles.iter().all(thread::ScopedJoinHandle::is_finished) {
+                if done.load(Ordering::SeqCst) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(1));
             }
         })
+    }
+}
+
+/// The parking dance over disjoint fields, so the fan-out serve loop can
+/// park while the rayon job holds the registry shared borrow: stop every
+/// open child subtree first (bottom-up; finished children deregister),
+/// then this thread; resume children after this thread runs again.
+fn park_self_fields(shared: &Shared, children: &Mutex<Vec<Arc<Shared>>>) {
+    let mut children = children.lock().expect("children lock: pure ops only");
+    children.retain(|child| !matches!(child.request_until_parked(None), Handshake::Closed));
+    let mut parked = shared.lock_parked();
+    *parked = true;
+    shared.park_cv.notify_all();
+    while shared.is_pending() {
+        parked = shared.wait_resume(parked);
+    }
+    *parked = false;
+    shared.park_cv.notify_all();
+    for child in children.iter() {
+        child.release_request();
     }
 }
 
@@ -424,10 +483,14 @@ pub fn with_checkpoint_pair<T, R>(
     let mut node = node;
     let node_ptr: *mut T = std::ptr::from_mut(&mut node);
     let shared = Shared::new();
+    // SAFETY (Handle constructor): the TYPE INVARIANT holds trivially —
+    // `node` is OWNED by this call (moved in), so no other reference can
+    // name it; this handle is the sole path to the storage, and the
+    // unforgeable brand ties requester and handle to this frame.
     let handle = Handle {
         node: node_ptr,
         shared: shared.clone(),
-        children: Vec::new(),
+        children: Mutex::new(Vec::new()),
         _brand: PhantomData,
     };
     let requester = CheckpointRequester {

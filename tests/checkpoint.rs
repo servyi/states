@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use rayon::iter::IntoParallelIterator;
 use servyi_states::checkpoint::{with_checkpoint_pair, CheckpointRequester, Handle};
 
 #[derive(Debug, Clone)]
@@ -81,7 +82,7 @@ impl Group {
 }
 
 fn run_group(mut h: Handle<'_, Group>, io: &Io) {
-    h.fanout(|g| g.children.iter_mut(), |a| run_analyze(a, io));
+    h.fanout(|g| (&mut g.children).into_par_iter(), |a| run_analyze(a, io));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -151,14 +152,14 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
     match which {
         0 => h.fanout(
             |m| match &mut m.stage {
-                Stage::Scatter { children } => children.iter_mut(),
+                Stage::Scatter { children } => (&mut *children).into_par_iter(),
                 _ => unreachable!("checked above"),
             },
             |a| run_analyze(a, io),
         ),
         1 => h.fanout(
             |m| match &mut m.stage {
-                Stage::Nested { groups } => groups.iter_mut(),
+                Stage::Nested { groups } => (&mut *groups).into_par_iter(),
                 _ => unreachable!("checked above"),
             },
             |g| run_group(g, io),
@@ -278,7 +279,7 @@ fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn freeze_window_allows_access_then_safepoint() {
     let out = with_checkpoint_pair(vec![7u32], |mut h, _req| {
-        h.fanout(|c| c.iter_mut(), |mut child| {
+        h.fanout(|c| (&mut *c).into_par_iter(), |mut child| {
             assert_eq!(*child.block_and_get(), 7);
             child.safepoint();
             *child.block_and_get_mut() += 1;
