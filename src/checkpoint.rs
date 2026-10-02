@@ -256,36 +256,32 @@ impl<'o, T> Handle<'o, T> {
     where
         T: Send,
         C: Send + 'o,
-        P: rayon::iter::ParallelIterator<Item = &'t mut C>,
+        P: rayon::iter::ParallelIterator<Item = &'t mut C> + Send,
         F: Fn(Handle<'o, C>) + Sync,
         'o: 't,
     {
         let action = &action;
-        let registry = &self.children;
-        // SAFETY (shared across the rayon job): a raw pointer is not
-        // `Send`, but this one is the handle's exclusive lease — it is
-        // dereferenced only inside the single spawned job, and the parent
-        // blocks in this scope until that job finishes, so no concurrent
-        // access through it exists. Wrapping it for the move makes that
-        // explicit instead of relying on closure capture inference.
-        struct NodeLease<T>(*mut T);
-        // SAFETY: one job, joined before the parent proceeds.
-        unsafe impl<T> Send for NodeLease<T> {}
-        // SAFETY: as Send — the job holds it by value; sharing touches no data.
-        unsafe impl<T> Sync for NodeLease<T> {}
-        let node = NodeLease(self.node);
+        // Destructure the borrow into disjoint field borrows: the node
+        // feeds the split, the shared pair and the registry serve the
+        // parking loop — neither blocks the other.
+        let Handle { node, shared, children, .. } = self;
+        // Shared view of the registry: the rayon job registers children
+        // while the parent's serve loop parks them — both hold &Mutex.
+        let children: &Mutex<Vec<Arc<Shared>>> = &*children;
+        // Build the parallel iterator OUTSIDE the rayon scope, on this
+        // thread: only the (Send) iterator crosses into the job — no raw
+        // pointer wrapper needed.
+        //
+        // SAFETY: the TYPE INVARIANT — `node` is this handle's exclusive
+        // storage, and the reborrow handed to `split` lives until the
+        // scope below joins its job, inside this method.
+        let items = split(unsafe { &mut **node });
         let done = AtomicBool::new(false);
         rayon::scope(|scope| {
             scope.spawn(|_| {
-                let node = node;
-                // SAFETY: the TYPE INVARIANT — `node` is this handle's
-                // exclusive storage, and the reborrow handed to `split`
-                // lives exactly inside this job, which the parent waits
-                // out before returning.
-                let items = split(unsafe { &mut *node.0 });
                 items.for_each(|child| {
                     let child_shared = Shared::new();
-                    registry
+                    children
                         .lock()
                         .expect("children lock: pure ops only")
                         .push(Arc::clone(&child_shared));
@@ -305,8 +301,8 @@ impl<'o, T> Handle<'o, T> {
                 done.store(true, Ordering::SeqCst);
             });
             loop {
-                if self.is_stop_requested() {
-                    park_self_fields(&self.shared, registry);
+                if shared.is_pending() {
+                    park_self_fields(shared, children);
                 }
                 if done.load(Ordering::SeqCst) {
                     break;

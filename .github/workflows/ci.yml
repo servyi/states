@@ -14,7 +14,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # nightly: the crate gates #![feature(register_tool)] for the
+      # servyi::unsound_constructor lint attribute.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-09-21
       - uses: Swatinem/rust-cache@v2
       - name: build
         run: cargo build --workspace
