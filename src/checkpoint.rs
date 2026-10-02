@@ -146,12 +146,12 @@ impl Shared {
 /// `&mut self`, and `safepoint` needs `&mut self` — so a reference into
 /// the subtree provably cannot outlive a park. The brand `'o` is
 /// unforgeable: it only arises inside [`with_checkpoint_pair`]'s
-/// higher-ranked closure, so no unrelated checkpointer can ever name it
-/// (which is what prevents unlocking a handle through a foreign pair).
+/// higher-ranked closure, so no unrelated pair can ever name it (which
+/// is what prevents unlocking a handle through a foreign pair).
 ///
 /// TYPE INVARIANT (what every construction site must establish, and what
 /// the unsafe blocks below rely on): the raw `node` pointer derives from
-/// an exclusive `&mut` borrows of storage that NO other live reference
+/// an exclusive `&mut` borrow of storage that NO other live reference
 /// aliases — one handle, one disjoint piece of the tree, for the handle's
 /// whole life. Creating `&T`/`&mut T` through the handle is then valid
 /// (pointer valid, no aliasing) whenever the handle is not parked.
@@ -208,10 +208,6 @@ impl<'o, T> Handle<'o, T> {
         park_self_fields(&self.shared, &self.children);
     }
 
-    /// Deref/DerefMut make the lease ergonomic (`*h`, `h.field`,
-    /// `&mut *h`). Sound for the same reason as every access: the
-    /// reference borrows `&mut self`, and parking (safepoint, fanout)
-    /// needs `&mut self` — nothing can be live across a park.
     /// Fan out over the children of this subtree.
     ///
     /// HANDLES FIRST (the original instruction): the split collects the
@@ -226,6 +222,11 @@ impl<'o, T> Handle<'o, T> {
     /// the only way to name the borrow the split takes without leaking a
     /// lifetime parameter into the signature; pass
     /// `&|n| n.children.iter_mut().collect()`.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panicked child subtask, and panics only if a handshake
+    /// lock is poisoned — see the invariant on `Shared::parked`.
     pub fn fanout<C, F>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut C> + Send + Sync),
@@ -266,7 +267,7 @@ impl<'o, T> Handle<'o, T> {
         let done = AtomicBool::new(false);
         rayon::scope(|scope| {
             scope.spawn(|_| {
-                handles.into_par_iter().for_each(|h| action(h));
+                handles.into_par_iter().for_each(action);
                 done.store(true, Ordering::SeqCst);
             });
             loop {
@@ -304,17 +305,17 @@ fn park_self_fields(shared: &Shared, children: &Mutex<Vec<Arc<Shared>>>) {
 impl<'o, T> std::ops::Deref for Handle<'o, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY: valid, un-aliased per the TYPE
-        // INVARIANT); shared, tied to this handle's exclusivity.
+        // SAFETY: valid and un-aliased per the TYPE INVARIANT; a shared
+        // reborrow, unique to this handle's exclusivity.
         unsafe { &*self.node }
     }
 }
 
 impl<'o, T> std::ops::DerefMut for Handle<'o, T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as Deref — valid, un-aliased per the TYPE
-        // INVARIANT); exclusive reborrow tied to `&mut self`, so no park
-        // can intervene while it lives.
+        // SAFETY: as Deref, but exclusive — the reborrow is tied to
+        // `&mut self`, so no park (which needs `&mut self`) can intervene
+        // while it lives.
         unsafe { &mut *self.node }
     }
 }
@@ -456,8 +457,8 @@ impl<T> Drop for CheckpointGuard<'_, T> {
 ///
 /// The brand `'o` is an unforgeable unique lifetime: it only exists
 /// inside this call's higher-ranked closure, so no unrelated pair can
-/// name it — a handle can never be unlocked through a foreign
-/// checkpointer, and neither side can outlive the node.
+/// name it — a handle can never be unlocked through a foreign pair, and
+/// neither side can outlive the node.
 pub fn with_checkpoint_pair<T, R>(
     node: T,
     f: impl for<'o> FnOnce(Handle<'o, T>, CheckpointRequester<'o, T>) -> R,

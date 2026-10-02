@@ -136,7 +136,7 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
         }
     };
     if let Some(n) = next {
-        (&mut *h).stage = n;
+        h.stage = n;
     }
     if !keep_going {
         return (h, false);
