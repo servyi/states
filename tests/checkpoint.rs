@@ -3,7 +3,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use rayon::iter::IntoParallelIterator;
 use servyi_states::checkpoint::{with_checkpoint_pair, CheckpointRequester, Handle};
 
 #[derive(Debug, Clone)]
@@ -50,18 +49,18 @@ fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
     loop {
         h.safepoint();
         let (id, steps) = {
-            let st = h.block_and_get();
+            let st = &*h;
             (st.item.id, st.item.steps)
         };
         io.step(id);
         h.safepoint();
         let finished = {
-            let st = h.block_and_get_mut();
+            let st = &mut *h;
             st.step += 1;
             st.step >= steps
         };
         if finished {
-            h.block_and_get_mut().done = Some(format!("v{id}"));
+            h.done = Some(format!("v{id}"));
             return;
         }
     }
@@ -82,7 +81,7 @@ impl Group {
 }
 
 fn run_group(mut h: Handle<'_, Group>, io: &Io) {
-    h.fanout(|g| (&mut g.children).into_par_iter(), |a| run_analyze(a, io));
+    h.fanout(&|g| g.children.iter_mut().collect(), |a| run_analyze(a, io));
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,7 +112,7 @@ struct Machine {
 fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) {
     let mut next: Option<Stage> = None;
     let keep_going = {
-        let m = h.block_and_get_mut();
+        let m = &mut *h;
         match &mut m.stage {
             Stage::Seq { step } => {
                 if (*step as usize) < m.items.len() {
@@ -137,36 +136,36 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
         }
     };
     if let Some(n) = next {
-        h.block_and_get_mut().stage = n;
+        (&mut *h).stage = n;
     }
     if !keep_going {
         return (h, false);
     }
     // Fan-out stages: run while serving checkpoints, then read results
     // from the node.
-    let which = match &h.block_and_get().stage {
+    let which = match &h.stage {
         Stage::Scatter { .. } => 0,
         Stage::Nested { .. } => 1,
         _ => -1,
     };
     match which {
         0 => h.fanout(
-            |m| match &mut m.stage {
-                Stage::Scatter { children } => (&mut *children).into_par_iter(),
+            &|m: &mut Machine| match &mut m.stage {
+                Stage::Scatter { children } => children.iter_mut().collect(),
                 _ => unreachable!("checked above"),
             },
             |a| run_analyze(a, io),
         ),
         1 => h.fanout(
-            |m| match &mut m.stage {
-                Stage::Nested { groups } => (&mut *groups).into_par_iter(),
+            &|m: &mut Machine| match &mut m.stage {
+                Stage::Nested { groups } => groups.iter_mut().collect(),
                 _ => unreachable!("checked above"),
             },
             |g| run_group(g, io),
         ),
         _ => {}
     }
-    let m = h.block_and_get_mut();
+    let m = &mut *h;
     let mut collected: Vec<(u32, String)> = Vec::new();
     match &m.stage {
         Stage::Scatter { children } => collected.extend(children.iter().map(AnalyzeState::result)),
@@ -264,7 +263,7 @@ fn drive(
                 }
             }
             // Snapshot the final state out of the node through the handle.
-            let out: Machine = h.block_and_get().clone();
+            let out: Machine = h.clone();
             out
         })
     })
@@ -279,12 +278,12 @@ fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
 #[test]
 fn freeze_window_allows_access_then_safepoint() {
     let out = with_checkpoint_pair(vec![7u32], |mut h, _req| {
-        h.fanout(|c| (&mut *c).into_par_iter(), |mut child| {
-            assert_eq!(*child.block_and_get(), 7);
+        h.fanout(&|c| c.iter_mut().collect(), |mut child| {
+            assert_eq!(*child, 7);
             child.safepoint();
-            *child.block_and_get_mut() += 1;
+            *child += 1;
         });
-        h.block_and_get().clone()
+        h.clone()
     });
     assert_eq!(out, vec![8]);
 }
@@ -298,8 +297,8 @@ fn snapshotter_reads_live_tree_through_guard() {
                 let mut v = 41;
                 for _ in 0..50 {
                     h.safepoint();
-                    *h.block_and_get_mut() += 1;
-                    v = *h.block_and_get();
+                    *h += 1;
+                    v = *h;
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 v
@@ -334,7 +333,7 @@ fn concurrent_requesters_serialize_instead_of_deadlocking() {
             let _mutifier = scope.spawn(move || {
                 for _ in 0..200 {
                     h.safepoint();
-                    *h.block_and_get_mut() += 1;
+                    *h += 1;
                 }
                 done_ref.store(true, Ordering::SeqCst);
             });
