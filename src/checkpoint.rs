@@ -222,6 +222,9 @@ impl<'o, T> Handle<'o, T> {
 
     /// Mutably access the leased subtree. Same borrowing rules as
     /// [`block_and_get`](Self::block_and_get).
+    /// With the checkpointer fused into the handle, deref coercion is
+    /// sound for the same reason: the reference is tied to `&mut self`,
+    /// and every park needs `&mut self`.
     pub fn block_and_get_mut(&mut self) -> &mut T {
         // SAFETY: creating a `&mut T` requires the pointer to be valid,
         // aligned, and NOT ALIASED by any other live reference (shared or
@@ -233,6 +236,12 @@ impl<'o, T> Handle<'o, T> {
         unsafe { &mut *self.node }
     }
 
+    /// Deref/DerefMut make the lease ergonomic (`*h`, `h.field`,
+    /// `&mut *h`). Sound for exactly the block_and_get(_mut) reason: the
+    /// reference borrows `&mut self`, and parking (safepoint, fanout)
+    /// needs `&mut self` — nothing can be live across a park.
+    /// [`block_and_get`](Self::block_and_get)/[`block_and_get_mut`](Self::block_and_get_mut)
+    /// remain for explicitness at protocol-sensitive sites.
     /// Fan out over the children of this subtree.
     ///
     /// `split` yields the children as a rayon `ParallelIterator` of
@@ -330,6 +339,24 @@ fn park_self_fields(shared: &Shared, children: &Mutex<Vec<Arc<Shared>>>) {
     shared.park_cv.notify_all();
     for child in children.iter() {
         child.release_request();
+    }
+}
+
+impl<'o, T> std::ops::Deref for Handle<'o, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: as block_and_get (valid, un-aliased per the TYPE
+        // INVARIANT); shared, tied to this handle's exclusivity.
+        unsafe { &*self.node }
+    }
+}
+
+impl<'o, T> std::ops::DerefMut for Handle<'o, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as block_and_get_mut (valid, un-aliased per the TYPE
+        // INVARIANT); exclusive reborrow tied to `&mut self`, so no park
+        // can intervene while it lives.
+        unsafe { &mut *self.node }
     }
 }
 
