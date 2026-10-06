@@ -6,7 +6,6 @@ description = "Hierarchical context IDs, phase trackers, and generic state machi
 license = "MIT"
 
 [dependencies]
-rayon = "1"
 dashmap = "6"
 anyhow = "1"
 async-trait = "0.1"

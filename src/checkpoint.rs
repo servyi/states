@@ -15,7 +15,6 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -227,33 +226,24 @@ impl<'o, T> Handle<'o, T> {
     ///
     /// Propagates a panicked child subtask, and panics only if a handshake
     /// lock is poisoned — see the invariant on `Shared::parked`.
-    pub fn fanout<C, F>(
-        &mut self,
-        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut C> + Send + Sync),
-        action: F,
-    ) where
-        T: Send + Sync,
+    pub fn fanout<C, F>(&mut self, split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut C> + Send + Sync), action: F)
+    where
         C: Send + 'o,
-        F: for<'c> Fn(Handle<'c, C>) + Sync,
+        F: Fn(Handle<'_, C>) + Send + Sync,
     {
-        let action = &action;
-        // Collect OFFSITE while holding the `&mut` node borrow (which
-        // blocks a `&mut` to the Handle): split into items, pair each
-        // with a fresh child Shared.
-        // Raw conversion INSIDE the node borrow: the split's references
-        // die here, at the earliest possible point.
+        // Collect OFFSITE under the &mut node borrow; the split's
+        // references die at the raw conversion, the earliest point.
         let child_ptrs: Vec<*mut C> = {
             let node: &mut T = self;
             split(node).into_iter().map(std::ptr::from_mut).collect()
         };
         let mut storages: Vec<Shared> =
             (0..child_ptrs.len()).map(|_| Shared::new()).collect();
-        // Node borrow dropped: swap the collected vec into the Handle.
+        // Node borrow dropped: swap the collected vec in, then create the
+        // handles from the elements' final resting places.
         let start = self.children.len();
         self.children.append(&mut storages);
-        // HANDLES FIRST: create every child Handle from the swapped-in
-        // boxes (stable heap addresses) plus the split items; the items'
-        // references die right here.
+        // HANDLES FIRST: every child becomes its Handle here.
         let handles: Vec<Handle<'_, C>> = child_ptrs
             .into_iter()
             .zip(&self.children[start..])
@@ -262,35 +252,31 @@ impl<'o, T> Handle<'o, T> {
                 // INVARIANT — the split yielded each child exactly once,
                 // disjointly; this handle is the only reference to it
                 // for its whole life.
-                Handle {
-                    node: ptr,
-                    shared: storage,
-                    children: Vec::new(),
-                    _brand: PhantomData,
-                }
+                Handle { node: ptr, shared: storage, children: Vec::new(), _brand: PhantomData }
             })
             .collect();
-        // THEN THREADS: a new par iter over the collected handles; the
-        // serve loop parks children bottom-up through the same boxes.
-        let done = AtomicBool::new(false);
+        // THEN THREADS: one dedicated scoped thread per handle — no pool
+        // to saturate, no serve loop ever blocks a worker.
         let shared = self.shared;
         let children = &self.children;
-        rayon::scope(|scope| {
-            scope.spawn(|_| {
-                handles.into_par_iter().for_each(action);
-                done.store(true, Ordering::SeqCst);
-            });
+        std::thread::scope(|scope| {
+            let action = &action;
+            let mut joins = Vec::with_capacity(handles.len());
+            for h in handles {
+                joins.push(scope.spawn(move || action(h)));
+            }
             loop {
                 if shared.is_pending() {
                     park_self_fields(shared, children);
                 }
-                if done.load(Ordering::SeqCst) {
+                if joins.iter().all(|j| j.is_finished()) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(1));
             }
+            // Join: a panicked child propagates from scope exit.
         });
-        // Scope joined: this fan-out's boxes go away with it.
+        // Scope joined: this fan-out's children go away with it.
         self.children.truncate(start);
     }
 }
