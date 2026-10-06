@@ -14,7 +14,7 @@
 
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,15 +53,19 @@ struct Shared {
 }
 
 impl Shared {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
+    fn new() -> Self {
+        Self {
             pending_request: AtomicBool::new(false),
             closed: AtomicBool::new(false),
             request_lock: Mutex::new(()),
             parked: Mutex::new(false),
             park_cv: Condvar::new(),
             resume_cv: Condvar::new(),
-        })
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
     }
 
     fn is_pending(&self) -> bool {
@@ -163,32 +167,28 @@ impl Shared {
 #[servyi::unsound_constructor]
 pub struct Handle<'o, T> {
     node: *mut T,
-    shared: Arc<Shared>,
-    /// Child subtrees created by `fanout`: parking this handle stops the
-    /// children first (bottom-up). Deregistered automatically once a
-    /// child closes (a finished worker never parks). Arc+Mutex so the
-    /// handle-construction phase can register children through a shared
-    /// clone while the node is mutably borrowed for the split.
-    /// Poisoning invariant: only push/retain over shared refs — nothing
-    /// that can panic holds it.
-    children: Arc<Mutex<Vec<Arc<Shared>>>>,
+    shared: &'o Shared,
+    /// Child pairs of the CURRENT fan-out (pushed in `fanout`, truncated
+    /// when it joins). Plain Vec: the collection is built while the
+    /// `&mut` node borrow blocks other Handle access, then swapped in —
+    /// no lock needed.
+    children: Vec<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign lifetime.
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-// SAFETY: `Send`'s requirement is that transferring the value to another
-// thread cannot cause data races. The handle carries no shared state
-// beyond atomics/locks, and the TYPE INVARIANT (exactly one handle per
-// disjoint piece of the tree, unforgeable brand) means wherever it goes,
-// no other reference to that storage exists — with `T: Send` the data
-// itself may safely cross. (Which thread it "should" go to is a protocol
-// matter, not part of Send's contract.)
+// SAFETY: the requirement is that MOVING the value to another thread
+// cannot cause UB. A Handle cannot be cloned, so moving it means the
+// original thread has no way left to access the data. `Deref` produces
+// `&T`, which may be moved across threads only if `T: Send`; the handle
+// operations themselves are safe to perform on different threads
+// (non-concurrently).
 unsafe impl<'o, T: Send> Send for Handle<'o, T> {}
 
-// SAFETY: sharing a handle only shares atomics and mutexes; every node
-// access needs `&mut self`, so no shared access to `T` exists through a
-// shared handle.
-unsafe impl<'o, T: Send> Sync for Handle<'o, T> {}
+// SAFETY: Handles implement Deref, so `&Handle` grants `&T` access.
+// Sharing a handle across threads therefore allows cross-thread `&T` —
+// sound only if `T: Sync`.
+unsafe impl<'o, T: Sync> Sync for Handle<'o, T> {}
 
 impl<'o, T> Handle<'o, T> {
     /// Park while a checkpoint has been requested, then return. Requires
@@ -205,7 +205,7 @@ impl<'o, T> Handle<'o, T> {
     }
 
     fn park_self(&mut self) {
-        park_self_fields(&self.shared, &self.children);
+        park_self_fields(self.shared, &self.children);
     }
 
     /// Fan out over the children of this subtree.
@@ -232,63 +232,78 @@ impl<'o, T> Handle<'o, T> {
         split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut C> + Send + Sync),
         action: F,
     ) where
-        T: Send,
+        T: Send + Sync,
         C: Send + 'o,
-        F: Fn(Handle<'o, C>) + Sync,
+        F: for<'c> Fn(Handle<'c, C>) + Sync,
     {
         let action = &action;
-        let registry = Arc::clone(&self.children);
-        let handles: Vec<Handle<'o, C>> = {
-            // The split borrows the node through DerefMut — no raw
-            // pointer on this side.
+        // Collect OFFSITE while holding the `&mut` node borrow (which
+        // blocks a `&mut` to the Handle): split into items, pair each
+        // with a fresh child Shared.
+        // Raw conversion INSIDE the node borrow: the split's references
+        // die here, at the earliest possible point.
+        let child_ptrs: Vec<*mut C> = {
             let node: &mut T = self;
-            split(node)
-                .into_iter()
-                .map(|child| {
-                    let child_shared = Shared::new();
-                    registry
-                        .lock()
-                        .expect("children lock: pure ops only")
-                        .push(Arc::clone(&child_shared));
-                    // SAFETY (Handle constructor): the TYPE INVARIANT —
-                    // the splitter yielded each `&mut C` exactly once,
-                    // disjointly; this handle is the only reference to
-                    // that child for its whole life.
-                    Handle {
-                        node: std::ptr::from_mut(child),
-                        shared: child_shared,
-                        children: Arc::new(Mutex::new(Vec::new())),
-                        _brand: PhantomData,
-                    }
-                })
-                .collect::<Vec<_>>()
+            split(node).into_iter().map(std::ptr::from_mut).collect()
         };
-        // THEN THREADS: a new par iter over the collected handles.
+        let mut storages: Vec<Shared> =
+            (0..child_ptrs.len()).map(|_| Shared::new()).collect();
+        // Node borrow dropped: swap the collected vec into the Handle.
+        let start = self.children.len();
+        self.children.append(&mut storages);
+        // HANDLES FIRST: create every child Handle from the swapped-in
+        // boxes (stable heap addresses) plus the split items; the items'
+        // references die right here.
+        let handles: Vec<Handle<'_, C>> = child_ptrs
+            .into_iter()
+            .zip(&self.children[start..])
+            .map(|(ptr, storage)| {
+                // SAFETY (Handle constructor, per child): the TYPE
+                // INVARIANT — the split yielded each child exactly once,
+                // disjointly; this handle is the only reference to it
+                // for its whole life.
+                Handle {
+                    node: ptr,
+                    shared: storage,
+                    children: Vec::new(),
+                    _brand: PhantomData,
+                }
+            })
+            .collect();
+        // THEN THREADS: a new par iter over the collected handles; the
+        // serve loop parks children bottom-up through the same boxes.
         let done = AtomicBool::new(false);
+        let shared = self.shared;
+        let children = &self.children;
         rayon::scope(|scope| {
             scope.spawn(|_| {
                 handles.into_par_iter().for_each(action);
                 done.store(true, Ordering::SeqCst);
             });
             loop {
-                if self.is_stop_requested() {
-                    self.park_self();
+                if shared.is_pending() {
+                    park_self_fields(shared, children);
                 }
                 if done.load(Ordering::SeqCst) {
                     break;
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-        })
+        });
+        // Scope joined: this fan-out's boxes go away with it.
+        self.children.truncate(start);
     }
 }
 
-/// The parking dance over disjoint state: stop every open child subtree
-/// first (bottom-up; finished children deregister), then this thread;
-/// resume the children after this thread runs again.
-fn park_self_fields(shared: &Shared, children: &Mutex<Vec<Arc<Shared>>>) {
-    let mut children = children.lock().expect("children lock: pure ops only");
-    children.retain(|child| !matches!(child.request_until_parked(None), Handshake::Closed));
+/// The parking dance over the current fan-out's children: request every
+/// open child subtree first (bottom-up; closed children never park and are
+/// skipped), then this thread; resume the children after it runs again.
+fn park_self_fields(shared: &Shared, children: &[Shared]) {
+    for child in children.iter() {
+        if !child.is_closed() {
+            let _ = child.request_until_parked(None);
+        }
+    }
     let mut parked = shared.lock_parked();
     *parked = true;
     shared.park_cv.notify_all();
@@ -298,7 +313,9 @@ fn park_self_fields(shared: &Shared, children: &Mutex<Vec<Arc<Shared>>>) {
     *parked = false;
     shared.park_cv.notify_all();
     for child in children.iter() {
-        child.release_request();
+        if !child.is_closed() {
+            child.release_request();
+        }
     }
 }
 
@@ -333,7 +350,7 @@ impl<'o, T> Drop for Handle<'o, T> {
 /// threads.
 pub struct CheckpointRequester<'a, T> {
     node: *const T,
-    shared: Arc<Shared>,
+    shared: &'a Shared,
     _brand: PhantomData<fn(&'a ()) -> &'a T>,
 }
 
@@ -346,7 +363,7 @@ unsafe impl<'a, T: Send> Sync for CheckpointRequester<'a, T> {}
 
 impl<'a, T> Clone for CheckpointRequester<'a, T> {
     fn clone(&self) -> Self {
-        Self { node: self.node, shared: self.shared.clone(), _brand: PhantomData }
+        Self { node: self.node, shared: self.shared, _brand: PhantomData }
     }
 }
 
@@ -387,7 +404,7 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
             }
             return Some(CheckpointGuard {
                 node: self.node as *mut T,
-                shared: &self.shared,
+                shared: self.shared,
                 request_lock,
                 _brand: PhantomData,
             });
@@ -407,7 +424,7 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
         let guard = match self.shared.request_until_parked(timeout) {
             Handshake::Parked | Handshake::Closed => CheckpointGuard {
                 node: self.node as *mut T,
-                shared: &self.shared,
+                shared: self.shared,
                 request_lock,
                 _brand: PhantomData,
             },
@@ -480,13 +497,13 @@ pub fn with_checkpoint_pair<T, R>(
     // unforgeable brand ties requester and handle to this frame.
     let handle = Handle {
         node: node_ptr,
-        shared: shared.clone(),
-        children: Arc::new(Mutex::new(Vec::new())),
+        shared: &shared,
+        children: Vec::new(),
         _brand: PhantomData,
     };
     let requester = CheckpointRequester {
         node: node_ptr as *const T,
-        shared,
+        shared: &shared,
         _brand: PhantomData,
     };
     f(handle, requester)
