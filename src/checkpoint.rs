@@ -386,7 +386,7 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
                 self.shared.release_request();
             }
             return Some(CheckpointGuard {
-                node: self.node,
+                node: self.node as *mut T,
                 shared: &self.shared,
                 request_lock,
                 _brand: PhantomData,
@@ -406,7 +406,7 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
         }
         let guard = match self.shared.request_until_parked(timeout) {
             Handshake::Parked | Handshake::Closed => CheckpointGuard {
-                node: self.node,
+                node: self.node as *mut T,
                 shared: &self.shared,
                 request_lock,
                 _brand: PhantomData,
@@ -420,10 +420,12 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
     }
 }
 
-/// Direct read access to the top-level node while every mutator is parked.
+/// Direct access to the top-level node while every mutator is parked,
+/// through `Deref`/`DerefMut` — the world is stopped for the guard's
+/// whole life, so even mutable access is exclusive by construction.
 /// Dropping the guard resumes the world.
 pub struct CheckpointGuard<'a, T> {
-    node: *const T,
+    node: *mut T,
     shared: &'a Shared,
     /// Held for the guard's whole life: concurrent requesters block until
     /// this guard (and therefore the stop it caused) is done. Never read —
@@ -433,15 +435,21 @@ pub struct CheckpointGuard<'a, T> {
     _brand: PhantomData<fn(&'a mut ()) -> &'a T>,
 }
 
-impl<'a, T> CheckpointGuard<'a, T> {
-    /// The top-level node, quiesced: every mutator that could reach it is
-    /// parked at a safepoint where it provably holds no references.
-    pub fn node(&self) -> &T {
+impl<'a, T> std::ops::Deref for CheckpointGuard<'a, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
         // SAFETY: the guard exists only while the handshake proved every
-        // mutator parked. The reference is tied to the GUARD (not the
-        // requester's brand): it cannot outlive the guard, so the world
+        // mutator parked; the reborrow is tied to the guard, so the world
         // cannot resume underneath it.
         unsafe { &*self.node }
+    }
+}
+
+impl<'a, T> std::ops::DerefMut for CheckpointGuard<'a, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: as Deref, but exclusive — the world is stopped for the
+        // guard's whole life, so no mutator can coexist with this borrow.
+        unsafe { &mut *self.node }
     }
 }
 

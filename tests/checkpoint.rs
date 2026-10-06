@@ -233,7 +233,7 @@ fn drive(
                         let Some(guard) = req.request_timeout(Duration::from_millis(50)) else {
                             continue;
                         };
-                        let bytes = serde_json::to_string(guard.node()).expect("serialize");
+                        let bytes = serde_json::to_string(&*guard).expect("serialize");
                         drop(guard);
                         let tmp = path.with_extension("tmp");
                         if std::fs::write(&tmp, &bytes).is_ok() {
@@ -309,7 +309,7 @@ fn snapshotter_reads_live_tree_through_guard() {
                 let Some(guard) = req.request() else {
                     continue;
                 };
-                observed.push(*guard.node());
+                observed.push(*guard);
                 drop(guard);
             }
             (observed, mutifier.join().expect("mutifier"))
@@ -343,7 +343,7 @@ fn concurrent_requesters_serialize_instead_of_deadlocking() {
                         let mut last = 0;
                         for _ in 0..20 {
                             if let Some(guard) = req.request_timeout(Duration::from_millis(500)) {
-                                let v = *guard.node();
+                                let v = *guard;
                                 drop(guard);
                                 assert!(v >= last, "observations must be monotonic per reader");
                                 last = v;
