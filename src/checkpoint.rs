@@ -345,9 +345,9 @@ impl<'o, T> Drop for Handle<'o, T> {
     }
 }
 
-/// Transmitter side of the pair. Lives with the snapshotter; interior
-/// synchronization allows sharing behind a `Mutex`/`Arc` by several
-/// threads.
+/// Transmitter side of the pair. Lives with the snapshotter; the pair's
+/// `Shared` is borrowed for `'o`, and the internal request mutex lets
+/// several threads share the requester.
 pub struct CheckpointRequester<'a, T> {
     node: *const T,
     shared: &'a Shared,
