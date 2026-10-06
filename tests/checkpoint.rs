@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::{with_checkpoint_pair, CheckpointRequester, Handle};
+use servyi_states::checkpoint::{restore_from, with_checkpoint_pair, CheckpointRequester, Handle, Snapshotter};
 
 #[derive(Debug, Clone)]
 struct Io {
@@ -406,4 +406,109 @@ fn mid_run_snapshot_resumes() {
     ids.sort();
     assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
     assert!(io2.calls.load(Ordering::SeqCst) < 4 * 4 + 2 * 4);
+}
+
+
+#[test]
+fn save_restore_roundtrip() {
+    let (_g, dir) = tempdir();
+    let path = dir.join("snap.json");
+    let m = Machine {
+        items: (1..=3).map(|id| WorkItem { id, steps: 2 }).collect(),
+        ..Machine::default()
+    };
+    // Run to completion, snapshotting at the end of the pair closure.
+    let out = with_checkpoint_pair(m, |mut h, _req| {
+        loop {
+            h.safepoint();
+            let (h2, go) = step(h, &Io::new());
+            h = h2;
+            if !go {
+                break;
+            }
+        }
+        // Mutator-side save at a safepoint: no handshake, cannot block.
+        h.save_to(&path).expect("save at end");
+        h.clone()
+    });
+    let restored: Machine = restore_from(&path).expect("restore");
+    assert_eq!(out.done, restored.done);
+    assert_eq!(restored.result, out.result);
+}
+
+#[test]
+fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
+    let (_g, dir) = tempdir();
+    let path = dir.join("mid.json");
+    // Slow children + a fast snapshotter: snapshots land while the
+    // Scatter fan-out is in flight.
+    let io = Io { step_delay: Duration::from_millis(2), ..Io::new() };
+    let m = Machine {
+        items: (1..=4).map(|id| WorkItem { id, steps: 6 }).collect(),
+        ..Machine::default()
+    };
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    with_checkpoint_pair(m, |mut h, req| {
+        // Nested scope: the snapshotter thread must not outlive the
+        // pair's brand 'o.
+        let stop_ref = &stop;
+        std::thread::scope(|scope| {
+            let path2 = path.clone();
+            let snapper = scope.spawn(move || {
+                Snapshotter::new(req, &path2, Duration::from_millis(2)).run(stop_ref)
+            });
+            // Seq stage up to Scatter.
+            loop {
+                h.safepoint();
+                let (h2, go) = step(h, &Io::new());
+                h = h2;
+                if !go || matches!(h.stage, Stage::Scatter { .. }) {
+                    break;
+                }
+            }
+            // Scatter fan-out, slowly, while the snapshotter catches
+            // mid-flight states.
+            if matches!(h.stage, Stage::Scatter { .. }) {
+                h.fanout(
+                    &|mm: &mut Machine| match &mut mm.stage {
+                        Stage::Scatter { children } => children.iter_mut().collect(),
+                        _ => unreachable!(),
+                    },
+                    |a| run_analyze(a, &io),
+                );
+            }
+            stop_ref.store(true, Ordering::SeqCst);
+            let _snapshots = snapper.join().expect("snapshotter").expect("io");
+        });
+    });
+
+    // The snapshot file exists and is mid-resumable: count unfinished
+    // children at snapshot time.
+    let snap: Machine = restore_from(&path).expect("snapshot parses");
+    let unfinished_at_snap: u32 = match &snap.stage {
+        Stage::Scatter { children } => children.iter().filter(|c| c.done.is_none()).count() as u32,
+        _ => 0,
+    };
+
+    // RESUME from the mid-flight snapshot and run to completion.
+    let io2 = Io::new();
+    let resumed = drive(snap, &io2, None);
+    let mut ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
+
+    // THE PROPERTY: children that were already done at snapshot time were
+    // NOT re-run. run_analyze does `steps` io calls per child (plus one
+    // per finished child for the completion step... it calls io.step once
+    // per loop iteration). A child that resumes mid-way runs only its
+    // remaining steps; a done child runs ZERO. Exact bound:
+    // Exact bound: the only children that run io are those unfinished at
+    // snapshot time, each running at most its remaining steps (< 6 each),
+    // plus the Seq/Nested stages' small fixed cost (<= 6 + 2*4 calls).
+    let calls = io2.calls.load(Ordering::SeqCst);
+    let bound = unfinished_at_snap as usize * 6 + 6 + 2 * 4;
+    assert!(
+        calls <= bound,
+        "resume must skip finished children: {calls} calls, bound {bound} (unfinished at snap: {unfinished_at_snap})"
+    );
 }

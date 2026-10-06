@@ -15,6 +15,7 @@
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -205,6 +206,19 @@ impl<'o, T> Handle<'o, T> {
 
     fn park_self(&mut self) {
         park_self_fields(self.shared, &self.children);
+    }
+
+    /// Serialize the whole node to `path` as JSON, atomically — the
+    /// mutator-side save. Call between transitions (any point where
+    /// dereferencing the handle is legal): this thread owns the world, so
+    /// no stop-the-world handshake is needed and this can never block.
+    /// The snapshotter-side counterpart is
+    /// [`CheckpointRequester::save_to`].
+    pub fn save_to(&self, path: impl AsRef<Path>) -> std::io::Result<()>
+    where
+        T: serde::Serialize,
+    {
+        write_snapshot(&**self, path.as_ref())
     }
 
     /// Fan out over the children of this subtree.
@@ -423,6 +437,47 @@ impl<'a, T: Send> CheckpointRequester<'a, T> {
     }
 }
 
+impl<'a, T: Send + serde::Serialize> CheckpointRequester<'a, T> {
+    /// Stop the world and serialize the whole node to `path` as JSON,
+    /// atomically (temp file + rename, so a crash mid-write never
+    /// corrupts a previous snapshot).
+    ///
+    /// RESUMABILITY, courtesy of the fan-out design: actions store their
+    /// results INSIDE the node, so a snapshot taken while a fan-out is in
+    /// flight captures which children already completed — restoring from
+    /// it resumes the fan-out without re-running them.
+    ///
+    /// Blocks until the mutator parks (see [`request`](Self::request)).
+    pub fn save_to(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
+        let Some(guard) = self.request_impl(None) else {
+            // request() without a deadline only fails on a closed pair,
+            // which hands out the guard immediately — unreachable.
+            return Ok(());
+        };
+        write_snapshot(&*guard, path.as_ref())
+    }
+
+    /// [`save_to`](Self::save_to) with a deadline: returns `Ok(false)`
+    /// when the world did not stop in time (nothing was written).
+    pub fn try_save_to(&self, path: impl AsRef<Path>, timeout: Duration) -> std::io::Result<bool> {
+        match self.request_impl(Some(timeout)) {
+            Some(guard) => write_snapshot(&*guard, path.as_ref()).map(|()| true),
+            None => Ok(false),
+        }
+    }
+}
+
+/// Serialize the (quiesced) node to `path`, atomically.
+fn write_snapshot<T: serde::Serialize>(node: &T, path: &Path) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let file = std::fs::File::create(&tmp)?;
+        serde_json::to_writer(file, node)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// Direct access to the top-level node while every mutator is parked,
 /// through `Deref`/`DerefMut` — the world is stopped for the guard's
 /// whole life, so even mutable access is exclusive by construction.
@@ -493,4 +548,56 @@ pub fn with_checkpoint_pair<T, R>(
         _brand: PhantomData,
     };
     f(handle, requester)
+}
+
+/// Deserialize a node from a snapshot written by
+/// [`CheckpointRequester::save_to`]. Feed the result straight back into
+/// [`with_checkpoint_pair`] to resume: because fan-out results live in
+/// the node, everything the snapshot marked done stays done.
+pub fn restore_from<T: serde::de::DeserializeOwned>(
+    path: impl AsRef<Path>,
+) -> std::io::Result<T> {
+    let text = std::fs::read_to_string(path.as_ref())?;
+    serde_json::from_str(&text)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Periodic snapshot taker: run [`Snapshotter::run`] on any thread (a
+/// scoped one fits [`with_checkpoint_pair`]'s closure) and it saves the
+/// world to one file every `every`, overwriting atomically, until `stop`
+/// is set. The last complete write wins — restore gives you the most
+/// recent quiesced state.
+pub struct Snapshotter<'a, T> {
+    requester: CheckpointRequester<'a, T>,
+    path: std::path::PathBuf,
+    every: Duration,
+}
+
+impl<'a, T: Send + serde::Serialize> Snapshotter<'a, T> {
+    pub fn new(
+        requester: CheckpointRequester<'a, T>,
+        path: impl Into<std::path::PathBuf>,
+        every: Duration,
+    ) -> Self {
+        Self { requester, path: path.into(), every }
+    }
+
+    /// Save every `every` until `stop` is set. Returns the number of
+    /// snapshots written. A world that will not stop within one period
+    /// skips that round (`try_save_to`), so a busy machine never wedges
+    /// the snapshotter.
+    pub fn run(&self, stop: &std::sync::atomic::AtomicBool) -> std::io::Result<u64> {
+        let mut written: u64 = 0;
+        let ordering = Ordering::SeqCst;
+        while !stop.load(ordering) {
+            thread::sleep(self.every);
+            if stop.load(ordering) {
+                break;
+            }
+            if self.requester.try_save_to(&self.path, self.every)? {
+                written += 1;
+            }
+        }
+        Ok(written)
+    }
 }
