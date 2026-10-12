@@ -398,7 +398,7 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
                                 a.step += 1;
                             }
                             a.done = Some(format!("v{}", a.item.id));
-                            early_done_ref.fetch_add(1, Ordering::SeqCst);
+                            let _prev = early_done_ref.fetch_add(1, Ordering::SeqCst);
                         }
                         // …then everyone holds until the snapshot fired.
                         while !snap_taken_ref.load(Ordering::SeqCst) {
