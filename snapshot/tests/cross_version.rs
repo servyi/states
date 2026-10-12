@@ -19,8 +19,17 @@ use servyi_states_snapshot as snapshot;
 
 // ---------------------------------------------------------------------------
 // The stable shape: what v1 wrote, what v2 reads. NEVER changes once
-// published — this is the contract.
+// published — this is the contract. Restoring goes through a dyn impl of
+// exactly this shape — the trait object is the seam where version code
+// changes while the shape does not.
 // ---------------------------------------------------------------------------
+
+/// The stable shape contract: `restore` is the code that changes per
+/// version; the implementing TYPE is the frozen shape.
+trait Shape {
+    type State;
+    fn restore(&self) -> Self::State;
+}
 
 /// Snapshot shape, version 1 — frozen.
 #[derive(Serialize, Deserialize)]
@@ -90,12 +99,14 @@ mod v2 {
         pub needs_fix: bool,
     }
 
-    impl ShapeV1 {
+    impl Shape for ShapeV1 {
+        type State = MachineV2;
+
         /// v2's restorer — THIS code changed between versions; the shape
         /// did not. v1 recorded the completion step twice, so anything
         /// v1 called finished is restored as a pre-fix state: done, but
         /// flagged for the fixer to re-validate.
-        pub fn restore(&self) -> MachineV2 {
+        fn restore(&self) -> MachineV2 {
             MachineV2 {
                 items: self
                     .steps_total
@@ -235,8 +246,11 @@ fn unfixed_prefix_state_refuses_to_run_and_reports() {
     // with unfinished work — surfaced to the caller instead of silently
     // misbehaving. Here we assert the stall is observable via a bounded
     // probe, standing in for the error gate parking the process.
-    let restored =
-        ShapeV1 { steps_total: vec![3], steps_done: vec![3], finished: vec![true] };
+    let restored: Box<dyn Shape<State = v2::MachineV2>> = Box::new(ShapeV1 {
+        steps_total: vec![3],
+        steps_done: vec![3],
+        finished: vec![true],
+    });
     let machine_v2 = restored.restore();
     assert!(machine_v2.items[0].needs_fix);
 
