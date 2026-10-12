@@ -71,6 +71,14 @@ pub fn restore_from<T: serde::de::DeserializeOwned>(
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
+/// Serialize any snapshot artifact (a stable shape, a versioned envelope,
+/// or the node itself) to `path`, atomically — the primitive the save
+/// functions are built on. Version-skew workflows save their SHAPE
+/// through this, never their machine type.
+pub fn write_value<T: serde::Serialize>(value: &T, path: impl AsRef<Path>) -> std::io::Result<()> {
+    write_snapshot(value, path.as_ref())
+}
+
 /// Serialize the (quiesced or owned) node to `path`, atomically.
 fn write_snapshot<T: serde::Serialize>(node: &T, path: &Path) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
