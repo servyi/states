@@ -237,7 +237,7 @@ fn unfixed_prefix_state_refuses_to_run_and_reports() {
     // probe, standing in for the error gate parking the process.
     let restored =
         ShapeV1 { steps_total: vec![3], steps_done: vec![3], finished: vec![true] };
-    let mut machine_v2 = restored.restore();
+    let machine_v2 = restored.restore();
     assert!(machine_v2.items[0].needs_fix);
 
     let io = CountingIo::default();
