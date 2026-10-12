@@ -75,7 +75,7 @@ fn validate_run_trace(r: &Run, item_total: u32) {
                         parts.next().and_then(|v| v.parse::<u32>().ok()),
                     );
                     if let (Some(s), Some(t)) = (s, t) {
-                        finishes.insert(id, (s, t));
+                        let _prev = finishes.insert(id, (s, t));
                     } else {
                         unreachable!("malformed finish event: {line}");
                     }
