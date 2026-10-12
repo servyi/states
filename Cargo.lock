@@ -371,8 +371,6 @@ dependencies = [
  "serde_json",
  "servyi-states",
  "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

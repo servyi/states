@@ -22,3 +22,6 @@ tempfile = "3"
 
 [workspace]
 members = ["snapshot"]
+# cross-version-fixtures/* are intentionally NOT members: each fixture is
+# its own [workspace] — an independently versioned codebase built by the
+# cross-version tests.

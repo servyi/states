@@ -106,10 +106,25 @@ fn validate_run_trace(r: &Run, item_total: u32) {
     );
 }
 
-macro_rules! exe {
-    ($name:literal) => {
-        env!(concat!("CARGO_BIN_EXE_", $name))
-    };
+/// Each fixture is built from its own crate (own [workspace]) at test
+/// time — genuinely separate versioned codebases, not targets of this
+/// crate.
+fn build_fixture(version: u8) -> String {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../cross-version-fixtures/version{version}"));
+    let out = std::process::Command::new(
+        std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
+    )
+    .args(["build", "--manifest-path", manifest.join("Cargo.toml").to_str().expect("utf8")])
+    .status()
+    .expect("cargo build fixture");
+    assert!(out.success(), "fixture v{version} failed to build");
+    manifest
+        .join("target/debug")
+        .join(format!("cross-version-fixture-v{version}"))
+        .to_str()
+        .expect("utf8")
+        .to_string()
 }
 
 #[test]
@@ -148,14 +163,14 @@ fn path_v1_saved_by_version1_restored_by_version2() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.json");
 
-    let save = run(exe!("version1"), "save", &path);
+    let save = run(&build_fixture(1), "save", &path);
     assert!(
         save.err.contains("[v1:save] wrote ShapeV1"),
         "saver trace: {}",
         save.err
     );
 
-    let r = run(exe!("version2"), "restore-run", &path);
+    let r = run(&build_fixture(2), "restore-run", &path);
     // OBSERVED: v2's restore code took the origin-1 upgrade path.
     assert!(
         r.err.contains("[v2:restore] origin=v1 (upgrading through v2's knowledge)"),
@@ -179,8 +194,8 @@ fn path_v1_saved_by_version1_restored_by_version3() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("b.json");
 
-    let _saved = run(exe!("version1"), "save", &path);
-    let r = run(exe!("version3"), "restore-run", &path);
+    let _saved = run(&build_fixture(1), "save", &path);
+    let r = run(&build_fixture(3), "restore-run", &path);
     assert!(
         r.err.contains("[v3:restore] origin=v1 (one-hop upgrade)"),
         "restore trace: {}",
@@ -198,14 +213,14 @@ fn path_v2_saved_by_version2_restored_by_version3() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.json");
 
-    let save = run(exe!("version2"), "save", &path);
+    let save = run(&build_fixture(2), "save", &path);
     assert!(
         save.err.contains("[v2:save] wrote ShapeV2"),
         "saver trace: {}",
         save.err
     );
 
-    let r = run(exe!("version3"), "restore-run", &path);
+    let r = run(&build_fixture(3), "restore-run", &path);
     assert!(
         r.err
             .contains("[v3:restore] origin=v2 (repairing the early-flag bug)"),
@@ -225,8 +240,8 @@ fn control_v3_saved_and_restored_by_version3_is_lossless() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("d.json");
 
-    let _saved = run(exe!("version3"), "save", &path);
-    let r = run(exe!("version3"), "restore-run", &path);
+    let _saved = run(&build_fixture(3), "save", &path);
+    let r = run(&build_fixture(3), "restore-run", &path);
     assert!(
         r.err.contains("[v3:restore] origin=v3 (own shape, lossless)"),
         "restore trace: {}",
