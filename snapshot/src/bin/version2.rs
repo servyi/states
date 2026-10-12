@@ -166,18 +166,23 @@ fn restore_run(path: &str) {
 fn run(machine: Machine) -> (String, usize) {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = std::sync::Arc::clone(&calls);
+    let mut skip_logged = std::collections::HashSet::new();
     let out = with_checkpoint_pair(machine, move |mut h, _req| loop {
         h.safepoint();
         let m = &mut *h;
         for item in &mut m.items {
             if item.done.is_some() || item.needs_fix {
-                tracing::info!("[v2:run] item {} skipped (done)", item.id);
+                // One skip event per item, not one per loop iteration.
+                if skip_logged.insert(item.id) {
+                    tracing::info!("[v2:run] item {} skipped (done)", item.id);
+                }
                 continue;
             }
             let _n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             item.step += 1;
             if item.step >= item.steps {
                 item.done = Some(format!("v{}", item.id));
+                tracing::info!("[v2:run] item {} finished (step {}/{})", item.id, item.step, item.steps);
             }
         }
         if m.items.iter().all(|i| i.done.is_some()) {

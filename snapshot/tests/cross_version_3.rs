@@ -81,6 +81,7 @@ fn path_v1_saved_by_version1_restored_by_version2() {
     assert!(r.err.contains("[v2:fix] item 1 pre-fix resolved"), "{}", r.err);
     // OBSERVED: the finished item was skipped by the runner (zero io).
     assert!(r.err.contains("[v2:run] item 1 skipped (done)"), "{}", r.err);
+    assert!(r.err.contains("[v2:run] item 2 finished (step 3/3)"), "{}", r.err);
 
     assert_eq!(out_str(&r), "v1,v2", "two items done");
     // The unfinished item had 1 of 3 steps left (v1 recorded step 2).
@@ -100,6 +101,7 @@ fn path_v1_saved_by_version1_restored_by_version3() {
         r.err
     );
     assert!(r.err.contains("[v3:fix] item 1 pre-fix resolved"), "{}", r.err);
+    assert!(r.err.contains("[v3:run] item 2 finished (step 3/3)"), "{}", r.err);
     assert_eq!(out_str(&r), "v1,v2");
     assert_eq!(io_count(&r), 1, "only the last step of the unfinished item");
 }
@@ -126,6 +128,7 @@ fn path_v2_saved_by_version2_restored_by_version3() {
     // v2's early-flagged item arrived pre-fix and was resolved at zero cost.
     assert!(r.err.contains("[v3:fix] item 1 pre-fix resolved"), "{}", r.err);
     assert_eq!(out_str(&r), "v1,v2");
+    assert!(r.err.contains("[v3:run] item 2 finished (step 3/3)"), "{}", r.err);
     assert_eq!(io_count(&r), 3, "the not-started item ran all 3 steps");
 }
 
@@ -143,6 +146,7 @@ fn control_v3_saved_and_restored_by_version3_is_lossless() {
     );
     // OBSERVED: no fixer activity on same-version artifacts.
     assert!(!r.err.contains("[v3:fix]"), "no pre-fix expected: {}", r.err);
+    assert!(r.err.contains("[v3:run] item 2 finished (step 3/3)"), "{}", r.err);
     assert_eq!(out_str(&r), "v1,v2");
     assert_eq!(io_count(&r), 2, "only the unfinished item remaining steps");
 }
