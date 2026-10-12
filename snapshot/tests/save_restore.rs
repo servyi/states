@@ -151,28 +151,34 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
         return (h, false);
     }
     // Fan-out stages: run while serving checkpoints, then read results
-    // from the node.
+    // from the node. Which fan-out to run, without borrowing `h` for the
+    // match arm (NLL limitation; Polonius would allow the direct match).
+    enum Fan {
+        Scatter,
+        Nested,
+    }
+    // Seq advances (or Done exits) inside the block above; only the
+    // fan-out stages reach here.
     let which = match &h.stage {
-        Stage::Scatter { .. } => 0,
-        Stage::Nested { .. } => 1,
-        _ => -1,
+        Stage::Scatter { .. } => Fan::Scatter,
+        Stage::Nested { .. } => Fan::Nested,
+        Stage::Seq { .. } | Stage::Done => return (h, true),
     };
     match which {
-        0 => h.fanout(
+        Fan::Scatter => h.fanout(
             &|m: &mut Machine| match &mut m.stage {
                 Stage::Scatter { children } => children.iter_mut().collect(),
                 _ => unreachable!("checked above"),
             },
             |a| run_analyze(a, io),
         ),
-        1 => h.fanout(
+        Fan::Nested => h.fanout(
             &|m: &mut Machine| match &mut m.stage {
                 Stage::Nested { groups } => groups.iter_mut().collect(),
                 _ => unreachable!("checked above"),
             },
             |g| run_group(g, io),
         ),
-        _ => {}
     }
     let m = &mut *h;
     let mut collected: Vec<(u32, String)> = Vec::new();
