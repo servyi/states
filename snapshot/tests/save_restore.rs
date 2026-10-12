@@ -51,10 +51,16 @@ impl AnalyzeState {
 fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
     loop {
         h.safepoint();
-        let (id, steps) = {
+        let (id, steps, already_done) = {
             let st = &*h;
-            (st.item.id, st.item.steps)
+            (st.item.id, st.item.steps, st.step >= st.item.steps)
         };
+        // A restored child that was already finished does NO work —
+        // this is the resume-skips-finished property under test.
+        if already_done {
+            h.done = Some(format!("v{id}"));
+            return;
+        }
         io.step(id);
         h.safepoint();
         let finished = {
@@ -316,6 +322,9 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
     // snapper releases after its first successful write.
     let snap_taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let snap_taken_ref = &snap_taken;
+    // The snapper must not fire before BOTH early children finished.
+    let early_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let early_done_ref = &early_done;
     let slow_io = Io { step_delay: Duration::from_millis(1), ..Io::new() };
 
     let m = Machine {
@@ -327,20 +336,47 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
             let path2 = path.clone();
             let snapper = scope.spawn(move || {
                 // ONE snapshot, taken while the barrier holds the children
-                // mid-fan-out — the file must keep exactly that state, so
-                // the snapper exits after the first successful write.
+                // mid-fan-out — AFTER both early children finished, and
+                // before the late ones start. The file must keep exactly
+                // that state, so the snapper exits after the write.
+                while early_done_ref.load(Ordering::SeqCst) < 2 {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 while !snapshot::try_save_requester(&req, &path2, Duration::from_millis(50))? {
                     std::thread::sleep(Duration::from_millis(1));
                 }
                 snap_taken_ref.store(true, Ordering::SeqCst);
                 Ok::<_, std::io::Error>(())
             });
-            // Seq stage up to Scatter.
+            // Seq stage up to Scatter — hand-rolled: `step` would run the
+            // fan-outs internally, bypassing this test's barrier action.
             loop {
                 h.safepoint();
-                let (h2, go) = step(h, &Io::new());
-                h = h2;
-                if !go || matches!(h.stage, Stage::Scatter { .. }) {
+                let advanced = {
+                    let m = &mut *h;
+                    match &mut m.stage {
+                        Stage::Seq { step } if (*step as usize) < m.items.len() => {
+                            *step += 1;
+                            true
+                        }
+                        Stage::Seq { .. } => {
+                            m.stage = Stage::Scatter {
+                                children: m
+                                    .items
+                                    .iter()
+                                    .map(|i| AnalyzeState {
+                                        item: i.clone(),
+                                        step: 0,
+                                        done: None,
+                                    })
+                                    .collect(),
+                            };
+                            true
+                        }
+                        _ => false,
+                    }
+                };
+                if !advanced || matches!(h.stage, Stage::Scatter { .. }) {
                     break;
                 }
             }
@@ -362,6 +398,7 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
                                 a.step += 1;
                             }
                             a.done = Some(format!("v{}", a.item.id));
+                            early_done_ref.fetch_add(1, Ordering::SeqCst);
                         }
                         // …then everyone holds until the snapshot fired.
                         while !snap_taken_ref.load(Ordering::SeqCst) {
@@ -397,11 +434,12 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
     ids.sort();
     assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
 
-    // THE PROPERTY: children already done at snapshot time were NOT re-run.
-    // Only the 2 unfinished children run steps (≤ 6 each), plus the
-    // Seq/Nested overhead (≤ 6 + 2*4 calls).
+    // THE PROPERTY: children already done at snapshot time were NOT
+    // re-run — zero IO for them. The unfinished children run ≤ 6 steps
+    // each; the Nested stage (fresh machines, 4 children × 6 steps) is
+    // the only other IO the resumed run performs.
     let calls = io2.calls.load(Ordering::SeqCst);
-    let bound = unfinished_at_snap * 6 + 6 + 2 * 4;
+    let bound = unfinished_at_snap * 6 + 4 * 6;
     assert!(
         calls <= bound,
         "resume must skip finished children: {calls} calls, bound {bound}"
