@@ -9,6 +9,26 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  hygiene:
+    # Repo hygiene is part of the policy: build artifacts and binaries
+    # must never be tracked. Failed once (2179 fixture target files);
+    # this check makes it impossible to merge again.
+    name: no build artifacts tracked
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: fail if target/ or ELF files are tracked
+        run: |
+          set -eu
+          bad=$(git ls-files | grep -E '(^|/)target/' || true)
+          if [ -n "$bad" ]; then
+            echo "tracked build artifacts:"; echo "$bad"; exit 1
+          fi
+          elf=$(git ls-files -z | xargs -0 -r file | grep ':.*ELF' || true)
+          if [ -n "$elf" ]; then
+            echo "tracked ELF files:"; echo "$elf"; exit 1
+          fi
+
   test:
     name: tests
     runs-on: ubuntu-latest

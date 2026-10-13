@@ -1,1 +1,6 @@
-/target
+# Build artifacts — anywhere in the tree (fixtures compile in place).
+target/
+**/target/
+
+# Fixture binaries compiled at test time by the cross-version tests.
+cross-version-fixtures/*/target/

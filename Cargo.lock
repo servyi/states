@@ -356,10 +356,21 @@ dependencies = [
  "futures",
  "serde",
  "serde_json",
+ "servyi-states-snapshot",
  "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "servyi-states-snapshot"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "servyi-states",
+ "tempfile",
 ]
 
 [[package]]
