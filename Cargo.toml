@@ -25,3 +25,14 @@ members = ["snapshot"]
 # cross-version-fixtures/* are intentionally NOT members: each fixture is
 # its own [workspace] — an independently versioned codebase built by the
 # cross-version tests.
+
+[features]
+# Serialize/Deserialize for the trackers, so checkpoint consumers
+# snapshot/restore them through serde instead of ad-hoc accessors that
+# would bypass the phase-transition discipline.
+serde = ["dep:serde"]
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true

@@ -44,6 +44,8 @@ jobs:
         run: cargo build --workspace
       - name: test
         run: cargo test --workspace
+      - name: test (serde)
+        run: cargo test --workspace --features serde
 
   lint-policy:
     # Shared Servyi policy (servyi/lints): clippy under the shared
