@@ -80,8 +80,12 @@ pub fn write_value<T: serde::Serialize>(value: &T, path: impl AsRef<Path>) -> st
 }
 
 /// Serialize the (quiesced or owned) node to `path`, atomically.
+const TEMP_FILE_EXTENSION: &str = "tmp";
+/// Where the written-snapshot counter starts.
+const SNAPSHOTS_WRITTEN_START: u64 = 0;
+
 fn write_snapshot<T: serde::Serialize>(node: &T, path: &Path) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(TEMP_FILE_EXTENSION);
     {
         let file = std::fs::File::create(&tmp)?;
         serde_json::to_writer(file, node)
@@ -113,7 +117,7 @@ impl<'a, T: serde::Serialize + Send> Snapshotter<'a, T> {
     /// snapshots written.
     pub fn run(&self, stop: &std::sync::atomic::AtomicBool) -> std::io::Result<u64> {
         use std::sync::atomic::Ordering;
-        let mut written: u64 = 0;
+        let mut written: u64 = SNAPSHOTS_WRITTEN_START;
         while !stop.load(Ordering::SeqCst) {
             std::thread::sleep(self.every);
             if stop.load(Ordering::SeqCst) {

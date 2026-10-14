@@ -6,6 +6,13 @@ static GLOBAL_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static ROOT: OnceLock<ContextId> = OnceLock::new();
 
+/// Id of the root context.
+const ROOT_CONTEXT_ID: u64 = 0;
+/// Counter value a fresh context's children start from.
+const FIRST_CHILD_COUNTER: u64 = 1;
+/// Name-segment index where the dot separator starts.
+const FIRST_SEGMENT_INDEX: usize = 0;
+
 pub struct ContextId {
     id: u64,
     name: Vec<u64>,
@@ -15,9 +22,9 @@ pub struct ContextId {
 impl ContextId {
     pub fn root() -> &'static ContextId {
         ROOT.get_or_init(|| ContextId {
-            id: 0,
+            id: ROOT_CONTEXT_ID,
             name: Vec::new(),
-            child_counter: Mutex::new(1),
+            child_counter: Mutex::new(FIRST_CHILD_COUNTER),
         })
     }
 
@@ -41,7 +48,7 @@ impl ContextId {
         ContextId {
             id: GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed),
             name,
-            child_counter: Mutex::new(1),
+            child_counter: Mutex::new(FIRST_CHILD_COUNTER),
         }
     }
 
@@ -56,7 +63,7 @@ impl fmt::Display for ContextId {
             return write!(f, "0");
         }
         for (i, seg) in self.name.iter().enumerate() {
-            if i > 0 {
+            if i > FIRST_SEGMENT_INDEX {
                 write!(f, ".")?;
             }
             write!(f, "{}", seg)?;

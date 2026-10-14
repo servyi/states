@@ -89,13 +89,22 @@ mod tests {
     use super::*;
     use crate::context_id::ContextId;
 
+    /// Phase names of the little lifecycle the tests exercise.
+    const PHASE_OPEN: &str = "open";
+    const PHASE_CLOSED: &str = "closed";
+    const PHASE_RETRY: &str = "retry";
+    const PHASE_DONE: &str = "done";
+    const PHASE_UNEXPECTED: &str = "wrong";
+    const PHASE_OF_A: &str = "phase_a";
+    const PHASE_OF_B: &str = "phase_b";
+
     #[test]
     fn test_advance_from_none() {
         let tracker = DefaultPhaseTracker::<&str>::new();
         let root = ContextId::root();
         let ctx = root.new_child();
-        tracker.advance(&ctx, None, "open");
-        assert_eq!(tracker.get_phase(&ctx), Some("open"));
+        tracker.advance(&ctx, None, PHASE_OPEN);
+        assert_eq!(tracker.get_phase(&ctx), Some(PHASE_OPEN));
     }
 
     #[test]
@@ -103,9 +112,9 @@ mod tests {
         let tracker = DefaultPhaseTracker::<&str>::new();
         let root = ContextId::root();
         let ctx = root.new_child();
-        tracker.advance(&ctx, None, "open");
-        tracker.advance(&ctx, Some("open"), "closed");
-        assert_eq!(tracker.get_phase(&ctx), Some("closed"));
+        tracker.advance(&ctx, None, PHASE_OPEN);
+        tracker.advance(&ctx, Some(PHASE_OPEN), PHASE_CLOSED);
+        assert_eq!(tracker.get_phase(&ctx), Some(PHASE_CLOSED));
     }
 
     #[test]
@@ -114,8 +123,8 @@ mod tests {
         let tracker = DefaultPhaseTracker::<&str>::new();
         let root = ContextId::root();
         let ctx = root.new_child();
-        tracker.advance(&ctx, None, "open");
-        tracker.advance(&ctx, Some("wrong"), "closed");
+        tracker.advance(&ctx, None, PHASE_OPEN);
+        tracker.advance(&ctx, Some(PHASE_UNEXPECTED), PHASE_CLOSED);
     }
 
     #[test]
@@ -123,9 +132,9 @@ mod tests {
         let tracker = DefaultPhaseTracker::<&str>::new();
         let root = ContextId::root();
         let ctx = root.new_child();
-        tracker.advance(&ctx, None, "open");
-        tracker.expect_any_and_set(&ctx, &["open", "retry"], "done");
-        assert_eq!(tracker.get_phase(&ctx), Some("done"));
+        tracker.advance(&ctx, None, PHASE_OPEN);
+        tracker.expect_any_and_set(&ctx, &[PHASE_OPEN, PHASE_RETRY], PHASE_DONE);
+        assert_eq!(tracker.get_phase(&ctx), Some(PHASE_DONE));
     }
 
     #[test]
@@ -142,9 +151,9 @@ mod tests {
         let root = ContextId::root();
         let a = root.new_child();
         let b = root.new_child();
-        tracker.advance(&a, None, "phase_a");
-        tracker.advance(&b, None, "phase_b");
-        assert_eq!(tracker.get_phase(&a), Some("phase_a"));
-        assert_eq!(tracker.get_phase(&b), Some("phase_b"));
+        tracker.advance(&a, None, PHASE_OF_A);
+        tracker.advance(&b, None, PHASE_OF_B);
+        assert_eq!(tracker.get_phase(&a), Some(PHASE_OF_A));
+        assert_eq!(tracker.get_phase(&b), Some(PHASE_OF_B));
     }
 }

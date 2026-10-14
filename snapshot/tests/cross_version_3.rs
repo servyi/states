@@ -15,6 +15,11 @@
 //! these tests capture the traces and assert the upgrade actually took
 //! the claimed path.
 
+
+// The scenario literals below are test data (see header); they are
+// the one class the inline_literal policy exempts via allow.
+#![allow(unknown_lints)] // plain clippy does not know the driver's lints
+#![allow(inline_literal)]
 use std::process::Command;
 
 struct Run {
