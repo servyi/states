@@ -10,8 +10,6 @@ static ROOT: OnceLock<ContextId> = OnceLock::new();
 const ROOT_CONTEXT_ID: u64 = 0;
 /// Counter value a fresh context's children start from.
 const FIRST_CHILD_COUNTER: u64 = 1;
-/// Increment of the global id counter.
-const NEXT_ID_STEP: u64 = 1;
 /// Name-segment index where the dot separator starts.
 const FIRST_SEGMENT_INDEX: usize = 0;
 
@@ -48,7 +46,7 @@ impl ContextId {
         name.extend_from_slice(&self.name);
         name.push(child_num);
         ContextId {
-            id: GLOBAL_COUNTER.fetch_add(NEXT_ID_STEP, Ordering::Relaxed),
+            id: GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed),
             name,
             child_counter: Mutex::new(FIRST_CHILD_COUNTER),
         }
