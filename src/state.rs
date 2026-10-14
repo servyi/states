@@ -68,14 +68,19 @@ where
 mod tests {
     use super::*;
 
+    const STEPS_REMAINING_DONE: u32 = 0;
+    const STEP_DECREMENT: u32 = 1;
+    const FINAL_RESULT: u32 = 42;
+    const INITIAL_STEPS: u32 = 3;
+
     struct Increment(u32);
     #[async_trait]
     impl State<u32> for Increment {
         async fn execute(self: Box<Self>) -> Result<Step<u32>> {
-            if self.0 > 0 {
-                Ok(Step::Continue(Box::new(Increment(self.0 - 1))))
+            if self.0 > STEPS_REMAINING_DONE {
+                Ok(Step::Continue(Box::new(Increment(self.0 - STEP_DECREMENT))))
             } else {
-                Ok(Step::Done(42))
+                Ok(Step::Done(FINAL_RESULT))
             }
         }
     }
@@ -83,15 +88,15 @@ mod tests {
     #[test]
     fn test_run_to_completion_linear() {
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_to_completion(Box::new(Increment(3))));
-        assert_eq!(result.unwrap(), 42);
+        let result = rt.block_on(run_to_completion(Box::new(Increment(INITIAL_STEPS))));
+        assert_eq!(result.unwrap(), FINAL_RESULT);
     }
 
     #[test]
     fn test_run_to_completion_immediate() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         let result = rt.block_on(run_to_completion(Box::new(Increment(0))));
-        assert_eq!(result.unwrap(), 42);
+        assert_eq!(result.unwrap(), FINAL_RESULT);
     }
 
     struct FailState;

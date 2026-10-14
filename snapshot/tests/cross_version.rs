@@ -10,6 +10,11 @@
 //!    product) transitions it to a fully fixed state before the machine
 //!    runs. The crate sees none of this — only the checkpoint protocol.
 
+
+// The scenario literals below are test data (see header); they are
+// the one class the inline_literal policy exempts via allow.
+#![allow(unknown_lints)] // plain clippy does not know the driver's lints
+#![allow(inline_literal)]
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 

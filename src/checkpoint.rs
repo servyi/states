@@ -18,6 +18,11 @@ use std::sync::{Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Where child-storage vectors start indexing.
+const INDEX_START: usize = 0;
+/// How long the join loop sleeps between finished-checks.
+const JOIN_POLL_INTERVAL_MS: u64 = 1;
+
 /// Outcome of the stop request handshake.
 enum Handshake {
     /// The other side is parked and holds no references.
@@ -237,8 +242,9 @@ impl<'o, T> Handle<'o, T> {
             let node: &mut T = self;
             split(node).into_iter().map(std::ptr::from_mut).collect()
         };
-        let mut storages: Vec<Shared> =
-            (0..child_ptrs.len()).map(|_| Shared::new()).collect();
+        let mut storages: Vec<Shared> = (INDEX_START..child_ptrs.len())
+            .map(|_| Shared::new())
+            .collect();
         // Node borrow dropped: swap the collected vec in, then create the
         // handles from the elements' final resting places.
         let start = self.children.len();
@@ -272,7 +278,7 @@ impl<'o, T> Handle<'o, T> {
                 if joins.iter().all(|j| j.is_finished()) {
                     break;
                 }
-                thread::sleep(Duration::from_millis(1));
+                thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
             // Join: a panicked child propagates from scope exit.
         });

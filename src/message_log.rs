@@ -78,16 +78,22 @@ struct EventVisitor {
 }
 
 const CTX_FIELD_NAMES: &[&str] = &["ctx", "context_id", "func_ctx", "fctx"];
+/// The tracing field carrying the event message.
+const MESSAGE_FIELD_NAME: &str = "message";
+/// Prefix tracing puts on visitor-supplied field names.
+const SELF_MODULE_PREFIX: &str = "self.";
+/// Separator of the context-id path segments.
+const SEGMENT_SEPARATOR: char = '.';
 
 fn normalize_field_name(name: &str) -> &str {
-    name.strip_prefix("self.").unwrap_or(name)
+    name.strip_prefix(SELF_MODULE_PREFIX).unwrap_or(name)
 }
 
 impl Visit for EventVisitor {
     fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn fmt::Debug) {
         let formatted = format!("{:?}", value);
         let name = normalize_field_name(field.name());
-        if name == "message" {
+        if name == MESSAGE_FIELD_NAME {
             self.message = formatted;
         } else if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(formatted);
@@ -98,7 +104,7 @@ impl Visit for EventVisitor {
 
     fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
         let name = normalize_field_name(field.name());
-        if name == "message" {
+        if name == MESSAGE_FIELD_NAME {
             self.message = value.to_string();
         } else if CTX_FIELD_NAMES.contains(&name) {
             self.context_ids.push(value.to_string());
@@ -181,7 +187,7 @@ pub fn ancestors(ctx_id: &str) -> Vec<String> {
     let mut current = ctx_id;
     loop {
         result.push(current.to_string());
-        match current.rfind('.') {
+        match current.rfind(SEGMENT_SEPARATOR) {
             Some(pos) => current = &current[..pos],
             None => break,
         }
@@ -191,12 +197,21 @@ pub fn ancestors(ctx_id: &str) -> Vec<String> {
 
 pub fn is_valid_ctx_id(s: &str) -> bool {
     !s.is_empty()
-        && s.split('.').all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
+        && s
+            .split(SEGMENT_SEPARATOR)
+            .all(|seg| !seg.is_empty() && seg.chars().all(|c| c.is_ascii_digit()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_TARGET_NAME: &str = "test";
+    const TEST_CTX_PATH: &str = "1.2";
+    const TEST_MESSAGE: &str = "hello";
+    const EXPECTED_ENTRY_COUNT: usize = 1;
+    const ABSENT_CTX_PATH: &str = "9.9";
+    const FIRST_ENTRY_INDEX: usize = 0;
 
     #[test]
     fn test_ancestors_leaf() {
@@ -228,7 +243,7 @@ mod tests {
         LogEntry {
             seq: log.next_seq(),
             level: tracing::Level::INFO,
-            target: "test".to_string(),
+            target: TEST_TARGET_NAME.to_string(),
             message: message.to_string(),
             fields: vec![],
         }
@@ -237,10 +252,10 @@ mod tests {
     #[test]
     fn test_message_log_push_and_get() {
         let log = MessageLog::new();
-        log.push("1.2".to_string(), test_entry(&log, "hello"));
-        let entries = log.get("1.2");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].message, "hello");
-        assert!(log.get("9.9").is_empty());
+        log.push(TEST_CTX_PATH.to_string(), test_entry(&log, TEST_MESSAGE));
+        let entries = log.get(TEST_CTX_PATH);
+        assert_eq!(entries.len(), EXPECTED_ENTRY_COUNT);
+        assert_eq!(entries[FIRST_ENTRY_INDEX].message, TEST_MESSAGE);
+        assert!(log.get(ABSENT_CTX_PATH).is_empty());
     }
 }
