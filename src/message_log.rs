@@ -183,16 +183,14 @@ impl<S: tracing::Subscriber> Layer<S> for MessageLogLayer {
 }
 
 pub fn ancestors(ctx_id: &str) -> Vec<String> {
-    let mut result = Vec::new();
-    let mut current = ctx_id;
-    loop {
-        result.push(current.to_string());
-        match current.rfind(SEGMENT_SEPARATOR) {
-            Some(pos) => current = &current[..pos],
-            None => break,
-        }
-    }
-    result
+    // Split once into segments, then emit the progressively shorter
+    // prefixes — same ancestor order as walking the separators right
+    // to left, built from allowed primitives.
+    let segments: Vec<&str> = ctx_id.split(SEGMENT_SEPARATOR).collect();
+    (1..=segments.len())
+        .rev()
+        .map(|n| segments[..n].join(&SEGMENT_SEPARATOR.to_string()))
+        .collect()
 }
 
 pub fn is_valid_ctx_id(s: &str) -> bool {

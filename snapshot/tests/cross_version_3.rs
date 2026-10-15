@@ -40,10 +40,19 @@ fn run(bin: &str, cmd: &str, path: &std::path::Path) -> Run {
     }
 }
 
+/// Trace field after a fixed `"OUT "` tag (allowed primitives: `get`).
+fn after_tag<'a>(l: &'a str, tag: &str) -> Option<&'a str> {
+    if l.get(..tag.len()) == Some(tag) {
+        Some(&l[tag.len()..])
+    } else {
+        None
+    }
+}
+
 fn out_str(r: &Run) -> String {
     r.out
         .lines()
-        .find_map(|l| l.strip_prefix("OUT "))
+        .find_map(|l| after_tag(l, "OUT "))
         .map(str::trim)
         .map(str::to_string)
         .unwrap_or_else(|| unreachable!("OUT missing from output: {}", r.out))
@@ -52,7 +61,7 @@ fn out_str(r: &Run) -> String {
 fn io_count(r: &Run) -> usize {
     r.out
         .lines()
-        .find_map(|l| l.strip_prefix("IO "))
+        .find_map(|l| after_tag(l, "IO "))
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or_else(|| unreachable!("IO missing from output: {}", r.out))
 }
@@ -74,7 +83,7 @@ fn validate_run_trace(r: &Run, item_total: u32) {
                 Some("finished") => {
                     // "... finished (step S/T)"
                     let paren = rest.split("(step ").nth(1).unwrap_or("");
-                    let mut parts = paren.trim_end_matches(')').split('/');
+                    let mut parts = paren.split(')').next().unwrap_or("").split('/');
                     let (s, t) = (
                         parts.next().and_then(|v| v.parse::<u32>().ok()),
                         parts.next().and_then(|v| v.parse::<u32>().ok()),
