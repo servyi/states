@@ -13,29 +13,35 @@ use anyhow::Result;
 use std::sync::Mutex;
 use std::thread;
 
+/// Interval between child-finish checks while the fan-out serve loop waits.
+const JOIN_POLL_INTERVAL_MS: u64 = 1;
+
 use crate::checkpoint::{Handle, Shared, park_self_fields, with_checkpoint_pair};
 
-/// The machine node: the current state.
-pub type StateNode<K, E> = Box<dyn State<K, Env = E> + Send + Sync>;
+/// The machine node: the current state. The object lifetime `'e` is the
+/// machine's run — long enough for the env (borrowed providers and the
+/// like), while the states themselves stay `'static`.
+pub type StateNode<'e, K, E> = Box<dyn State<'e, K, Env = E> + Send + Sync + 'e>;
 
 /// What a state decides: its successor, or the machine's result.
-pub enum Step<K, E: ?Sized> {
-    Continue(StateNode<K, E>),
+pub enum Step<'e, K, E: ?Sized + 'e> {
+    Continue(StateNode<'e, K, E>),
     Done(K),
 }
 
-pub trait State<K>: Send + Sync + 'static
+pub trait State<'e, K>: Send + Sync
 where
     K: Send + 'static,
-    Self::Env: 'static,
 {
-    /// The machine's environment (providers and the like).
-    type Env: ?Sized;
+    /// The machine's environment (providers and the like); shared with
+    /// fan-out children, so it must be `Sync`. May borrow — `'e` is the
+    /// machine's run, carried by the trait so impls can name it.
+    type Env: ?Sized + Sync + 'e;
 
     /// One transition. `env` carries the machine's IO. Fan-outs run here:
     /// [`Ctx::fanout`] takes a slot vector — a field of `self` — and
     /// splits its children directly off the node's tree.
-    fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Self::Env) -> Result<Step<K, Self::Env>>;
+    fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &'e Self::Env) -> Result<Step<'e, K, Self::Env>>;
 }
 
 /// The fan-out and safepoint facilities of one transition, handed to the
@@ -100,17 +106,18 @@ impl Ctx<'_, '_> {
                 if joins.iter().all(|j| j.is_finished()) {
                     break;
                 }
-                thread::sleep(std::time::Duration::from_millis(1));
+                thread::sleep(std::time::Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
         });
         self.children.truncate(start);
     }
 }
 
-impl<'o, K, E> Handle<'o, StateNode<K, E>>
+impl<'o, 'e, K, E> Handle<'o, StateNode<'e, K, E>>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync + 'e + 'o,
+    'e: 'o,
 {
     /// One transition of the machine: the current state executes through
     /// its own handle (as the node's single fan-out child, so its fan-outs
@@ -121,16 +128,20 @@ where
     ///
     /// Panics if a panicked child propagates from the fan-out scope — see
     /// [`Handle::fanout`].
-    pub fn execute(&mut self, env: &E) -> Result<Option<K>> {
+    pub fn execute(&mut self, env: &'e E) -> Result<Option<K>> {
         self.safepoint();
         // The action runs exactly once (single child); the Mutex is only
         // here because fan-out actions must be Fn + Send + Sync.
-        let outcome = Mutex::new(None::<Result<Step<K, E>>>);
+        let outcome = Mutex::new(None::<Result<Step<'e, K, E>>>);
         self.fanout(
-            &|node: &mut StateNode<K, E>| vec![&mut *node],
-            |mut child: Handle<'_, StateNode<K, E>>| {
+            &|node: &mut StateNode<'e, K, E>| vec![&mut *node],
+            |mut child: Handle<'_, StateNode<'e, K, E>>| {
                 child.safepoint();
-                *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.step(env));
+                let node = child.raw_node();
+                let shared = child.shared();
+                let children = child.raw_children();
+                *outcome.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(step_state(node, shared, children, env));
             },
         );
         match outcome
@@ -145,22 +156,28 @@ where
             Step::Done(result) => Ok(Some(result)),
         }
     }
+}
 
-    /// Run the state behind this handle with its transition ctx: the state
-    /// and the ctx come from disjoint fields of the handle.
-    fn step(&mut self, env: &E) -> Result<Step<K, E>> {
-        // SAFETY: the handle's type invariant guarantees `node` points at
-        // the node's own storage whenever the handle is not parked; this
-        // method runs on the mutator thread, not parked.
-        let boxed = self.raw_node();
-        // SAFETY: the handle's type invariant guarantees `boxed` points at
-        // the node's own storage whenever the handle is not parked; this
-        // method runs on the mutator thread, not parked.
-        let node: &mut StateNode<K, E> = unsafe { &mut *boxed };
-        let state: &mut (dyn State<K, Env = E> + Send + Sync) = node.as_mut();
-        let mut ctx = Ctx { shared: self.shared(), children: self.raw_children() };
-        state.execute(&mut ctx, env)
-    }
+/// Run the state behind a node pointer with its transition ctx. The state
+/// and the ctx come from disjoint parts of the child handle, so the two
+/// borrows never overlap.
+fn step_state<'a, 'e, K, E>(
+    node: *mut StateNode<'e, K, E>,
+    shared: &'a Shared,
+    children: &'a mut Vec<Shared>,
+    env: &'e E,
+) -> Result<Step<'e, K, E>>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'e,
+{
+    // SAFETY: the handle's type invariant guarantees `node` points at the
+    // node's own storage whenever the handle is not parked; the caller runs
+    // on the mutator thread, not parked.
+    let boxed: &mut StateNode<'e, K, E> = unsafe { &mut *node };
+    let state: &mut (dyn State<'e, K, Env = E> + Send + Sync) = boxed.as_mut();
+    let mut ctx = Ctx { shared, children };
+    state.execute(&mut ctx, env)
 }
 
 /// Drive a machine to completion under one checkpoint pair: the node is
@@ -169,13 +186,13 @@ where
 /// # Panics
 ///
 /// Panics if a state panics — the pair's fan-out scope propagates it.
-pub fn run_to_completion<K, E>(
-    machine: StateNode<K, E>,
-    env: &E,
+pub fn run_to_completion<'e, K, E>(
+    machine: StateNode<'e, K, E>,
+    env: &'e E,
 ) -> Result<K>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync + 'e,
 {
     with_checkpoint_pair(machine, |mut handle, _requester| {
         loop {
@@ -194,20 +211,32 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Countdown start and expected result in the linear-machine test.
+    const LINEAR_START: u32 = 3;
+    const LINEAR_RESULT: u32 = 42;
+    /// Steps observed by the linear test: LINEAR_START transitions plus Done.
+    const LINEAR_CALLS: usize = 4;
+    /// The fan-out test's work items: per-item steps and the item count.
+    const WORK_STEPS: &[u32] = &[3, 2, 1];
+    /// The fan-out test's second round index.
+    const SECOND_ROUND: u32 = 1;
+    /// A work item counts as served on its own dedicated thread.
+    const MIN_DEDICATED_THREADS: usize = 2;
+
     struct Env {
         calls: Arc<AtomicUsize>,
     }
 
     struct CountDown(u32);
 
-    impl State<u32> for CountDown {
+    impl<'e> State<'e, u32> for CountDown {
         type Env = Env;
 
-        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<u32, Env>> {
+        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &'e Env) -> Result<Step<'e, u32, Env>> {
             ctx.safepoint();
             let _n = env.calls.fetch_add(1, Ordering::SeqCst);
             if self.0 == 0 {
-                Ok(Step::Done(42))
+                Ok(Step::Done(LINEAR_RESULT))
             } else {
                 Ok(Step::Continue(Box::new(CountDown(self.0 - 1))))
             }
@@ -218,9 +247,9 @@ mod tests {
     fn linear_machine_runs_to_completion() {
         let calls = Arc::new(AtomicUsize::new(0));
         let env = Env { calls: Arc::clone(&calls) };
-        let result = run_to_completion(Box::new(CountDown(3)), &env).expect("run");
-        assert_eq!(result, 42);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let result = run_to_completion(Box::new(CountDown(LINEAR_START)), &env).expect("run");
+        assert_eq!(result, LINEAR_RESULT);
+        assert_eq!(calls.load(Ordering::SeqCst), LINEAR_CALLS);
     }
 
     struct WorkItem {
@@ -239,10 +268,10 @@ mod tests {
         work: Vec<WorkItem>,
     }
 
-    impl State<String> for Machine {
+    impl<'e> State<'e, String> for Machine {
         type Env = Env;
 
-        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<String, Env>> {
+        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &'e Env) -> Result<Step<'e, String, Env>> {
             ctx.safepoint();
             let _n = env.calls.fetch_add(1, Ordering::SeqCst);
             if self.round == 0 {
@@ -253,10 +282,10 @@ mod tests {
                     child.threads.push(thread::current().id());
                     for _ in 0..child.steps {
                         child.safepoint();
-                        std::thread::sleep(Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
                     }
                 });
-                self.round = 1;
+                self.round = SECOND_ROUND;
                 Ok(Step::Continue(Box::new(Machine {
                     round: self.round,
                     work: std::mem::take(&mut self.work),
@@ -265,7 +294,7 @@ mod tests {
                 let distinct: std::collections::HashSet<thread::ThreadId> =
                     self.work.iter().flat_map(|w| w.threads.iter().copied()).collect();
                 // Every work item ran on its own dedicated thread.
-                assert!(distinct.len() >= self.work.len().min(2));
+                assert!(distinct.len() >= self.work.len().min(MIN_DEDICATED_THREADS));
                 Ok(Step::Done(format!("done:{}", distinct.len())))
             }
         }
@@ -275,8 +304,11 @@ mod tests {
     fn fanout_machine_runs_children_on_dedicated_threads() {
         let calls = Arc::new(AtomicUsize::new(0));
         let env = Env { calls: Arc::clone(&calls) };
-        let machine = Machine { round: 0, work: vec![WorkItem::new(3), WorkItem::new(2), WorkItem::new(1)] };
+        let machine = Machine {
+            round: 0,
+            work: WORK_STEPS.iter().map(|&steps| WorkItem::new(steps)).collect(),
+        };
         let result = run_to_completion(Box::new(machine), &env).expect("run");
-        assert_eq!(result, "done:3");
+        assert_eq!(result, format!("done:{}", WORK_STEPS.len()));
     }
 }
