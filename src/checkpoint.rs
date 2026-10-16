@@ -22,7 +22,7 @@ use std::time::{Duration, Instant};
 const JOIN_POLL_INTERVAL_MS: u64 = 1;
 
 /// Outcome of the stop request handshake.
-enum Handshake {
+pub(crate) enum Handshake {
     /// The other side is parked and holds no references.
     Parked,
     /// The other side is gone (its handle was dropped) — it will never
@@ -34,7 +34,7 @@ enum Handshake {
     TimedOut,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     pending_request: AtomicBool,
     /// Set when the owning handle is dropped: a finished worker never
     /// parks, and a parent waiting to park it must see this instead of
@@ -55,7 +55,7 @@ struct Shared {
 }
 
 impl Shared {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pending_request: AtomicBool::new(false),
             closed: AtomicBool::new(false),
@@ -66,11 +66,11 @@ impl Shared {
         }
     }
 
-    fn is_closed(&self) -> bool {
+    pub(crate) fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
     }
 
-    fn is_pending(&self) -> bool {
+    pub(crate) fn is_pending(&self) -> bool {
         self.pending_request.load(Ordering::SeqCst)
     }
 
@@ -193,6 +193,51 @@ unsafe impl<'o, T: Send> Send for Handle<'o, T> {}
 unsafe impl<'o, T: Sync> Sync for Handle<'o, T> {}
 
 impl<'o, T> Handle<'o, T> {
+    /// The node's raw pointer (crate-internal: the state-machine driver
+    /// splits the handle into state + ctx with disjoint borrows).
+    pub(crate) fn raw_node(&mut self) -> *mut T {
+        self.node
+    }
+
+    /// Replace the node's value in place (crate-internal: the state
+    /// machine installs its successor with `*handle = Box::new(..)`).
+    ///
+    /// # Panics
+    ///
+    /// Must not be called while parked (the mutator only transitions
+    /// between safepoints).
+    pub(crate) fn set_state(&mut self, next: T) {
+        // SAFETY: `self.node` points at the node's own storage (type
+        // invariant); the handle is not parked, so no child or requester
+        // holds a reference into it.
+        unsafe {
+            *self.node = next;
+        }
+    }
+
+    /// This subtree's shared parking state.
+    pub(crate) fn shared(&self) -> &'o Shared {
+        self.shared
+    }
+
+    /// The child subtrees of the CURRENT fan-out (crate-internal).
+    pub(crate) fn raw_children(&mut self) -> &mut Vec<Shared> {
+        &mut self.children
+    }
+
+    /// Handle from raw parts (crate-internal: the state-machine ctx builds
+    /// child handles over slot storage).
+    ///
+    /// SAFETY (constructor): the caller must prove the [`Handle`] type
+    /// invariant — `node` is a fresh, disjoint, exclusive piece of the
+    /// tree for this handle's whole life.
+    pub(crate) fn from_raw_parts<C>(node: *mut C, shared: &'o Shared) -> Handle<'o, C> {
+        // SAFETY (Handle constructor): the caller (crate-internal) proves
+        // the type invariant — a fresh, disjoint, exclusive piece of the
+        // tree for this handle's whole life.
+        Handle { node, shared, children: Vec::new(), _brand: PhantomData }
+    }
+
     /// Park while a checkpoint has been requested, then return. Requires
     /// `&mut self`: no deref borrow can be live across it.
     pub fn safepoint(&mut self) {
@@ -286,7 +331,7 @@ impl<'o, T> Handle<'o, T> {
 /// The parking dance over the current fan-out's children: request every
 /// open child subtree first (bottom-up; closed children never park and are
 /// skipped), then this thread; resume the children after it runs again.
-fn park_self_fields(shared: &Shared, children: &[Shared]) {
+pub(crate) fn park_self_fields(shared: &Shared, children: &[Shared]) {
     for child in children.iter() {
         if !child.is_closed() {
             let _ = child.request_until_parked(None);
