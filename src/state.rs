@@ -1,116 +1,282 @@
-use anyhow::Result;
-use async_trait::async_trait;
-use futures::future::try_join_all;
+//! State machines on the checkpoint protocol.
+//!
+//! The machine's node is the current state, `Box<dyn State<..>>`; one
+//! transition is [`Handle::execute`]: the state runs as the node's single
+//! fan-out child and receives its [`Ctx`] — the fan-out and safepoint
+//! facilities for the transition. Fan-outs live inside the state's
+//! `execute`: [`Ctx::fanout`] splits the children (fields of the state)
+//! directly off the node's tree, one dedicated thread per child, this
+//! thread parked join-waiting. The successor is installed by the driver
+//! with `*handle = Box::new(..)`.
 
-pub enum Step<K> {
-    Continue(Box<dyn State<K>>),
+use anyhow::Result;
+use std::sync::Mutex;
+use std::thread;
+
+use crate::checkpoint::{Handle, Shared, park_self_fields, with_checkpoint_pair};
+
+/// The machine node: the current state.
+pub type StateNode<K, E> = Box<dyn State<K, Env = E> + Send + Sync>;
+
+/// What a state decides: its successor, or the machine's result.
+pub enum Step<K, E: ?Sized> {
+    Continue(StateNode<K, E>),
     Done(K),
 }
 
-#[async_trait]
-pub trait State<K>: Send + Sync + 'static {
-    async fn execute(self: Box<Self>) -> Result<Step<K>>;
-}
-
-#[async_trait]
-pub trait IOState<K>: Send + Sync + 'static {
-    type Output: Send + Sync + 'static;
-
-    async fn perform_io(&self) -> Result<Self::Output>;
-    async fn transition(self: Box<Self>, result: Self::Output) -> Result<Step<K>>;
-}
-
-#[async_trait]
-pub trait ParallelState<K, I>: Send + Sync + 'static
+pub trait State<K>: Send + Sync + 'static
 where
-    I: Send + Sync + 'static,
+    K: Send + 'static,
+    Self::Env: 'static,
 {
-    async fn split(&self) -> Result<Vec<Box<dyn State<I>>>>;
-    async fn collect(self: Box<Self>, results: Vec<I>) -> Result<Step<K>>;
+    /// The machine's environment (providers and the like).
+    type Env: ?Sized;
+
+    /// One transition. `env` carries the machine's IO. Fan-outs run here:
+    /// [`Ctx::fanout`] takes a slot vector — a field of `self` — and
+    /// splits its children directly off the node's tree.
+    fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Self::Env) -> Result<Step<K, Self::Env>>;
 }
 
-pub async fn run_to_completion<I>(mut state: Box<dyn State<I>>) -> Result<I>
-where
-    I: Send + Sync + 'static,
-{
-    loop {
-        match state.execute().await? {
-            Step::Continue(next) => state = next,
-            Step::Done(result) => return Ok(result),
+/// The fan-out and safepoint facilities of one transition, handed to the
+/// running state. Derived from its node handle; borrows of the two never
+/// overlap.
+pub struct Ctx<'a, 'o> {
+    shared: &'o Shared,
+    children: &'a mut Vec<Shared>,
+}
+
+impl Ctx<'_, '_> {
+    /// Park while a checkpoint has been requested, then return.
+    pub fn safepoint(&mut self) {
+        if self.shared.is_pending() {
+            park_self_fields(self.shared, self.children);
         }
+    }
+
+    /// Fan out over `slots` — a field of the state that owns this ctx, so
+    /// the children are part of the node's tree. One dedicated scoped
+    /// thread per child runs `action` with the child's handle; this thread
+    /// parks join-waiting while they run. Data lives in the slot for the
+    /// child's whole life and is accessed through its handle.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a panicked child propagates from the fan-out scope, or if
+    /// a handshake lock is poisoned — see the invariant on `Shared::parked`.
+    pub fn fanout<C, F>(&mut self, slots: &mut [C], action: F)
+    where
+        C: Send,
+        F: Fn(Handle<'_, C>) + Send + Sync,
+    {
+        let child_ptrs: Vec<*mut C> = slots.iter_mut().map(std::ptr::from_mut).collect();
+        let start = self.children.len();
+        for _ in 0..child_ptrs.len() {
+            self.children.push(Shared::new());
+        }
+        let handles: Vec<Handle<'_, C>> = child_ptrs
+            .into_iter()
+            .zip(&self.children[start..])
+            .map(|(ptr, storage)| {
+                // SAFETY (Handle constructor, per child): `slots` is a
+                // field of the state that owns this ctx; each child is
+                // yielded exactly once, disjointly; this handle is the only
+                // reference to it for its whole life.
+                Handle::<C>::from_raw_parts(ptr, storage)
+            })
+            .collect();
+        let shared = self.shared;
+        let children = &self.children[start..];
+        thread::scope(|scope| {
+            let action = &action;
+            let mut joins = Vec::with_capacity(handles.len());
+            for h in handles {
+                joins.push(scope.spawn(move || action(h)));
+            }
+            loop {
+                if shared.is_pending() {
+                    park_self_fields(shared, children);
+                }
+                if joins.iter().all(|j| j.is_finished()) {
+                    break;
+                }
+                thread::sleep(std::time::Duration::from_millis(1));
+            }
+        });
+        self.children.truncate(start);
     }
 }
 
-pub async fn execute_io<K, S>(state: Box<S>) -> Result<Step<K>>
+impl<'o, K, E> Handle<'o, StateNode<K, E>>
 where
-    S: IOState<K>,
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
 {
-    let output = state.perform_io().await?;
-    state.transition(output).await
+    /// One transition of the machine: the current state executes through
+    /// its own handle (as the node's single fan-out child, so its fan-outs
+    /// split straight off the node), and its successor is installed with
+    /// `*handle = Box::new(..)`. Returns the machine's result when done.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a panicked child propagates from the fan-out scope — see
+    /// [`Handle::fanout`].
+    pub fn execute(&mut self, env: &E) -> Result<Option<K>> {
+        self.safepoint();
+        // The action runs exactly once (single child); the Mutex is only
+        // here because fan-out actions must be Fn + Send + Sync.
+        let outcome = Mutex::new(None::<Result<Step<K, E>>>);
+        self.fanout(
+            &|node: &mut StateNode<K, E>| vec![&mut *node],
+            |mut child: Handle<'_, StateNode<K, E>>| {
+                child.safepoint();
+                *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.step(env));
+            },
+        );
+        match outcome
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner())
+            .expect("the single child always runs")?
+        {
+            Step::Continue(next) => {
+                (*self).set_state(next);
+                Ok(None)
+            }
+            Step::Done(result) => Ok(Some(result)),
+        }
+    }
+
+    /// Run the state behind this handle with its transition ctx: the state
+    /// and the ctx come from disjoint fields of the handle.
+    fn step(&mut self, env: &E) -> Result<Step<K, E>> {
+        // SAFETY: the handle's type invariant guarantees `node` points at
+        // the node's own storage whenever the handle is not parked; this
+        // method runs on the mutator thread, not parked.
+        let boxed = self.raw_node();
+        // SAFETY: the handle's type invariant guarantees `boxed` points at
+        // the node's own storage whenever the handle is not parked; this
+        // method runs on the mutator thread, not parked.
+        let node: &mut StateNode<K, E> = unsafe { &mut *boxed };
+        let state: &mut (dyn State<K, Env = E> + Send + Sync) = node.as_mut();
+        let mut ctx = Ctx { shared: self.shared(), children: self.raw_children() };
+        state.execute(&mut ctx, env)
+    }
 }
 
-pub async fn execute_parallel<K, I, S>(state: Box<S>) -> Result<Step<K>>
+/// Drive a machine to completion under one checkpoint pair: the node is
+/// the current state; each transition is [`Handle::execute`].
+///
+/// # Panics
+///
+/// Panics if a state panics — the pair's fan-out scope propagates it.
+pub fn run_to_completion<K, E>(
+    machine: StateNode<K, E>,
+    env: &E,
+) -> Result<K>
 where
-    K: Send + Sync + 'static,
-    I: Send + Sync + 'static,
-    S: ParallelState<K, I>,
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
 {
-    let sub_states = state.split().await?;
-    let futures: Vec<_> = sub_states
-        .into_iter()
-        .map(|s| run_to_completion(s))
-        .collect();
-    let results = try_join_all(futures).await?;
-    state.collect(results).await
+    with_checkpoint_pair(machine, |mut handle, _requester| {
+        loop {
+            handle.safepoint();
+            if let Some(result) = handle.execute(env)? {
+                return Ok(result);
+            }
+        }
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    const STEPS_REMAINING_DONE: u32 = 0;
-    const STEP_DECREMENT: u32 = 1;
-    const FINAL_RESULT: u32 = 42;
-    const INITIAL_STEPS: u32 = 3;
+    struct Env {
+        calls: Arc<AtomicUsize>,
+    }
 
-    struct Increment(u32);
-    #[async_trait]
-    impl State<u32> for Increment {
-        async fn execute(self: Box<Self>) -> Result<Step<u32>> {
-            if self.0 > STEPS_REMAINING_DONE {
-                Ok(Step::Continue(Box::new(Increment(self.0 - STEP_DECREMENT))))
+    struct CountDown(u32);
+
+    impl State<u32> for CountDown {
+        type Env = Env;
+
+        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<u32, Env>> {
+            ctx.safepoint();
+            let _n = env.calls.fetch_add(1, Ordering::SeqCst);
+            if self.0 == 0 {
+                Ok(Step::Done(42))
             } else {
-                Ok(Step::Done(FINAL_RESULT))
+                Ok(Step::Continue(Box::new(CountDown(self.0 - 1))))
             }
         }
     }
 
     #[test]
-    fn test_run_to_completion_linear() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_to_completion(Box::new(Increment(INITIAL_STEPS))));
-        assert_eq!(result.unwrap(), FINAL_RESULT);
+    fn linear_machine_runs_to_completion() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let env = Env { calls: Arc::clone(&calls) };
+        let result = run_to_completion(Box::new(CountDown(3)), &env).expect("run");
+        assert_eq!(result, 42);
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 
-    #[test]
-    fn test_run_to_completion_immediate() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_to_completion(Box::new(Increment(0))));
-        assert_eq!(result.unwrap(), FINAL_RESULT);
+    struct WorkItem {
+        steps: u32,
+        threads: Vec<thread::ThreadId>,
     }
 
-    struct FailState;
-    #[async_trait]
-    impl State<()> for FailState {
-        async fn execute(self: Box<Self>) -> Result<Step<()>> {
-            anyhow::bail!("intentional failure")
+    impl WorkItem {
+        fn new(steps: u32) -> Self {
+            Self { steps, threads: Vec::new() }
+        }
+    }
+
+    struct Machine {
+        round: u32,
+        work: Vec<WorkItem>,
+    }
+
+    impl State<String> for Machine {
+        type Env = Env;
+
+        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<String, Env>> {
+            ctx.safepoint();
+            let _n = env.calls.fetch_add(1, Ordering::SeqCst);
+            if self.round == 0 {
+                // The fan-out lives inside the transition: the children
+                // are this state's own work slots.
+                ctx.fanout(&mut self.work, |mut child| {
+                    let _n = env.calls.fetch_add(1, Ordering::SeqCst);
+                    child.threads.push(thread::current().id());
+                    for _ in 0..child.steps {
+                        child.safepoint();
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                self.round = 1;
+                Ok(Step::Continue(Box::new(Machine {
+                    round: self.round,
+                    work: std::mem::take(&mut self.work),
+                })))
+            } else {
+                let distinct: std::collections::HashSet<thread::ThreadId> =
+                    self.work.iter().flat_map(|w| w.threads.iter().copied()).collect();
+                // Every work item ran on its own dedicated thread.
+                assert!(distinct.len() >= self.work.len().min(2));
+                Ok(Step::Done(format!("done:{}", distinct.len())))
+            }
         }
     }
 
     #[test]
-    fn test_state_error_propagates() {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(run_to_completion::<()>(Box::new(FailState)));
-        assert!(result.is_err());
+    fn fanout_machine_runs_children_on_dedicated_threads() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let env = Env { calls: Arc::clone(&calls) };
+        let machine = Machine { round: 0, work: vec![WorkItem::new(3), WorkItem::new(2), WorkItem::new(1)] };
+        let result = run_to_completion(Box::new(machine), &env).expect("run");
+        assert_eq!(result, "done:3");
     }
 }
