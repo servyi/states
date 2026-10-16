@@ -1,59 +1,65 @@
 //! State machines on the checkpoint protocol.
 //!
-//! The machine's node is the current state, `Box<dyn State<..>>`; one
-//! transition is [`Handle::execute`]: the state runs as the node's single
-//! fan-out child and receives its [`Ctx`] — the fan-out and safepoint
-//! facilities for the transition. Fan-outs live inside the state's
-//! `execute`: [`Ctx::fanout`] splits the children (fields of the state)
-//! directly off the node's tree, one dedicated thread per child, this
-//! thread parked join-waiting. The successor is installed by the driver
-//! with `*handle = Box::new(..)`.
+//! The machine's node is the current state ([`StateNode`]); one
+//! transition is [`Handle::execute`]: the state runs directly through
+//! the handle's `DerefMut` and receives its [`Ctx`] — the fan-out and
+//! safepoint facilities of the transition. Fan-outs live inside the
+//! state's `execute`: [`Ctx::fanout`] splits the children (fields of
+//! the state) directly off the node's tree, one dedicated thread per
+//! child, this thread parked join-waiting. A transition returns the
+//! successor ([`Step::Next`]); the driver loop installs it with
+//! `*handle = next`.
 
 use anyhow::Result;
-use std::sync::Mutex;
 use std::thread;
+
+use crate::checkpoint::{Handle, Shared, park_self_fields, with_checkpoint_pair};
 
 /// Interval between child-finish checks while the fan-out serve loop waits.
 const JOIN_POLL_INTERVAL_MS: u64 = 1;
 
-use crate::checkpoint::{Handle, Shared, park_self_fields, with_checkpoint_pair};
+/// The machine node: the current state. The elided object lifetime is
+/// the machine's run — long enough for the env (borrowed providers and
+/// the like), while the states themselves stay `'static`.
+pub type StateNode<K, E> = Box<dyn State<K, E> + Send + Sync>;
 
-/// The machine node: the current state.
-pub type StateNode<K, E> = Box<dyn State<K, Env = E> + Send + Sync>;
-
-/// What a state decides: its successor, or the machine's result.
+/// What a state decides: its successor, or the machine's result. The
+/// successor's object lifetime is the run (elided).
 pub enum Step<K, E: ?Sized> {
-    Continue(StateNode<K, E>),
+    Next(StateNode<K, E>),
     Done(K),
 }
 
-pub trait State<K>: Send + Sync + 'static
+pub trait State<K, E>: Send + Sync
 where
     K: Send + 'static,
-    Self::Env: 'static,
+    E: ?Sized + Sync,
 {
-    /// The machine's environment (providers and the like).
-    type Env: ?Sized;
-
-    /// One transition. `env` carries the machine's IO. Fan-outs run here:
-    /// [`Ctx::fanout`] takes a slot vector — a field of `self` — and
+    /// One transition. `env` carries the machine's IO — providers and the
+    /// like, supplied by the runner (an input, not an output, hence a
+    /// generic parameter). It may borrow, and is shared with fan-out
+    /// children; the machine's box types carry its lifetime. Fan-outs run
+    /// here: [`Ctx::fanout`] takes a slot vector — a field of `self` — and
     /// splits its children directly off the node's tree.
-    fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Self::Env) -> Result<Step<K, Self::Env>>;
+    fn execute(&mut self, ctx: &mut Ctx<'_>, env: &E) -> Result<Step<K, E>>;
 }
 
 /// The fan-out and safepoint facilities of one transition, handed to the
-/// running state. Derived from its node handle; borrows of the two never
-/// overlap.
-pub struct Ctx<'a, 'o> {
+/// running state: a copy of its node's shared parking state. A fan-out's
+/// children are local to that fan-out — parking the running state parks
+/// them through its own serve loop (parking propagates bottom-up), so no
+/// registration anywhere is needed.
+pub struct Ctx<'o> {
     shared: &'o Shared,
-    children: &'a mut Vec<Shared>,
 }
 
-impl Ctx<'_, '_> {
-    /// Park while a checkpoint has been requested, then return.
+impl Ctx<'_> {
+    /// Park while a checkpoint has been requested, then return. Any
+    /// fan-out children this ctx owns are parked by the fan-out's own
+    /// serve loop; outside a fan-out there are none.
     pub fn safepoint(&mut self) {
         if self.shared.is_pending() {
-            park_self_fields(self.shared, self.children);
+            park_self_fields(self.shared, &[]);
         }
     }
 
@@ -73,13 +79,10 @@ impl Ctx<'_, '_> {
         F: Fn(Handle<'_, C>) + Send + Sync,
     {
         let child_ptrs: Vec<*mut C> = slots.iter_mut().map(std::ptr::from_mut).collect();
-        let start = self.children.len();
-        for _ in 0..child_ptrs.len() {
-            self.children.push(Shared::new());
-        }
+        let storages: Vec<Shared> = (0..child_ptrs.len()).map(|_| Shared::new()).collect();
         let handles: Vec<Handle<'_, C>> = child_ptrs
             .into_iter()
-            .zip(&self.children[start..])
+            .zip(&storages)
             .map(|(ptr, storage)| {
                 // SAFETY (Handle constructor, per child): `slots` is a
                 // field of the state that owns this ctx; each child is
@@ -89,7 +92,6 @@ impl Ctx<'_, '_> {
             })
             .collect();
         let shared = self.shared;
-        let children = &self.children[start..];
         thread::scope(|scope| {
             let action = &action;
             let mut joins = Vec::with_capacity(handles.len());
@@ -98,7 +100,7 @@ impl Ctx<'_, '_> {
             }
             loop {
                 if shared.is_pending() {
-                    park_self_fields(shared, children);
+                    park_self_fields(shared, &storages);
                 }
                 if joins.iter().all(|j| j.is_finished()) {
                     break;
@@ -106,62 +108,27 @@ impl Ctx<'_, '_> {
                 thread::sleep(std::time::Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
         });
-        self.children.truncate(start);
     }
 }
 
 impl<'o, K, E> Handle<'o, StateNode<K, E>>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync + 'o,
 {
-    /// One transition of the machine: the current state executes through
-    /// its own handle (as the node's single fan-out child, so its fan-outs
-    /// split straight off the node), and its successor is installed with
-    /// `*handle = Box::new(..)`. Returns the machine's result when done.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a panicked child propagates from the fan-out scope — see
-    /// [`Handle::fanout`].
-    pub fn execute(&mut self, env: &E) -> Result<Option<K>> {
+    /// One transition of the machine: the current state runs directly
+    /// through the handle's `DerefMut`, with its [`Ctx`] for fan-outs and
+    /// safepoints. Returns the state's decision — installing a `Next`
+    /// successor is the driver loop's job (`*handle = next`).
+    pub fn execute(&mut self, env: &E) -> Result<Step<K, E>> {
         self.safepoint();
-        // The action runs exactly once (single child); the Mutex is only
-        // here because fan-out actions must be Fn + Send + Sync.
-        let outcome = Mutex::new(None::<Result<Step<K, E>>>);
-        self.fanout(
-            &|node: &mut StateNode<K, E>| vec![&mut *node],
-            |mut child: Handle<'_, StateNode<K, E>>| {
-                child.safepoint();
-                *outcome.lock().unwrap_or_else(|e| e.into_inner()) = Some(child.step(env));
-            },
-        );
-        match outcome
-            .into_inner()
-            .unwrap_or_else(|e| e.into_inner())
-            .expect("the single child always runs")?
-        {
-            Step::Continue(next) => {
-                (*self).set_state(next);
-                Ok(None)
-            }
-            Step::Done(result) => Ok(Some(result)),
-        }
-    }
-
-    /// Run the state behind this handle with its transition ctx: the state
-    /// and the ctx come from disjoint fields of the handle.
-    fn step(&mut self, env: &E) -> Result<Step<K, E>> {
-        // SAFETY: the handle's type invariant guarantees `node` points at
-        // the node's own storage whenever the handle is not parked; this
-        // method runs on the mutator thread, not parked.
-        let boxed = self.raw_node();
-        // SAFETY: the handle's type invariant guarantees `boxed` points at
-        // the node's own storage whenever the handle is not parked; this
-        // method runs on the mutator thread, not parked.
-        let node: &mut StateNode<K, E> = unsafe { &mut *boxed };
-        let state: &mut (dyn State<K, Env = E> + Send + Sync) = node.as_mut();
-        let mut ctx = Ctx { shared: self.shared(), children: self.raw_children() };
+        // The ctx is the machine's own shared parking ref (a copy — the
+        // two borrows cannot overlap); the state runs directly through
+        // the handle's DerefMut. Fan-outs inside the state park through
+        // the ctx; a request on the machine parks this thread and,
+        // bottom-up, whatever the ctx's fan-outs own.
+        let mut ctx = Ctx { shared: self.shared() };
+        let state: &mut (dyn State<K, E> + Send + Sync) = (*self).as_mut();
         state.execute(&mut ctx, env)
     }
 }
@@ -178,13 +145,14 @@ pub fn run_to_completion<K, E>(
 ) -> Result<K>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync,
 {
     with_checkpoint_pair(machine, |mut handle, _requester| {
         loop {
             handle.safepoint();
-            if let Some(result) = handle.execute(env)? {
-                return Ok(result);
+            match handle.execute(env)? {
+                Step::Done(result) => return Ok(result),
+                Step::Next(next) => *handle = next,
             }
         }
     })
@@ -202,7 +170,7 @@ mod tests {
     const LINEAR_RESULT: u32 = 42;
     /// Steps observed by the linear test: LINEAR_START transitions plus Done.
     const LINEAR_CALLS: usize = 4;
-    /// The fan-out test's work items: per-item steps.
+    /// The fan-out test's work items: per-item steps and the item count.
     const WORK_STEPS: &[u32] = &[3, 2, 1];
     /// The fan-out test's second round index.
     const SECOND_ROUND: u32 = 1;
@@ -215,16 +183,14 @@ mod tests {
 
     struct CountDown(u32);
 
-    impl State<u32> for CountDown {
-        type Env = Env;
-
-        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<u32, Env>> {
+    impl State<u32, Env> for CountDown {
+        fn execute(&mut self, ctx: &mut Ctx<'_>, env: &Env) -> Result<Step<u32, Env>> {
             ctx.safepoint();
             let _n = env.calls.fetch_add(1, Ordering::SeqCst);
             if self.0 == 0 {
                 Ok(Step::Done(LINEAR_RESULT))
             } else {
-                Ok(Step::Continue(Box::new(CountDown(self.0 - 1))))
+                Ok(Step::Next(Box::new(CountDown(self.0 - 1))))
             }
         }
     }
@@ -254,10 +220,8 @@ mod tests {
         work: Vec<WorkItem>,
     }
 
-    impl State<String> for Machine {
-        type Env = Env;
-
-        fn execute(&mut self, ctx: &mut Ctx<'_, '_>, env: &Env) -> Result<Step<String, Env>> {
+    impl State<String, Env> for Machine {
+        fn execute(&mut self, ctx: &mut Ctx<'_>, env: &Env) -> Result<Step<String, Env>> {
             ctx.safepoint();
             let _n = env.calls.fetch_add(1, Ordering::SeqCst);
             if self.round == 0 {
@@ -272,7 +236,7 @@ mod tests {
                     }
                 });
                 self.round = SECOND_ROUND;
-                Ok(Step::Continue(Box::new(Machine {
+                Ok(Step::Next(Box::new(Machine {
                     round: self.round,
                     work: std::mem::take(&mut self.work),
                 })))

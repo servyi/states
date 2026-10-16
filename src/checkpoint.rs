@@ -193,36 +193,9 @@ unsafe impl<'o, T: Send> Send for Handle<'o, T> {}
 unsafe impl<'o, T: Sync> Sync for Handle<'o, T> {}
 
 impl<'o, T> Handle<'o, T> {
-    /// The node's raw pointer (crate-internal: the state-machine driver
-    /// splits the handle into state + ctx with disjoint borrows).
-    pub(crate) fn raw_node(&mut self) -> *mut T {
-        self.node
-    }
-
-    /// Replace the node's value in place (crate-internal: the state
-    /// machine installs its successor with `*handle = Box::new(..)`).
-    ///
-    /// # Panics
-    ///
-    /// Must not be called while parked (the mutator only transitions
-    /// between safepoints).
-    pub(crate) fn set_state(&mut self, next: T) {
-        // SAFETY: `self.node` points at the node's own storage (type
-        // invariant); the handle is not parked, so no child or requester
-        // holds a reference into it.
-        unsafe {
-            *self.node = next;
-        }
-    }
-
     /// This subtree's shared parking state.
     pub(crate) fn shared(&self) -> &'o Shared {
         self.shared
-    }
-
-    /// The child subtrees of the CURRENT fan-out (crate-internal).
-    pub(crate) fn raw_children(&mut self) -> &mut Vec<Shared> {
-        &mut self.children
     }
 
     /// Handle from raw parts (crate-internal: the state-machine ctx builds
