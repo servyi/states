@@ -13,6 +13,9 @@ use anyhow::Result;
 use std::sync::Mutex;
 use std::thread;
 
+/// Interval between child-finish checks while the fan-out serve loop waits.
+const JOIN_POLL_INTERVAL_MS: u64 = 1;
+
 use crate::checkpoint::{Handle, Shared, park_self_fields, with_checkpoint_pair};
 
 /// The machine node: the current state.
@@ -100,7 +103,7 @@ impl Ctx<'_, '_> {
                 if joins.iter().all(|j| j.is_finished()) {
                     break;
                 }
-                thread::sleep(std::time::Duration::from_millis(1));
+                thread::sleep(std::time::Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
         });
         self.children.truncate(start);
@@ -194,6 +197,18 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    /// Countdown start and expected result in the linear-machine test.
+    const LINEAR_START: u32 = 3;
+    const LINEAR_RESULT: u32 = 42;
+    /// Steps observed by the linear test: LINEAR_START transitions plus Done.
+    const LINEAR_CALLS: usize = 4;
+    /// The fan-out test's work items: per-item steps.
+    const WORK_STEPS: &[u32] = &[3, 2, 1];
+    /// The fan-out test's second round index.
+    const SECOND_ROUND: u32 = 1;
+    /// A work item counts as served on its own dedicated thread.
+    const MIN_DEDICATED_THREADS: usize = 2;
+
     struct Env {
         calls: Arc<AtomicUsize>,
     }
@@ -207,7 +222,7 @@ mod tests {
             ctx.safepoint();
             let _n = env.calls.fetch_add(1, Ordering::SeqCst);
             if self.0 == 0 {
-                Ok(Step::Done(42))
+                Ok(Step::Done(LINEAR_RESULT))
             } else {
                 Ok(Step::Continue(Box::new(CountDown(self.0 - 1))))
             }
@@ -218,9 +233,9 @@ mod tests {
     fn linear_machine_runs_to_completion() {
         let calls = Arc::new(AtomicUsize::new(0));
         let env = Env { calls: Arc::clone(&calls) };
-        let result = run_to_completion(Box::new(CountDown(3)), &env).expect("run");
-        assert_eq!(result, 42);
-        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        let result = run_to_completion(Box::new(CountDown(LINEAR_START)), &env).expect("run");
+        assert_eq!(result, LINEAR_RESULT);
+        assert_eq!(calls.load(Ordering::SeqCst), LINEAR_CALLS);
     }
 
     struct WorkItem {
@@ -253,10 +268,10 @@ mod tests {
                     child.threads.push(thread::current().id());
                     for _ in 0..child.steps {
                         child.safepoint();
-                        std::thread::sleep(Duration::from_millis(1));
+                        std::thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
                     }
                 });
-                self.round = 1;
+                self.round = SECOND_ROUND;
                 Ok(Step::Continue(Box::new(Machine {
                     round: self.round,
                     work: std::mem::take(&mut self.work),
@@ -265,7 +280,7 @@ mod tests {
                 let distinct: std::collections::HashSet<thread::ThreadId> =
                     self.work.iter().flat_map(|w| w.threads.iter().copied()).collect();
                 // Every work item ran on its own dedicated thread.
-                assert!(distinct.len() >= self.work.len().min(2));
+                assert!(distinct.len() >= self.work.len().min(MIN_DEDICATED_THREADS));
                 Ok(Step::Done(format!("done:{}", distinct.len())))
             }
         }
@@ -275,8 +290,11 @@ mod tests {
     fn fanout_machine_runs_children_on_dedicated_threads() {
         let calls = Arc::new(AtomicUsize::new(0));
         let env = Env { calls: Arc::clone(&calls) };
-        let machine = Machine { round: 0, work: vec![WorkItem::new(3), WorkItem::new(2), WorkItem::new(1)] };
+        let machine = Machine {
+            round: 0,
+            work: WORK_STEPS.iter().map(|&steps| WorkItem::new(steps)).collect(),
+        };
         let result = run_to_completion(Box::new(machine), &env).expect("run");
-        assert_eq!(result, "done:3");
+        assert_eq!(result, format!("done:{}", WORK_STEPS.len()));
     }
 }
