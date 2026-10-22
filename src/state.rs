@@ -144,30 +144,17 @@ where
         self.fanout(
             &|phase: &mut ParallelState<K, E>| phase.children.iter_mut().collect(),
             |mut child: Handle<'_, (ContextId, StateNode<K, E>)>| {
-                loop {
-                    child.safepoint();
-                    // The auto-deref chain in action: child handle →
-                    // tuple → Box → dyn State.
-                    match child.1.execute(env) {
-                        Ok(Step::Continue(next)) => {
-                            child.1 = next;
-                        }
-                        Ok(Step::Done(result)) => {
-                            let id = child.0.hash();
-                            results
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .push((id, result));
-                            break;
-                        }
-                        Err(e) => {
-                            let mut slot = first_error
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner());
-                            if slot.is_none() {
-                                *slot = Some(e);
-                            }
-                            break;
+                let id = child.0.hash();
+                match child.run_to_completion(env) {
+                    Ok(result) => results
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .push((id, result)),
+                    Err(e) => {
+                        let mut slot =
+                            first_error.lock().unwrap_or_else(|e| e.into_inner());
+                        if slot.is_none() {
+                            *slot = Some(e);
                         }
                     }
                 }
@@ -177,6 +164,25 @@ where
             return Err(e);
         }
         Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl<'o, K, E> Handle<'o, (ContextId, StateNode<K, E>)>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
+{
+    /// The child form of run-to-completion: same protocol (safepoint,
+    /// transition, install) through the tuple's state half — the
+    /// auto-deref chain child handle → tuple → Box → dyn State.
+    fn run_to_completion(&mut self, env: &E) -> Result<K> {
+        loop {
+            self.safepoint();
+            match self.1.execute(env)? {
+                Step::Continue(next) => self.1 = next,
+                Step::Done(result) => return Ok(result),
+            }
+        }
     }
 }
 
@@ -206,6 +212,27 @@ where
     }
 }
 
+impl<'o, K, E> Handle<'o, StateNode<K, E>>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
+{
+    /// Drive the machine to completion: safepoint, one transition
+    /// ([`Handle::execute`]), repeat until a state yields the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a state panics inside a nested fan-out scope.
+    pub fn run_to_completion(&mut self, env: &E) -> Result<K> {
+        loop {
+            self.safepoint();
+            if let Some(result) = self.execute(env)? {
+                return Ok(result);
+            }
+        }
+    }
+}
+
 /// Drive a machine to completion under one checkpoint pair: the node
 /// is the current state; each transition is [`Handle::execute`].
 ///
@@ -217,11 +244,8 @@ where
     K: Send + 'static,
     E: ?Sized + Sync + 'static,
 {
-    with_checkpoint_pair(machine, |mut handle, _requester| loop {
-        handle.safepoint();
-        if let Some(result) = handle.execute(env)? {
-            return Ok(result);
-        }
+    with_checkpoint_pair(machine, |mut handle, _requester| {
+        handle.run_to_completion(env)
     })
 }
 
