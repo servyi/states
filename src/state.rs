@@ -263,6 +263,8 @@ mod tests {
     const WORK_ITEMS: usize = 3;
     /// The single result the ctx-deref test expects.
     const ONE_RESULT: usize = 1;
+    /// The first (and only) child's slot in the seen counter.
+    const FIRST_CHILD_INDEX: usize = 0;
 
     struct Env;
 
@@ -378,7 +380,8 @@ mod tests {
             ctx.fanout(
                 &|p: &mut ParallelState<u32, Env>| p.children.iter_mut().collect(),
                 |child: Handle<'_, (ContextId, StateNode<u32, Env>)>| {
-                    seen.fetch_add(1, Ordering::SeqCst);
+                    let n = seen.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(n, FIRST_CHILD_INDEX, "each child counted once");
                     assert_eq!(child.0.hash(), h, "the tuple is the node's child");
                 },
             );
