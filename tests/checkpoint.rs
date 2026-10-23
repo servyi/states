@@ -10,19 +10,46 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use servyi_states::checkpoint::{with_checkpoint_pair, CheckpointRequester, Handle};
 
+/// Steps after which the machine holds (parks at safepoints, no
+/// progress) until released — the deterministic mid-run point.
+const HOLD_AT: usize = 6;
+/// Every work item in the mid-run test has this many steps.
+const WORK_STEPS_PER_ITEM: usize = 4;
+
 #[derive(Debug, Clone)]
 struct Io {
     calls: Arc<AtomicUsize>,
     step_delay: Duration,
+    /// Work steps taken since the last release.
+    progress: Arc<AtomicUsize>,
+    /// Set to let a held machine continue.
+    release: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Io {
     fn new() -> Self {
-        Self { calls: Arc::new(AtomicUsize::new(0)), step_delay: Duration::from_millis(0) }
+        Self {
+            calls: Arc::new(AtomicUsize::new(0)),
+            step_delay: Duration::from_millis(0),
+            progress: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        }
+    }
+
+    /// Whether the machine is held at the deterministic mid-run point.
+    fn holding(&self) -> bool {
+        !self.release.load(Ordering::SeqCst)
+            && self.progress.load(Ordering::SeqCst) >= HOLD_AT
+    }
+
+    fn release(&self) {
+        self.release.store(true, Ordering::SeqCst);
+        self.progress.store(0, Ordering::SeqCst);
     }
 
     fn step(&self, _id: u32) {
         let _n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let _p = self.progress.fetch_add(1, Ordering::SeqCst);
         if !self.step_delay.is_zero() {
             std::thread::sleep(self.step_delay);
         }
@@ -53,10 +80,19 @@ impl AnalyzeState {
 fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
     loop {
         h.safepoint();
-        let (id, steps) = {
+        let (id, steps, done_steps) = {
             let st = &*h;
-            (st.item.id, st.item.steps)
+            (st.item.id, st.item.steps, st.step)
         };
+        if done_steps >= steps {
+            h.done = Some(format!("v{id}"));
+            return;
+        }
+        while io.holding() {
+            h.safepoint();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        h.safepoint();
         io.step(id);
         h.safepoint();
         let finished = {
@@ -120,9 +156,13 @@ fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) 
         let m = &mut *h;
         match &mut m.stage {
             Stage::Seq { step } => {
-                if (*step as usize) < m.items.len() {
+                if (*step as usize) < m.items.len() && !io.holding() {
                     io.step(m.items[*step as usize].id);
                     *step += 1;
+                    true
+                } else if (*step as usize) < m.items.len() {
+                    // Held mid-Seq: make no progress this transition; the
+                    // driver loop's safepoints keep serving the snapshotter.
                     true
                 } else {
                     next = Some(Stage::Scatter {
@@ -385,30 +425,104 @@ fn full_run_with_stw_checkpoints_and_nested_fanout() {
     assert!(elapsed.as_millis() < 2000, "scoped threads run concurrently: {elapsed:?}");
 }
 
+/// Work already reflected in a machine snapshot: the Seq phase did one
+/// step per item (fully consumed once the stage moved past Seq), every
+/// finished item did its `steps`, in-flight items did their current
+/// `step`.
+fn consumed_work(machine: &Machine) -> usize {
+    let seq_done = match &machine.stage {
+        Stage::Seq { step } => *step as usize,
+        _ => machine.items.len(),
+    };
+    let mut consumed = machine.done.len() * WORK_STEPS_PER_ITEM + seq_done;
+    match &machine.stage {
+        Stage::Scatter { children } => {
+            consumed += children.iter().map(|c| c.step as usize).sum::<usize>();
+        }
+        Stage::Nested { groups } => {
+            for g in groups {
+                consumed += g.children.iter().map(|c| c.step as usize).sum::<usize>();
+            }
+        }
+        _ => {}
+    }
+    consumed
+}
+
 #[test]
 fn mid_run_snapshot_resumes() {
     let (_g, dir) = tempdir();
     let path = dir.join("cp.json");
-    let io = Io { step_delay: Duration::from_millis(4), ..Io::new() };
+    // Held from the start: the machine parks at its safepoints with
+    // deterministic progress, and every snapshot taken while held is a
+    // clean mid-run snapshot.
+    let io = Io {
+        step_delay: Duration::from_millis(1),
+        release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ..Io::new()
+    };
 
     let m = Machine {
         items: (1..=4).map(|id| WorkItem { id, steps: 4 }).collect(),
         ..Machine::default()
     };
+    let io_snapshotter = Duration::from_millis(2);
+    // The full-run IO count, measured (not derived): the resume assertion
+    // is exact against it.
+    let io0 = Io::new();
+    let full = drive(
+        Machine {
+            items: (1..=4).map(|id| WorkItem { id, steps: WORK_STEPS_PER_ITEM as u32 }).collect(),
+            ..Machine::default()
+        },
+        &io0,
+        None,
+    );
+    assert_eq!(full.result, "done: 1,2,3,4");
+    let total = io0.calls.load(Ordering::SeqCst);
     std::thread::scope(|s| {
-        let runner = s.spawn(|| drive(m, &io, Some((Duration::from_millis(3), path.clone()))));
-        std::thread::sleep(Duration::from_millis(60));
+        let runner = s.spawn({
+            let io = io.clone();
+            let path = path.clone();
+            move || drive(m, &io, Some((io_snapshotter, path)))
+        });
+        // Wait for a snapshot taken WHILE the machine is held — i.e. one
+        // that already reflects the HOLD_AT steps of consumed work (the
+        // first writes land before the hold engages; those are not the
+        // resume point).
+        let mut held_snap: Option<String> = None;
+        for _ in 0..500 {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(machine) = serde_json::from_str::<Machine>(&text) {
+                    if consumed_work(&machine) >= HOLD_AT {
+                        held_snap = Some(text);
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let held_snap = held_snap.expect("mid-run snapshot exists while held");
+        let snap: Machine = serde_json::from_str(&held_snap).expect("snapshot parses");
+        io.release();
         if let Err(payload) = runner.join() {
             std::panic::resume_unwind(payload);
         }
+        let consumed = consumed_work(&snap);
+        assert_eq!(consumed, HOLD_AT, "held snapshot consumes exactly HOLD_AT steps");
+        // Resume from the HELD snapshot: completed items finish without
+        // new IO, so the resumed run does exactly the remaining work.
+        let resumed: Machine = serde_json::from_str(&held_snap).expect("snapshot parses");
+        let io2 = Io::new();
+        let resumed = drive(resumed, &io2, None);
+        let mut ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
+        ids.sort();
+        assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
+        let observed = io2.calls.load(Ordering::SeqCst);
+        assert_eq!(
+            observed,
+            total - consumed,
+            "resume does exactly the remaining work"
+        );
     });
-
-    let snap = std::fs::read_to_string(&path).expect("mid-run snapshot exists");
-    let resumed: Machine = serde_json::from_str(&snap).expect("snapshot parses");
-    let io2 = Io::new();
-    let resumed = drive(resumed, &io2, None);
-    let mut ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
-    ids.sort();
-    assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
-    assert!(io2.calls.load(Ordering::SeqCst) < 4 * 4 + 2 * 4);
 }
