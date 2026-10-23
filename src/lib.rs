@@ -10,4 +10,4 @@ pub mod state;
 pub use context_id::ContextId;
 pub use message_log::{LogEntry, MessageLog, MessageLogLayer, ancestors, is_valid_ctx_id};
 pub use phase_tracker::{DefaultPhaseTracker, PhaseTracker};
-pub use state::{Ctx, ParallelState, State, Step, StateNode, run_to_completion};
+pub use state::{Context, ParallelState, State, Step, run_to_completion};
