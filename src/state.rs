@@ -20,7 +20,6 @@
 //!   reaches both.
 
 use anyhow::Result;
-use std::sync::Mutex;
 
 use crate::checkpoint::{Handle, with_checkpoint_pair};
 use crate::context_id::ContextId;
@@ -72,12 +71,78 @@ impl<'a, 'o, T> std::ops::DerefMut for Ctx<'a, 'o, T> {
     }
 }
 
-/// A fan-out phase: children are `(ContextId, state)` tuples; the
-/// context id is allocated and stored at spawn (issue #13's design).
-/// Run it with [`Handle::execute_children`] — the driver on the
-/// handle, since only the handle can fan out.
+/// A node that holds the current state and can replace it — the
+/// "derefs into a state" capability the generalized drivers need
+/// ([`Handle::execute`], [`Handle::run_to_completion`]): reading the
+/// state through `&mut dyn` is not enough, installing a successor
+/// needs the slot.
+pub trait StateSlot {
+    /// The machine's result type.
+    type K: Send + 'static;
+    /// The machine's environment type.
+    type E: ?Sized + Sync + 'static;
+    /// The current state.
+    fn state(&mut self) -> &mut (dyn State<Self::K, Env = Self::E> + Send + Sync);
+    /// Install the successor.
+    fn install(&mut self, next: StateNode<Self::K, Self::E>);
+}
+
+impl<K, E> StateSlot for StateNode<K, E>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
+{
+    type K = K;
+    type E = E;
+    fn state(&mut self) -> &mut (dyn State<K, Env = E> + Send + Sync) {
+        &mut **self
+    }
+    fn install(&mut self, next: StateNode<K, E>) {
+        *self = next;
+    }
+}
+
+/// One parallel child: the state and its LANDING SLOT — the result is
+/// written in place, through the child's own handle, by the worker
+/// that ran it (no lock, and the parent reads the slots in spawn
+/// order after the join).
+pub struct ParallelChild<K, E: ?Sized> {
+    state: StateNode<K, E>,
+    result: Option<K>,
+}
+
+impl<K, E> StateSlot for ParallelChild<K, E>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'static,
+{
+    type K = K;
+    type E = E;
+    fn state(&mut self) -> &mut (dyn State<K, Env = E> + Send + Sync) {
+        &mut *self.state
+    }
+    fn install(&mut self, next: StateNode<K, E>) {
+        self.state = next;
+    }
+}
+
+/// A fan-out phase: allocates each child's [`ContextId`] itself and
+/// hands the id to the state's CONSTRUCTOR (the state owns its id
+/// from birth); children are [`ParallelChild`] slots — state + result
+/// — wrapped in handles by `fanout`, each child run to completion by
+/// the generalized [`Handle::run_to_completion`]. When every child is
+/// done, `then` builds the phase's successor from the results, in
+/// spawn order.
+///
+/// [`State::execute`] for a `ParallelState` runs the phase under its
+/// own checkpoint pair (one pair per phase — the composition trade
+/// documented on refactor-check#10: a state inside a node cannot be
+/// dispatched and handed the handle at once, so a fanning state is
+/// the node of its own pair).
 pub struct ParallelState<K, E: ?Sized> {
-    children: Vec<(ContextId, StateNode<K, E>)>,
+    id: ContextId,
+    children: Vec<ParallelChild<K, E>>,
+    then: Box<dyn FnOnce(Vec<K>) -> StateNode<K, E> + Send + Sync>,
 }
 
 impl<K, E> ParallelState<K, E>
@@ -85,151 +150,123 @@ where
     K: Send + 'static,
     E: ?Sized + Sync + 'static,
 {
-    /// An empty parallel phase; spawn children under a context with
-    /// [`ParallelState::spawn`].
-    pub fn new() -> Self {
-        ParallelState { children: Vec::new() }
-    }
-}
-
-impl<K, E: ?Sized> Default for ParallelState<K, E> {
-    fn default() -> Self {
-        ParallelState { children: Vec::new() }
-    }
-}
-
-impl<K, E> ParallelState<K, E>
-where
-    K: Send + 'static,
-    E: ?Sized + Sync + 'static,
-{
-
-    /// Spawn a child state under `ctx`: allocates the child's
-    /// `ContextId` (a child of `ctx`), stores the tuple, and returns
-    /// the id's hash so the caller can correlate
-    /// [`Handle::execute_children`] results (the id itself is not
-    /// cloneable — cloning would reset its child counter).
-    pub fn spawn(&mut self, ctx: &ContextId, state: StateNode<K, E>) -> u64 {
-        let id = ctx.new_child();
-        let hash = id.hash();
-        self.children.push((id, state));
-        hash
-    }
-
-    /// The children's context ids, in spawn order.
-    pub fn child_ids(&self) -> impl Iterator<Item = &ContextId> {
-        self.children.iter().map(|(id, _)| id)
-    }
-}
-
-impl<'o, K, E> Handle<'o, ParallelState<K, E>>
-where
-    K: Send + 'static,
-    E: ?Sized + Sync + 'static,
-{
-    /// Run every child to completion, each on its own thread: the
-    /// child tuples are wrapped in handles by `fanout`, and each child
-    /// state runs its linear loop through the tuple. Returns each
-    /// child's result paired with its context id's hash, in completion
-    /// order.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a panicked child propagates from the fan-out scope —
-    /// see [`Handle::fanout`].
-    pub fn execute_children(&mut self, env: &E) -> Result<Vec<(u64, K)>> {
-        self.safepoint();
-        let results: Mutex<Vec<(u64, K)>> = Mutex::new(Vec::new());
-        let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        self.fanout(
-            &|phase: &mut ParallelState<K, E>| phase.children.iter_mut().collect(),
-            |mut child: Handle<'_, (ContextId, StateNode<K, E>)>| {
-                let id = child.0.hash();
-                match child.run_to_completion(env) {
-                    Ok(result) => results
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .push((id, result)),
-                    Err(e) => {
-                        let mut slot =
-                            first_error.lock().unwrap_or_else(|e| e.into_inner());
-                        if slot.is_none() {
-                            *slot = Some(e);
-                        }
-                    }
-                }
-            },
-        );
-        if let Some(e) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
-            return Err(e);
-        }
-        Ok(results.into_inner().unwrap_or_else(|e| e.into_inner()))
-    }
-}
-
-impl<'o, K, E> Handle<'o, (ContextId, StateNode<K, E>)>
-where
-    K: Send + 'static,
-    E: ?Sized + Sync + 'static,
-{
-    /// The child form of run-to-completion: same protocol (safepoint,
-    /// transition, install) through the tuple's state half — the
-    /// auto-deref chain child handle → tuple → Box → dyn State.
-    fn run_to_completion(&mut self, env: &E) -> Result<K> {
-        loop {
-            self.safepoint();
-            match self.1.execute(env)? {
-                Step::Continue(next) => self.1 = next,
-                Step::Done(result) => return Ok(result),
-            }
+    /// A phase under `ctx`: allocates the phase's own context id (a
+    /// child of `ctx`); spawn children with [`ParallelState::spawn`],
+    /// name the continuation with [`ParallelState::then`].
+    pub fn new(ctx: &ContextId) -> Self {
+        ParallelState {
+            id: ctx.new_child(),
+            children: Vec::new(),
+            then: Box::new(default_then),
         }
     }
+
+    /// Spawn a child from a CONSTRUCTOR that receives the child's
+    /// freshly allocated context id — the state embeds it at birth,
+    /// so the id travels inside the state, not beside it.
+    pub fn spawn(&mut self, make: impl FnOnce(&ContextId) -> StateNode<K, E>) {
+        let child_id = self.id.new_child();
+        self.children.push(ParallelChild {
+            state: make(&child_id),
+            result: None,
+        });
+    }
+
+    /// The continuation: builds the phase's successor from the
+    /// children's results, in spawn order.
+    pub fn then(
+        mut self,
+        then: impl FnOnce(Vec<K>) -> StateNode<K, E> + Send + Sync + 'static,
+    ) -> Self {
+        self.then = Box::new(then);
+        self
+    }
 }
 
-impl<'o, K, E> Handle<'o, StateNode<K, E>>
+fn default_then<K, E: ?Sized>(_results: Vec<K>) -> StateNode<K, E> {
+    unreachable!("ParallelState::then must name the continuation before running")
+}
+
+
+impl<K, E> State<K> for ParallelState<K, E>
 where
-    K: Send + 'static,
+    K: Send + Sync + 'static,
     E: ?Sized + Sync + 'static,
 {
-    /// One transition of the machine: safepoint, run the current
-    /// state (reached through `DerefMut`, never a raw `&mut`), install
-    /// its successor with a plain `DerefMut` assignment. Returns the
-    /// machine's result when done.
+    type Env = E;
+
+    fn execute(&mut self, env: &E) -> Result<Step<K, Self::Env>> {
+        // One pair per phase: the children move into the phase's own
+        // tree for the run and land back in their slots.
+        let children = std::mem::take(&mut self.children);
+        let mut landed = with_checkpoint_pair(children, |mut phase, _requester| {
+            phase.safepoint();
+            phase.fanout(
+                &|kids: &mut Vec<ParallelChild<K, E>>| kids.iter_mut().collect(),
+                |mut child: Handle<'_, ParallelChild<K, E>>| {
+                    let result = child.run_to_completion(env).expect("child machine completes");
+                    child.result = Some(result);
+                },
+            );
+            std::mem::take(&mut *phase)
+        });
+        let results = landed.iter_mut().map(|c| c.result.take()).collect::<Option<Vec<_>>>();
+        let results = results.unwrap_or_else(|| {
+            unreachable!("every child ran to completion and landed its result")
+        });
+        self.children = landed;
+        let then = std::mem::replace(&mut self.then, Box::new(default_then));
+        Ok(Step::Continue(then(results)))
+    }
+}
+
+impl<'o, T> Handle<'o, T>
+where
+    T: StateSlot + 'o,
+{
+    /// One transition: safepoint, run the current state through the
+    /// slot, install its successor. Returns the machine's result when
+    /// done.
     ///
     /// # Panics
     ///
     /// Panics if a panicked child propagates from a nested fan-out
     /// scope — see [`Handle::fanout`].
-    pub fn execute(&mut self, env: &E) -> Result<Option<K>> {
+    pub fn execute(&mut self, env: &T::E) -> Result<Option<T::K>> {
         self.safepoint();
-        match (**self).execute(env)? {
+        match self.state().execute(env)? {
             Step::Continue(next) => {
-                **self = next;
+                self.install(next);
                 Ok(None)
             }
             Step::Done(result) => Ok(Some(result)),
         }
     }
-}
 
-impl<'o, K, E> Handle<'o, StateNode<K, E>>
-where
-    K: Send + 'static,
-    E: ?Sized + Sync + 'static,
-{
     /// Drive the machine to completion: safepoint, one transition
     /// ([`Handle::execute`]), repeat until a state yields the result.
+    /// Generalized over every [`StateSlot`] — the machine node and
+    /// the parallel children run the same protocol.
     ///
     /// # Panics
     ///
     /// Panics if a state panics inside a nested fan-out scope.
-    pub fn run_to_completion(&mut self, env: &E) -> Result<K> {
+    pub fn run_to_completion(&mut self, env: &T::E) -> Result<T::K> {
         loop {
             self.safepoint();
             if let Some(result) = self.execute(env)? {
                 return Ok(result);
             }
         }
+    }
+}
+
+impl<'o, T> Handle<'o, T> {
+    /// Sugar for call sites that carry both: the [`Ctx`] is pure
+    /// `Deref`/`DerefMut` over this handle (there is no special
+    /// `ctx.fanout`, only `handle.fanout`).
+    pub fn as_ctx(&mut self) -> Ctx<'_, 'o, T> {
+        Ctx { handle: self }
     }
 }
 
@@ -252,141 +289,140 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
-    /// Countdown start and expected result in the linear-machine test.
+    /// Countdown start in the linear-machine test.
     const LINEAR_START: u32 = 3;
+    /// The linear test's fixed result.
     const LINEAR_RESULT: u32 = 42;
-    /// Work items per fan-out child.
+    /// Work steps per parallel child.
     const WORK_STEPS: [u32; WORK_ITEMS] = [2, 3, 4];
-    /// How many children the fan-out test spawns.
+    /// How many children the parallel phase spawns.
     const WORK_ITEMS: usize = 3;
-    /// The single result the ctx-deref test expects.
-    const ONE_RESULT: usize = 1;
-    /// The first (and only) child's slot in the seen counter.
-    const FIRST_CHILD_INDEX: usize = 0;
 
     struct Env;
 
-    /// The linear test's state: counts down, then a final state
-    /// yields the fixed result.
+    /// The linear test's state: counts down, then yields the fixed
+    /// result.
     struct Countdown {
         left: u32,
-        calls: usize,
     }
 
     impl State<u32> for Countdown {
         type Env = Env;
 
         fn execute(&mut self, _env: &Env) -> Result<Step<u32, Env>> {
-            self.calls += 1;
             if self.left == 0 {
                 return Ok(Step::Done(LINEAR_RESULT));
             }
             self.left -= 1;
-            Ok(Step::Continue(Box::new(Countdown {
-                left: self.left,
-                calls: self.calls,
-            })))
+            Ok(Step::Continue(Box::new(Countdown { left: self.left })))
         }
     }
 
     #[test]
     fn linear_machine_completes() {
-        let machine: StateNode<u32, Env> =
-            Box::new(Countdown { left: LINEAR_START, calls: 0 });
+        let machine: StateNode<u32, Env> = Box::new(Countdown { left: LINEAR_START });
         let result = run_to_completion(machine, &Env).expect("machine completes");
         assert_eq!(result, LINEAR_RESULT);
     }
 
-    /// One parallel child's state: counts its steps, records which
-    /// thread each step ran on, then yields the count.
+    /// One parallel child: its context id arrives at CONSTRUCTION and
+    /// is embedded (the constructor design); it counts its steps and
+    /// yields the id's hash, so results are correlated by what the
+    /// state itself carries.
     struct WorkItem {
+        id_hash: u64,
         steps: u32,
         done: u32,
-        threads: Vec<std::thread::ThreadId>,
     }
 
-    impl State<u32> for WorkItem {
+    impl State<u64> for WorkItem {
         type Env = Env;
 
-        fn execute(&mut self, _env: &Env) -> Result<Step<u32, Env>> {
+        fn execute(&mut self, _env: &Env) -> Result<Step<u64, Env>> {
             if self.done < self.steps {
                 self.done += 1;
-                self.threads.push(std::thread::current().id());
                 return Ok(Step::Continue(Box::new(WorkItem {
+                    id_hash: self.id_hash,
                     steps: self.steps,
                     done: self.done,
-                    threads: self.threads.clone(),
                 })));
             }
-            Ok(Step::Done(self.steps))
+            Ok(Step::Done(self.id_hash))
         }
     }
 
+    /// The phase's continuation: receives the landed results (in
+    /// spawn order) and yields their sum.
+    struct Sum(Vec<u64>);
+
+    impl State<u64> for Sum {
+        type Env = Env;
+
+        fn execute(&mut self, _env: &Env) -> Result<Step<u64, Env>> {
+            Ok(Step::Done(self.0.iter().sum()))
+        }
+    }
+
+    /// The whole composition: the PHASE is a state inside the dyn
+    /// machine — spawn allocates each child's context id and hands it
+    /// to the constructor; children land their results in their slots
+    /// in spawn order; `then` builds the continuation from them; the
+    /// machine's result is the sum.
     #[test]
-    fn parallel_phase_runs_children_on_their_own_threads() {
-        let phase_id = ContextId::root().new_child();
-        let mut phase = ParallelState::<u32, Env>::new();
-        let mut hashes = Vec::new();
+    fn parallel_phase_composes_inside_a_machine() {
+        let hashes: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let mut phase = ParallelState::<u64, Env>::new(ContextId::root());
         for steps in WORK_STEPS {
-            hashes.push(phase.spawn(&phase_id, Box::new(WorkItem {
-                steps,
-                done: 0,
-                threads: Vec::new(),
-            })));
+            phase.spawn({
+                let hashes = &hashes;
+                move |id: &ContextId| {
+                    hashes.lock().expect("hash vec").push(id.hash());
+                    Box::new(WorkItem { id_hash: id.hash(), steps, done: 0 })
+                        as StateNode<u64, Env>
+                }
+            });
         }
-        assert_eq!(phase.child_ids().count(), WORK_STEPS.len());
+        let expected: Vec<u64> = hashes.into_inner().expect("hash vec");
+        assert_eq!(expected.len(), WORK_ITEMS);
 
-        let results = with_checkpoint_pair(phase, |mut handle, _requester| {
-            handle.execute_children(&Env).expect("children complete")
-        });
-
-        // every child finished with its step count, keyed by the hash
-        // spawn handed out — the context-id correlation contract.
-        let mut by_hash = results.into_iter().collect::<std::collections::HashMap<_, _>>();
-        for (i, h) in hashes.iter().enumerate() {
-            assert_eq!(by_hash.remove(h), Some(WORK_STEPS[i]), "child {i} result");
-        }
-        assert!(by_hash.is_empty(), "no stray results");
+        let machine: StateNode<u64, Env> =
+            Box::new(phase.then(|results| Box::new(Sum(results)) as StateNode<u64, Env>));
+        let result = run_to_completion(machine, &Env).expect("machine completes");
+        let sum: u64 = expected.iter().sum();
+        assert_eq!(result, sum, "the continuation saw the landed results");
     }
 
-    /// The drivers are on the handles; the machine node installs
-    /// successors through DerefMut — a mid-machine ParallelState
-    /// phase composes by running under its own pair (#13 seam: the
-    /// composition rule is Jonas's to settle; this test pins the
-    /// standalone phase contract only).
     #[test]
     fn spawn_allocates_distinct_child_context_ids() {
         let parent = ContextId::root().new_child();
-        let mut phase = ParallelState::<u32, Env>::new();
-        let h1 = phase.spawn(&parent, Box::new(Countdown { left: 0, calls: 0 }));
-        let h2 = phase.spawn(&parent, Box::new(Countdown { left: 0, calls: 0 }));
-        assert_ne!(h1, h2, "each child gets its own context id");
+        let mut phase = ParallelState::<u32, Env>::new(&parent);
+        let mut seen = Vec::new();
+        for _ in 0..WORK_ITEMS {
+            phase.spawn(|id: &ContextId| {
+                seen.push(id.hash());
+                Box::new(Countdown { left: 0 }) as StateNode<u32, Env>
+            });
+        }
+        let unique: std::collections::HashSet<_> = seen.iter().copied().collect();
+        assert_eq!(unique.len(), WORK_ITEMS, "each child gets its own context id");
     }
 
+    /// The Ctx chain: `ctx.fanout` resolves on `Handle` and the split
+    /// reaches the node — pure Deref/DerefMut, no methods of Ctx's
+    /// own (an empty fan-out; the deref shape is the point).
     #[test]
     fn ctx_derefs_to_the_handle_and_the_node() {
-        // The chain Ctx -> Handle -> node: field access reaches the
-        // tuple through the handle without any method of Ctx's own.
-        let phase_id = ContextId::root().new_child();
-        let mut phase = ParallelState::<u32, Env>::new();
-        let h = phase.spawn(&phase_id, Box::new(Countdown { left: 0, calls: 0 }));
-        let results = with_checkpoint_pair(phase, |mut handle, _| {
-            let mut ctx = Ctx { handle: &mut handle };
-            // ctx.fanout resolves on Handle; the split reaches the
-            // node's children — pure Deref, no ctx methods.
-            let seen: AtomicUsize = AtomicUsize::new(0);
-            ctx.fanout(
-                &|p: &mut ParallelState<u32, Env>| p.children.iter_mut().collect(),
-                |child: Handle<'_, (ContextId, StateNode<u32, Env>)>| {
-                    let n = seen.fetch_add(1, Ordering::SeqCst);
-                    assert_eq!(n, FIRST_CHILD_INDEX, "each child counted once");
-                    assert_eq!(child.0.hash(), h, "the tuple is the node's child");
-                },
-            );
-            handle.execute_children(&Env).expect("children complete")
-        });
-        assert_eq!(results.len(), ONE_RESULT);
+        with_checkpoint_pair(
+            ParallelState::<u64, Env>::new(ContextId::root()),
+            |mut handle, _| {
+                let mut ctx = handle.as_ctx();
+                ctx.fanout(
+                    &|_p: &mut ParallelState<u64, Env>| Vec::new(),
+                    |_child: Handle<'_, ParallelChild<u64, Env>>| unreachable!("no children"),
+                );
+            },
+        );
     }
 }
