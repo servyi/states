@@ -181,11 +181,8 @@ where
         loop {
             self.safepoint();
             // &mut Handle → &mut Context → &mut dyn State: the
-            // state's own execute, through nothing but DerefMut. The
-            // state borrow ends with the call; the step is owned.
-            let context: &mut Context<'e, K, E> = self;
-            let step: Step<'e, K, E> = context.execute(env)?;
-            match step {
+            // state's own execute, through nothing but DerefMut.
+            match (**self).execute(env)? {
                 Step::Continue(next) => self.state = next,
                 Step::Done(result) => return Ok(result),
             }
