@@ -21,7 +21,7 @@
 use anyhow::Result;
 use std::sync::Mutex;
 
-use crate::checkpoint::{Handle, with_checkpoint_pair};
+use crate::checkpoint::Handle;
 use crate::context_id::ContextId;
 
 /// The machine node: the state's context id and the state. Derefs all
@@ -185,6 +185,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::checkpoint::with_checkpoint_pair;
 
     /// Countdown start in the linear-machine test.
     const LINEAR_START: u32 = 3;
