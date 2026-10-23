@@ -2,7 +2,11 @@
 //! the public [`Handle`] API (issue #13).
 //!
 //! The machine node is [`Context`]: the state's context id and the
-//! state, side by side. Through the deref chain
+//! state, side by side. The environment is an EXPLICIT parameter of
+//! the trait (`State<K, E>`), and the node carries the object
+//! lifetime (`Context<'e, K, E>`), so `E` may borrow — a machine can
+//! hold `E = MachineEnv<'e>` over stack providers for the whole run.
+//! Through the deref chain
 //! `&mut Handle<Context>` → `&mut Context` → `&mut dyn State` the
 //! driver calls the state's `execute` and installs successors with a
 //! plain field assignment (`h.state = next`) — no `unsafe`, no
@@ -27,73 +31,75 @@ use crate::context_id::ContextId;
 /// The machine node: the state's context id and the state. Derefs all
 /// the way to the state (`&mut Context` → `&mut dyn State`), so a
 /// handle over a Context drives the machine directly.
-pub struct Context<K, E: ?Sized> {
+pub struct Context<'e, K, E: ?Sized + 'e> {
     /// This state's context id.
     pub id: ContextId,
     /// The current state.
-    pub state: Box<dyn State<K, Env = E> + Send + Sync>,
+    pub state: Box<dyn State<K, E> + Send + Sync + 'e>,
     /// The child's landing slot: a parallel worker writes its result
     /// here, through its own handle; the machine driver never touches
     /// it.
     pub result: Option<K>,
 }
 
-impl<K, E: ?Sized> Context<K, E> {
+impl<'e, K, E: ?Sized + 'e> Context<'e, K, E> {
     /// A node for `state` under `ctx`: allocates the state's context
     /// id (a child of `ctx`).
-    pub fn new(ctx: &ContextId, state: Box<dyn State<K, Env = E> + Send + Sync>) -> Self {
+    pub fn new(ctx: &ContextId, state: Box<dyn State<K, E> + Send + Sync + 'e>) -> Self {
         Context { id: ctx.new_child(), state, result: None }
     }
 }
 
-impl<K, E: ?Sized> std::ops::Deref for Context<K, E> {
-    type Target = dyn State<K, Env = E> + Send + Sync;
+impl<'e, K, E: ?Sized + 'e> std::ops::Deref for Context<'e, K, E> {
+    type Target = dyn State<K, E> + Send + Sync + 'e;
 
     fn deref(&self) -> &Self::Target {
         &*self.state
     }
 }
 
-impl<K, E: ?Sized> std::ops::DerefMut for Context<K, E> {
+impl<'e, K, E: ?Sized + 'e> std::ops::DerefMut for Context<'e, K, E> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.state
     }
 }
 
 /// What a state decides: its successor, or the machine's result.
-pub enum Step<K, E: ?Sized> {
-    Continue(Box<dyn State<K, Env = E> + Send + Sync>),
+pub enum Step<'e, K, E: ?Sized + 'e> {
+    Continue(Box<dyn State<K, E> + Send + Sync + 'e>),
     Done(K),
 }
 
 /// A linear state: one transition through `&mut self`. Fan-out phases
 /// are [`ParallelState`]s, driven by their handles — states
 /// themselves never grow the trait.
-pub trait State<K>: Send + Sync + 'static
+pub trait State<K, E: ?Sized>: Send + Sync
 where
     K: Send + 'static,
-    Self::Env: 'static,
+    E: Sync,
 {
-    /// The machine's environment (providers and the like).
-    type Env: ?Sized + Sync;
-
     /// One transition: run, and name the successor or the result.
-    fn execute(&mut self, env: &Self::Env) -> Result<Step<K, Self::Env>>;
+    /// `E` is an explicit parameter so it may carry a lifetime — the
+    /// run's borrow of the providers. The successor's own object
+    /// lifetime `'r` is caller-chosen (the run's `'e` at the driver);
+    /// it must NOT elide to the `&mut self` borrow, or the successor
+    /// would appear to borrow the state it replaces.
+    fn execute<'r>(&mut self, env: &E) -> Result<Step<'r, K, E>>;
 }
 
 /// A fan-out phase: allocates each child's [`ContextId`] itself and
 /// hands the id to the state's constructor; the children are
 /// [`Context`]s of this same tree. Run it with
 /// [`Handle::run_children`].
-pub struct ParallelState<K, E: ?Sized> {
+pub struct ParallelState<'e, K, E: ?Sized + 'e> {
     id: ContextId,
-    children: Vec<Context<K, E>>,
+    children: Vec<Context<'e, K, E>>,
 }
 
-impl<K, E> ParallelState<K, E>
+impl<'e, K, E> ParallelState<'e, K, E>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync,
 {
     /// A phase under `ctx`: allocates the phase's own context id (a
     /// child of `ctx`); spawn children with [`ParallelState::spawn`].
@@ -103,16 +109,20 @@ where
 
     /// Spawn a child from a CONSTRUCTOR that receives the child's
     /// freshly allocated context id — the state embeds it at birth.
-    pub fn spawn(&mut self, make: impl FnOnce(&ContextId) -> Box<dyn State<K, Env = E> + Send + Sync>) {
+    pub fn spawn(
+        &mut self,
+        make: impl FnOnce(&ContextId) -> Box<dyn State<K, E> + Send + Sync + 'e>,
+    ) {
         let child_id = self.id.new_child();
         self.children.push(Context::new(&self.id, make(&child_id)));
     }
 }
 
-impl<'o, K, E> Handle<'o, ParallelState<K, E>>
+impl<'o, 'e, K, E> Handle<'o, ParallelState<'e, K, E>>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync,
+    'e: 'o,
 {
     /// Run every child to completion, each on its own thread: the
     /// children — [`Context`]s of this same tree — are wrapped in
@@ -129,8 +139,8 @@ where
         self.safepoint();
         let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
         self.fanout(
-            &|phase: &mut ParallelState<K, E>| phase.children.iter_mut().collect(),
-            |mut child: Handle<'_, Context<K, E>>| match child.run_to_completion(env) {
+            &|phase: &mut ParallelState<'e, K, E>| phase.children.iter_mut().collect(),
+            |mut child: Handle<'_, Context<'e, K, E>>| match child.run_to_completion(env) {
                 Ok(result) => child.result = Some(result),
                 Err(e) => {
                     let mut slot =
@@ -153,10 +163,10 @@ where
     }
 }
 
-impl<'o, K, E> Handle<'o, Context<K, E>>
+impl<'o, 'e, K, E> Handle<'o, Context<'e, K, E>>
 where
     K: Send + 'static,
-    E: ?Sized + Sync + 'static,
+    E: ?Sized + Sync,
 {
     /// Drive the machine to completion: safepoint, run the current
     /// state through the deref chain, install its successor with a
@@ -170,9 +180,12 @@ where
     pub fn run_to_completion(&mut self, env: &E) -> Result<K> {
         loop {
             self.safepoint();
-            // &mut Handle → &mut Context → &mut dyn State: the state's
-            // own execute, through nothing but DerefMut.
-            match (**self).execute(env)? {
+            // &mut Handle → &mut Context → &mut dyn State: the
+            // state's own execute, through nothing but DerefMut. The
+            // state borrow ends with the call; the step is owned.
+            let context: &mut Context<'e, K, E> = self;
+            let step: Step<'e, K, E> = context.execute(env)?;
+            match step {
                 Step::Continue(next) => self.state = next,
                 Step::Done(result) => return Ok(result),
             }
@@ -204,10 +217,8 @@ mod tests {
         left: u32,
     }
 
-    impl State<u32> for Countdown {
-        type Env = Env;
-
-        fn execute(&mut self, _env: &Env) -> Result<Step<u32, Env>> {
+    impl State<u32, Env> for Countdown {
+        fn execute<'r>(&mut self, _env: &Env) -> Result<Step<'r, u32, Env>> {
             if self.left == 0 {
                 return Ok(Step::Done(LINEAR_RESULT));
             }
@@ -235,10 +246,8 @@ mod tests {
         done: u32,
     }
 
-    impl State<u64> for WorkItem {
-        type Env = Env;
-
-        fn execute(&mut self, _env: &Env) -> Result<Step<u64, Env>> {
+    impl State<u64, Env> for WorkItem {
+        fn execute<'r>(&mut self, _env: &Env) -> Result<Step<'r, u64, Env>> {
             if self.done < self.steps {
                 self.done += 1;
                 return Ok(Step::Continue(Box::new(WorkItem {
@@ -265,7 +274,7 @@ mod tests {
                 move |id: &ContextId| {
                     hashes.lock().expect("hash vec").push(id.hash());
                     Box::new(WorkItem { id_hash: id.hash(), steps, done: 0 })
-                        as Box<dyn State<u64, Env = Env> + Send + Sync>
+                        as Box<dyn State<u64, Env> + Send + Sync>
                 }
             });
         }
@@ -286,10 +295,52 @@ mod tests {
         for _ in 0..WORK_ITEMS {
             phase.spawn(|id: &ContextId| {
                 seen.push(id.hash());
-                Box::new(Countdown { left: 0 }) as Box<dyn State<u32, Env = Env> + Send + Sync>
+                Box::new(Countdown { left: 0 }) as Box<dyn State<u32, Env> + Send + Sync>
             });
         }
         let unique: std::collections::HashSet<_> = seen.iter().copied().collect();
         assert_eq!(unique.len(), WORK_ITEMS, "each child gets its own context id");
+    }
+    /// The label the borrowing-env test clones out of its provider.
+    const BORROWED_LABEL: &str = "borrowed";
+
+    /// The run-lifetime contract: a machine whose environment BORROWS
+    /// stack providers — `E = MachineEnv<'e>` — with no `'static`
+    /// anywhere. This is the shape refactor-check needs.
+    struct Providers {
+        label: String,
+    }
+
+    struct MachineEnv<'a> {
+        providers: &'a Providers,
+    }
+
+    struct Borrowing {
+        left: u32,
+    }
+
+    impl<'a> State<String, MachineEnv<'a>> for Borrowing {
+        fn execute<'r>(
+            &mut self,
+            env: &MachineEnv<'a>,
+        ) -> Result<Step<'r, String, MachineEnv<'a>>> {
+            if self.left == 0 {
+                return Ok(Step::Done(env.providers.label.clone()));
+            }
+            self.left -= 1;
+            Ok(Step::Continue(Box::new(Borrowing { left: self.left })))
+        }
+    }
+
+    #[test]
+    fn machine_env_may_borrow_for_the_run() {
+        let providers = Providers { label: String::from(BORROWED_LABEL) };
+        let env = MachineEnv { providers: &providers };
+        let machine = Context::new(ContextId::root(), Box::new(Borrowing { left: LINEAR_START }));
+        let result = with_checkpoint_pair(machine, |mut handle, _requester| {
+            handle.run_to_completion(&env)
+        })
+        .expect("borrowing machine completes");
+        assert_eq!(result, providers.label);
     }
 }
