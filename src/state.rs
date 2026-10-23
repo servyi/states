@@ -13,8 +13,10 @@
 //! hands the id to the state's constructor; its children are
 //! [`Context`]s of the same tree, wrapped in handles by
 //! [`Handle::fanout`] and run by the same
-//! [`Handle::run_to_completion`]. Results land in each child's own
-//! slot, read in spawn order after the join.
+//! [`Handle::run_to_completion`] under a
+//! [`with_checkpoint_pair`](crate::checkpoint::with_checkpoint_pair).
+//! Results land in each child's own slot, read in spawn order after
+//! the join.
 
 use anyhow::Result;
 use std::sync::Mutex;
@@ -178,22 +180,7 @@ where
     }
 }
 
-/// Drive a machine to completion under one checkpoint pair: the node
-/// is the current [`Context`]; each transition is
-/// [`Handle::run_to_completion`]'s loop.
-///
-/// # Panics
-///
-/// Panics if a state panics inside a fan-out scope.
-pub fn run_to_completion<K, E>(machine: Context<K, E>, env: &E) -> Result<K>
-where
-    K: Send + 'static,
-    E: ?Sized + Sync + 'static,
-{
-    with_checkpoint_pair(machine, |mut handle, _requester| {
-        handle.run_to_completion(env)
-    })
-}
+
 
 #[cfg(test)]
 mod tests {
@@ -231,7 +218,10 @@ mod tests {
     #[test]
     fn linear_machine_completes() {
         let machine = Context::new(ContextId::root(), Box::new(Countdown { left: LINEAR_START }));
-        let result = run_to_completion(machine, &Env).expect("machine completes");
+        let result = with_checkpoint_pair(machine, |mut handle, _requester| {
+            handle.run_to_completion(&Env)
+        })
+        .expect("machine completes");
         assert_eq!(result, LINEAR_RESULT);
     }
 
