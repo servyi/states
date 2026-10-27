@@ -240,46 +240,123 @@ impl<'o, T> Handle<'o, T> {
             let node: &mut T = self;
             split(node).into_iter().map(std::ptr::from_mut).collect()
         };
-        let mut storages: Vec<Shared> = (0..child_ptrs.len()).map(|_| Shared::new()).collect();
-        // Node borrow dropped: swap the collected vec in, then create the
-        // handles from the elements' final resting places.
-        let start = self.children.len();
-        self.children.append(&mut storages);
-        // HANDLES FIRST: every child becomes its Handle here.
-        let handles: Vec<Handle<'_, C>> = child_ptrs
-            .into_iter()
-            .zip(&self.children[start..])
-            .map(|(ptr, storage)| {
-                // SAFETY (Handle constructor, per child): the TYPE
-                // INVARIANT — the split yielded each child exactly once,
-                // disjointly; this handle is the only reference to it
-                // for its whole life.
-                Handle { node: ptr, shared: storage, children: Vec::new(), _brand: PhantomData }
-            })
-            .collect();
-        // THEN THREADS: one dedicated scoped thread per handle — no pool
-        // to saturate, no serve loop ever blocks a worker.
         let shared = self.shared;
-        let children = &self.children;
-        std::thread::scope(|scope| {
-            let action = &action;
-            let mut joins = Vec::with_capacity(handles.len());
-            for h in handles {
-                joins.push(scope.spawn(move || action(h)));
+        fanout_core(shared, &mut self.children, child_ptrs, action);
+    }
+
+    /// Split this handle into its node and a transition [`Ctx`] over
+    /// the same tree — disjoint borrows. This is the basis of
+    /// fan-outs inside a state's `execute`: the state runs against
+    /// the `&mut T`, while its `ctx` reaches the tree identity and
+    /// the child registry, so `ctx.fanout` over the state's own
+    /// slots keeps every child in this tree.
+    pub fn step_parts(&mut self) -> (&mut T, Ctx<'_, 'o>) {
+        let Handle { node, shared, children, _brand } = self;
+        let ctx = Ctx { shared, children };
+        // SAFETY: exclusivity per the Handle invariant; the ctx takes
+        // only the other fields, so the borrows stay disjoint.
+        let node = unsafe { &mut **node };
+        (node, ctx)
+    }
+}
+
+/// The fan-out core shared by [`Handle::fanout`] and [`Ctx::fanout`]:
+/// fresh storages for the children (pushed on `registry`), one handle
+/// per slot — HANDLES FIRST — then one dedicated scoped thread per
+/// handle, this thread parked join-waiting while they run, the
+/// storages truncated when the scope joins.
+///
+/// # Panics
+///
+/// Propagates a panicked child subtask, and panics only if a handshake
+/// lock is poisoned — see the invariant on `Shared::parked`.
+fn fanout_core<C, F>(
+    shared: &Shared,
+    registry: &mut Vec<Shared>,
+    child_ptrs: Vec<*mut C>,
+    action: F,
+) where
+    C: Send,
+    F: Fn(Handle<'_, C>) + Send + Sync,
+{
+    let mut storages: Vec<Shared> = (0..child_ptrs.len()).map(|_| Shared::new()).collect();
+    let start = registry.len();
+    registry.append(&mut storages);
+    // HANDLES FIRST: every child becomes its Handle here.
+    let handles: Vec<Handle<'_, C>> = child_ptrs
+        .into_iter()
+        .zip(&registry[start..])
+        .map(|(ptr, storage)| {
+            // SAFETY (Handle constructor, per child): the TYPE
+            // INVARIANT — the caller yielded each child exactly once,
+            // disjointly; this handle is the only reference to it for
+            // its whole life.
+            Handle { node: ptr, shared: storage, children: Vec::new(), _brand: PhantomData }
+        })
+        .collect();
+    // THEN THREADS: one dedicated scoped thread per handle — no pool
+    // to saturate, no serve loop ever blocks a worker.
+    let children = &registry[start..];
+    std::thread::scope(|scope| {
+        let action = &action;
+        let mut joins = Vec::with_capacity(handles.len());
+        for h in handles {
+            joins.push(scope.spawn(move || action(h)));
+        }
+        loop {
+            if shared.is_pending() {
+                park_self_fields(shared, children);
             }
-            loop {
-                if shared.is_pending() {
-                    park_self_fields(shared, children);
-                }
-                if joins.iter().all(|j| j.is_finished()) {
-                    break;
-                }
-                thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
+            if joins.iter().all(|j| j.is_finished()) {
+                break;
             }
-            // Join: a panicked child propagates from scope exit.
-        });
-        // Scope joined: this fan-out's children go away with it.
-        self.children.truncate(start);
+            thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
+        }
+        // Join: a panicked child propagates from scope exit.
+    });
+    // Scope joined: this fan-out's children go away with it.
+    registry.truncate(start);
+}
+
+/// The fan-out and safepoint facilities of one transition, handed to
+/// the running state's `execute`. Derived from its node handle's tree
+/// identity and child registry — borrows of the node and of the ctx
+/// never overlap. A state fans out over a field of ITSELF (its child
+/// slots): `ctx.fanout(&mut self.work, ..)` keeps every child part of
+/// the enclosing tree — one pair, checkpointable from the root.
+pub struct Ctx<'a, 'o> {
+    shared: &'o Shared,
+    children: &'a mut Vec<Shared>,
+}
+
+impl Ctx<'_, '_> {
+    /// Park while a checkpoint has been requested, then return.
+    pub fn safepoint(&mut self) {
+        if self.shared.is_pending() {
+            park_self_fields(self.shared, self.children);
+        }
+    }
+
+    /// Fan out over `slots` — a field of the state that owns this
+    /// ctx, so the children are part of the enclosing tree. One
+    /// dedicated scoped thread per child runs `action` with the
+    /// child's handle; this thread parks join-waiting while they run.
+    /// Data lives in the slot for the child's whole life and is
+    /// accessed through its handle.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a panicked child subtask, and panics only if a
+    /// handshake lock is poisoned — see the invariant on
+    /// [`Shared::parked`](crate::checkpoint).
+    pub fn fanout<C, F>(&mut self, slots: &mut [C], action: F)
+    where
+        C: Send,
+        F: Fn(Handle<'_, C>) + Send + Sync,
+    {
+        let child_ptrs: Vec<*mut C> = slots.iter_mut().map(std::ptr::from_mut).collect();
+        let shared = self.shared;
+        fanout_core(shared, self.children, child_ptrs, action);
     }
 }
 
