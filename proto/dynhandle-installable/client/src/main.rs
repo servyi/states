@@ -7,7 +7,7 @@
 
 use std::ops::DerefMut;
 
-use dynstate::{Erased, Proj, StateHandle, Unwrap, install};
+use dynstate::{Erased, Proj, Unwrap, install};
 use handle::{Handle, with_pair};
 
 pub struct Env;
@@ -49,13 +49,13 @@ pub trait State: Sized + 'static {
 
 fn execute_entry<S: State>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
     h.safepoint(); // between transitions
-    let mut sh: StateHandle<'_, S> = Proj::<S, Context>::unwrap_handle(h);
-    S::execute(&mut *sh, env)
+    // the temporary Handle<S> (chain's brands) lives inside the
+    // closure; the state's execute runs on it
+    Proj::<S, Context>::unwrap_mut(h, |typed| S::execute(typed, env))
 }
 
 fn save_entry<S: State>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    let mut sh: StateHandle<'_, S> = Proj::<S, Context>::unwrap_handle(h);
-    S::save(&mut *sh)
+    Proj::<S, Context>::unwrap_mut(h, |typed| S::save(typed))
 }
 
 pub fn entries<S: State>() -> Context {

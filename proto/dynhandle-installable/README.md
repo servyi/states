@@ -31,10 +31,13 @@ safepoint), `save: countdown:3`.
 The projection casts to the WRAPPER and then takes an ordinary field
 borrow — no offset assumptions, any field order.
 
-Per the 16:08 comment: State methods run on `self: &mut Handle<Self>`
-— the projection now yields the state's own HANDLE (`StateHandle`,
-lending a projected `Handle<'a, 'a, S>` built by the handle crate's
-`project`: same shared, fresh brands picked at construction). The
+Per the 16:08 + 16:15 comments: State methods run on `self: &mut
+Handle<Self>`, and the unwrapper takes a CLOSURE — `unwrap_mut(h, |typed|
+...)` — building the `Handle<'o, 'c, S>` as a TEMPORARY inside (the node
+pointer differs from the chain handle's, so it is constructed, not
+cast), keeping the chain's BRANDS (no rebranding — the earlier
+'a-branded project deleted the child brand and was unsound), and
+scoping its lifetime by the closure so no ownership escapes. The
 inner/outer split COLLAPSES: one State trait, and EVERY state can
 safepoint mid-run (Countup does, before its last increment).
 

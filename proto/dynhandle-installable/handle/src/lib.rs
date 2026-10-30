@@ -38,19 +38,24 @@ impl<'o, 'c, T> Handle<'o, 'c, T> {
 }
 
 impl<'o, 'c, T> Handle<'o, 'c, T> {
-    /// Rebrand this handle's tree membership onto a projected node:
-    /// same shared, same brands, the given node. The projected handle
-    /// borrows this one (it must not outlive it).
+    /// Lend a handle over a projected node, INSIDE a closure: the
+    /// temporary `Handle<'o, 'c, S>` KEEPS this handle's brands (they
+    /// are its tree identity — rebranding would open cross-child
+    /// application); `f` runs with it; the temporary dies before this
+    /// borrow ends, so no ownership is given out.
     ///
     /// # Safety
     ///
     /// `node` must point at a live, exclusively-owned `S` for the
-    /// whole borrow, and the projection must not create a second
+    /// whole call, and this must not create a second concurrent
     /// handle over the same node.
-    pub unsafe fn project<'a, S>(&'a mut self, node: *mut S) -> Handle<'a, 'a, S> {
-        // the fresh handle's brands are this borrow (construction
-        // picks them; they are never rebased)
-        Handle { node, shared: self.shared, _brand: PhantomData }
+    pub unsafe fn with_projected<S, R>(
+        &mut self,
+        node: *mut S,
+        f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
+    ) -> R {
+        let mut projected = Handle { node, shared: self.shared, _brand: PhantomData };
+        f(&mut projected)
     }
 }
 

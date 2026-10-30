@@ -45,53 +45,38 @@ pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
 pub struct Proj<S, T>(PhantomData<fn() -> (S, T)>);
 
 pub trait Unwrap<S, T> {
-    /// Recover the state's own HANDLE — `&mut Handle<S>` — from the
-    /// chain handle, preserving the tree membership (same shared, same
-    /// brands), so the state's methods can run on `self: &mut
-    /// Handle<Self>` and safepoint through it.
-    fn unwrap_handle<'x>(
-        h: &'x mut Handle<'_, '_, Erased<T>>,
-    ) -> StateHandle<'x, S>;
-}
-
-/// The state's own handle: lends the projected handle.
-pub struct StateHandle<'a, S> {
-    handle: Handle<'a, 'a, S>,
-}
-
-impl<'a, S> std::ops::Deref for StateHandle<'a, S> {
-    type Target = Handle<'a, 'a, S>;
-    fn deref(&self) -> &Self::Target {
-        &self.handle
-    }
-}
-
-impl<'a, S> std::ops::DerefMut for StateHandle<'a, S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.handle
-    }
+    /// Run `f` with the state's own handle — `&mut Handle<'o, 'c, S>`
+    /// — built as a TEMPORARY inside: the node pointer differs from
+    /// the chain handle's (the state lives inside the box), so the
+    /// handle is constructed, not cast; its BRANDS are the chain's
+    /// (tree identity preserved — no rebranding); the closure scopes
+    /// its lifetime, so no ownership is given out.
+    fn unwrap_mut<'o, 'c, R>(
+        h: &mut Handle<'o, 'c, Erased<T>>,
+        f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
+    ) -> R;
 }
 
 impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
-    fn unwrap_handle<'x>(
-        h: &'x mut Handle<'_, '_, Erased<T>>,
-    ) -> StateHandle<'x, S> {
-        // dig the erased object (safe derefs), then land on this
-        // pairing's Installed
+    fn unwrap_mut<'o, 'c, R>(
+        h: &mut Handle<'o, 'c, Erased<T>>,
+        f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
+    ) -> R {
+        // dig the erased object (safe derefs)
         let b: &mut Erased<T> = &mut *h;
         let erased = &mut **b;
         // SAFETY: the re-type lands on the `Installed<S, T>` that
         // install::<S, T> built (this impl's `(S, T)` names exactly
         // that pairing); provenance: only the entries mk built for
         // this `S` reach this impl, and those travel only inside the
-        // same `Installed`. The state borrow is exclusive.
+        // same `Installed`.
         let installed =
             unsafe { &mut *(erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
-        // SAFETY: the projected node is this Installed's state —
-        // live, exclusively owned by the box this handle wraps, and
-        // no second handle over it exists; the brands/shared ride
-        // with the chain handle. The StateHandle lends it for 'x.
-        let handle = unsafe { h.project(&mut installed.state) };
-        StateHandle { handle }
+        let node = std::ptr::from_mut(&mut installed.state);
+        // SAFETY: the node is this Installed's state — live and
+        // exclusively owned by the box this handle wraps; the brands
+        // ride with the chain handle (no rebranding); the temporary
+        // dies inside, so the borrow is scoped.
+        unsafe { h.with_projected(node, f) }
     }
 }
