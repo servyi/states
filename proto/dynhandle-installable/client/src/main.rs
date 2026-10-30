@@ -5,9 +5,11 @@
 //! zero unsafe here. State methods run on `self: &mut Handle<Self>`
 //! (the projected state handle), so EVERY state can safepoint.
 
-use std::ops::DerefMut;
 
-use dynstate::{Erased, Proj, Unwrap, install};
+use std::ops::DerefMut;
+use std::rc::Rc;
+
+use dynstate::{Erased, Pairing, install};
 use handle::{Handle, with_pair};
 
 pub struct Env;
@@ -26,11 +28,13 @@ pub enum Outcome {
 /// higher-ranked over the handle's brands, which is what lets it be a
 /// with_pair node.
 pub struct Context {
-    pub execute: for<'x, 'o, 'c> fn(
-        &'x mut Handle<'o, 'c, Boxed>,
-        &Env,
-    ) -> Result<Outcome, String>,
-    pub save: for<'x, 'o, 'c> fn(&'x mut Handle<'o, 'c, Boxed>) -> String,
+    /// Rc so dispatch can clone the closure out of the context and
+    /// free the handle borrow for the call (fn pointers did this by
+    /// Copy; Rc is the capturing equivalent).
+    pub execute: Rc<
+        dyn for<'x, 'o, 'c> Fn(&'x mut Handle<'o, 'c, Boxed>, &Env) -> Result<Outcome, String>,
+    >,
+    pub save: Rc<dyn for<'x, 'o, 'c> Fn(&'x mut Handle<'o, 'c, Boxed>) -> String>,
 }
 
 /// The chain's erased node: a box that derefs to the Context.
@@ -47,19 +51,21 @@ pub trait State: Sized + 'static {
 
 // ── entries for both flavors (mk builds them) ─────────────────────
 
-fn execute_entry<S: State>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
-    h.safepoint(); // between transitions
-    // the temporary Handle<S> (chain's brands) lives inside the
-    // closure; the state's execute runs on it
-    Proj::<S, Context>::unwrap_mut(h, |typed| S::execute(typed, env))
-}
-
-fn save_entry<S: State>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    Proj::<S, Context>::unwrap_mut(h, |typed| S::save(typed))
-}
-
-pub fn entries<S: State>() -> Context {
-    Context { execute: execute_entry::<S>, save: save_entry::<S> }
+/// mk receives the pairing; the entries CAPTURE it (Copy ZST) and run
+/// everything through it — which is what lets the capability stay
+/// private: no nameable trait, no universally-callable associated fn.
+pub fn entries<S: State>(p: Pairing<S, Context>) -> Context {
+    Context {
+        execute: Rc::new(move |h: &mut Handle<'_, '_, Boxed>, env: &Env| {
+            h.safepoint(); // between transitions
+            // the temporary Handle<S> (chain's brands) lives inside
+            // the closure; the state's execute runs on it
+            p.project(h, |typed| S::execute(typed, env))
+        }),
+        save: Rc::new(move |h: &mut Handle<'_, '_, Boxed>| {
+            p.project(h, |typed| S::save(typed))
+        }),
+    }
 }
 
 // ── the states ────────────────────────────────────────────────────
@@ -119,8 +125,10 @@ const LAST_STEP_AT: u64 = 1;
 /// Switch, the box is swapped wholesale — the installed successor.
 fn drive(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<u64, String> {
     loop {
-        let execute = (**h).execute; // Handle -> Box -> Context (deref)
-        match execute(h, env)? {
+        // clone the entry out (Rc) so the handle borrow is free
+        let entry = (**h).execute.clone();
+        let r = entry(h, env);
+        match r? {
             Outcome::Pending => {}
             Outcome::Switch(next) => **h = next,
             Outcome::Done(k) => return Ok(k),
@@ -138,7 +146,7 @@ fn main() {
     with_pair(
         Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
         |mut h| {
-            let save = (**h).save;
+            let save = (**h).save.clone();
             println!("save: {}", save(&mut h));
             drive(&mut h, &Env).expect("chain completes")
         },

@@ -1,8 +1,10 @@
-//! The dynstate library, rebuilt around `Installed<S, T>` (per the
-//! 15:50 comment): the erased-box pairing, generalized over the state
-//! `S` and the context `T`. All the reusable parts — the wrapper, its
-//! derefs, the projection, install — live here; the client carries
-//! only its vocabulary and entries, zero unsafe.
+//! The dynstate library: `Installed<S, T>` and the PRIVATE pairing.
+//! The capability is a value (`Pairing<S, T>`) handed only to `mk` —
+//! constructible nowhere else — so the projection it unlocks is not
+//! reachable by naming a type. The client's entries are capturing
+//! closures (they hold the pairing), which is what makes the privacy
+//! possible: no fn-pointer entries that would need a nameable,
+//! universally-callable trait.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -33,45 +35,45 @@ impl<S, T> DerefMut for Installed<S, T> {
 /// context `T`.
 pub type Erased<T> = Box<dyn DerefMut<Target = T>>;
 
-/// install(S, mk) — the DerefMut-impl to box: mk builds the context
-/// (the entries) for this `S`; the pairing leaves together.
-pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
-    Installed { ctx: mk(), state }
+/// The pairing capability: a zero-sized value whose TYPE names the
+/// `(S, T)` it may project. Constructible ONLY by [`install`] (the
+/// field is private), which hands it to `mk` — there is no public
+/// projection path that does not start from this value.
+pub struct Pairing<S, T>(PhantomData<fn() -> (S, T)>);
+
+impl<S, T> Clone for Pairing<S, T> {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
+impl<S, T> Copy for Pairing<S, T> {}
 
-/// The projection's carrier: a zero-sized type per `(S, T)`, so the
-/// (fn-pointer) entries reach the unwrapper statically without
-/// capturing a value.
-pub struct Proj<S, T>(PhantomData<fn() -> (S, T)>);
-
-pub trait Unwrap<S, T> {
-    /// Run `f` with the state's own handle — `&mut Handle<'o, 'c, S>`
-    /// — built as a TEMPORARY inside: the node pointer differs from
-    /// the chain handle's (the state lives inside the box), so the
-    /// handle is constructed, not cast; its BRANDS are the chain's
-    /// (tree identity preserved — no rebranding); the closure scopes
-    /// its lifetime, so no ownership is given out.
-    fn unwrap_mut<'o, 'c, R>(
-        h: &mut Handle<'o, 'c, Erased<T>>,
-        f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
-    ) -> R;
-}
-
-impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
-    fn unwrap_mut<'o, 'c, R>(
+impl<S: 'static, T: 'static> Pairing<S, T> {
+    /// Lend the state's own handle — `&mut Handle<'o, 'c, S>` —
+    /// built as a TEMPORARY inside: the node pointer differs from the
+    /// chain handle's (the state lives inside the box), so the handle
+    /// is constructed, not cast; its BRANDS are the chain's (tree
+    /// identity preserved); the closure scopes its lifetime, so no
+    /// ownership is given out.
+    ///
+    /// Public METHOD, private CAPABILITY: calling it requires a
+    /// `Pairing` value, and values exist only where `install` handed
+    /// them to `mk` — the constructor is private, so a foreign
+    /// pairing cannot be conjured by any code (client or not).
+    pub fn project<'o, 'c, R>(
+        self,
         h: &mut Handle<'o, 'c, Erased<T>>,
         f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
     ) -> R {
-        // dig the erased object (safe derefs)
-        let b: &mut Erased<T> = &mut *h;
-        let erased = &mut **b;
-        // SAFETY: the re-type lands on the `Installed<S, T>` that
-        // install::<S, T> built (this impl's `(S, T)` names exactly
-        // that pairing); provenance: only the entries mk built for
-        // this `S` reach this impl, and those travel only inside the
-        // same `Installed`.
-        let installed =
-            unsafe { &mut *(erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
+        // dig the erased object: Handle derefs to its node (the
+        // Erased<T> box); borrow the box, then the trait object.
+        let b: &mut Erased<T> = &mut **h;
+        let dyn_ref: &mut dyn DerefMut<Target = T> = &mut **b;
+        // SAFETY: the re-type lands on the `Installed<S, T>` that the
+        // SAME `install` call built which minted this pairing value —
+        // the value cannot be obtained any other way, so the (S, T)
+        // here names exactly the box under this handle.
+        let installed = unsafe { &mut *(dyn_ref as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
         let node = std::ptr::from_mut(&mut installed.state);
         // SAFETY: the node is this Installed's state — live and
         // exclusively owned by the box this handle wraps; the brands
@@ -79,4 +81,15 @@ impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
         // dies inside, so the borrow is scoped.
         unsafe { h.with_projected(node, f) }
     }
+}
+
+/// install(S, mk) — per the sketch: mk RECEIVES the capability; it
+/// builds the context (the entries, capturing the capability); the
+/// pairing leaves together with the state.
+pub fn install<S: 'static, T: 'static>(
+    state: S,
+    mk: impl FnOnce(Pairing<S, T>) -> T,
+) -> Installed<S, T> {
+    let ctx = mk(Pairing(PhantomData));
+    Installed { ctx, state }
 }
