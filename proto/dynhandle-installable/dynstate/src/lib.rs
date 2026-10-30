@@ -29,14 +29,33 @@ impl<S, T> DerefMut for Installed<S, T> {
     }
 }
 
+/// The erased box's interface: derefs to the context `T`, and is
+/// downcastable — so the pairing can be VERIFIED at runtime instead
+/// of trusted (a capability applied to a box that is not its own
+/// `Installed` fails the downcast instead of mis-typing memory).
+pub trait Erasable<T>: DerefMut<Target = T> {
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
+}
+
+impl<S: 'static, T: 'static> Erasable<T> for Installed<S, T> {
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
 /// The erased box: what a chain's handle wraps. The box derefs to the
 /// context `T`.
-pub type Erased<T> = Box<dyn DerefMut<Target = T>>;
+pub type Erased<T> = Box<dyn Erasable<T>>;
 
-/// install(S, mk) — the DerefMut-impl to box: mk builds the context
-/// (the entries) for this `S`; the pairing leaves together.
-pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
-    Installed { ctx: mk(), state }
+/// install(S, mk) — per the sketch: mk RECEIVES the capability (a
+/// zero-sized value; its TYPE is the pairing); it builds the context
+/// (the entries); the pairing leaves together.
+pub fn install<S: 'static, T: 'static>(
+    state: S,
+    mk: impl FnOnce(Proj<S, T>) -> T,
+) -> Installed<S, T> {
+    let ctx = mk(Proj(PhantomData));
+    Installed { ctx, state }
 }
 
 /// The projection's carrier: a zero-sized type per `(S, T)`, so the
@@ -64,14 +83,18 @@ impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
     ) -> R {
         // dig the erased object (safe derefs)
         let b: &mut Erased<T> = &mut *h;
-        let erased = &mut **b;
-        // SAFETY: the re-type lands on the `Installed<S, T>` that
-        // install::<S, T> built (this impl's `(S, T)` names exactly
-        // that pairing); provenance: only the entries mk built for
-        // this `S` reach this impl, and those travel only inside the
-        // same `Installed`.
-        let installed =
-            unsafe { &mut *(erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
+        // VERIFIED pairing, not trusted: the box must BE the
+        // Installed<S, T> that install::<S, T> built — the downcast
+        // is the machine check; a mismatched capability (a safe client
+        // can name Proj::<Other, T> and call unwrap_mut on this box)
+        // lands here and fails loudly instead of mis-typing memory.
+        let Some(installed) = b.as_any().downcast_mut::<Installed<S, T>>() else {
+            unreachable!(
+                "pairing violated: the box is not Installed<{}> — the \
+                 capability was applied to a foreign chain",
+                std::any::type_name::<S>()
+            );
+        };
         let node = std::ptr::from_mut(&mut installed.state);
         // SAFETY: the node is this Installed's state — live and
         // exclusively owned by the box this handle wraps; the brands

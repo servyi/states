@@ -5,8 +5,6 @@
 //! zero unsafe here. State methods run on `self: &mut Handle<Self>`
 //! (the projected state handle), so EVERY state can safepoint.
 
-use std::ops::DerefMut;
-
 use dynstate::{Erased, Proj, Unwrap, install};
 use handle::{Handle, with_pair};
 
@@ -17,7 +15,7 @@ pub enum Outcome {
     /// Keep driving this state.
     Pending,
     /// Overwrite with this successor (an already-installed box).
-    Switch(Box<dyn DerefMut<Target = Context>>),
+    Switch(Box<dyn dynstate::Erasable<Context>>),
     /// The chain's result.
     Done(u64),
 }
@@ -58,7 +56,10 @@ fn save_entry<S: State>(h: &mut Handle<'_, '_, Boxed>) -> String {
     Proj::<S, Context>::unwrap_mut(h, |typed| S::save(typed))
 }
 
-pub fn entries<S: State>() -> Context {
+/// mk receives the capability (per the sketch); the entries are its
+/// fn pointers — the zero-sized value itself is unused (its TYPE is
+/// the pairing).
+pub fn entries<S: State>(_pair: Proj<S, Context>) -> Context {
     Context { execute: execute_entry::<S>, save: save_entry::<S> }
 }
 
@@ -115,6 +116,41 @@ const FINAL_RESULT: u64 = 42;
 /// When the outer state safepoints mid-run.
 const LAST_STEP_AT: u64 = 1;
 
+/// The hardening probe: a hostile/mistaken client applies Countdown's
+/// capability to a COUNTUP chain — the pairing check must catch it
+/// (loud failure), not mis-type memory.
+fn misuse_probe() {
+    use dynstate::{Proj as P, Unwrap as _};
+    // The capability is still NAMEABLE (a public associated fn —
+    // that cannot be prevented), so misapplication must be CAUGHT:
+    // unwrap_mut now downcasts the box, and a Proj::<Countdown, _>
+    // call over a Countup box panics with "pairing violated" instead
+    // of re-typing memory. The loud-failure round runs on the branch.
+    let _misapplied: fn(&mut Handle<'_, '_, Erased<Context>>, &mut dyn FnMut(&mut Handle<'_, '_, Countdown>) -> u64) -> u64 =
+        |h, f| <P<Countdown, Context> as dynstate::Unwrap<Countdown, Context>>::unwrap_mut(h, |t| f(t));
+    let _ = _misapplied;
+}
+
+/// The loud-failure round, executed: build a Countup chain, apply
+/// Countdown's capability to it — must PANIC with "pairing violated"
+/// (run via `cargo run` flag below).
+fn misuse_run() {
+    let caught = std::panic::catch_unwind(|| {
+        with_pair(
+            Box::new(install(Countup { up: 0, limit: COUNTUP_LIMIT }, entries::<Countup>)) as Boxed,
+            |mut h| {
+                // THE MISAPPLICATION: Countdown's capability over a
+                // Countup chain. Before the hardening this re-typed
+                // memory (UB); now the downcast fails loudly.
+                let r = <dynstate::Proj<Countdown, Context> as dynstate::Unwrap<Countdown, Context>>::unwrap_mut(&mut h, |_t| 7u64);
+                r
+            },
+        )
+    });
+    assert!(caught.is_err(), "the misapplied capability must be caught");
+    println!("misuse: caught loudly (pairing violated)");
+}
+
 /// The driver: the entry dispatches through the deref chain; on
 /// Switch, the box is swapped wholesale — the installed successor.
 fn drive(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<u64, String> {
@@ -134,6 +170,7 @@ fn main() {
         |mut h| drive(&mut h, &Env).expect("chain completes"),
     );
     println!("result: {result}");
+    misuse_run();
 
     with_pair(
         Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
