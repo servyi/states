@@ -31,6 +31,13 @@ safepoint), `save: countdown:3`.
 The projection casts to the WRAPPER and then takes an ordinary field
 borrow — no offset assumptions, any field order.
 
+Per the 16:08 comment: State methods run on `self: &mut Handle<Self>`
+— the projection now yields the state's own HANDLE (`StateHandle`,
+lending a projected `Handle<'a, 'a, S>` built by the handle crate's
+`project`: same shared, fresh brands picked at construction). The
+inner/outer split COLLAPSES: one State trait, and EVERY state can
+safepoint mid-run (Countup does, before its last increment).
+
 Walls found (W5/W6 new this round, in the client's notes):
 1. brand-free Context required (with_pair fixes T before the brands);
 2. the unwrapper's fat->thin offset projection is the one unsafe;

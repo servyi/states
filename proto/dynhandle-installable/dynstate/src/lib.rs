@@ -7,6 +7,8 @@
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
+use handle::Handle;
+
 /// The installed pair: the context `T` (what the box derefs to) and
 /// the state `S` it is paired with. Built solely by [`install`].
 pub struct Installed<S, T> {
@@ -42,33 +44,54 @@ pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
 /// capturing a value.
 pub struct Proj<S, T>(PhantomData<fn() -> (S, T)>);
 
-pub trait UnwrapMut<S, T> {
-    /// Recover `&mut S` from the erased box.
-    fn unwrap_mut<'x>(erased: &'x mut dyn DerefMut<Target = T>) -> &'x mut S;
+pub trait Unwrap<S, T> {
+    /// Recover the state's own HANDLE — `&mut Handle<S>` — from the
+    /// chain handle, preserving the tree membership (same shared, same
+    /// brands), so the state's methods can run on `self: &mut
+    /// Handle<Self>` and safepoint through it.
+    fn unwrap_handle<'x>(
+        h: &'x mut Handle<'_, '_, Erased<T>>,
+    ) -> StateHandle<'x, S>;
 }
 
-impl<S: 'static, T: 'static> UnwrapMut<S, T> for Proj<S, T> {
-    fn unwrap_mut<'x>(erased: &'x mut dyn DerefMut<Target = T>) -> &'x mut S {
-        // SAFETY: the re-type lands on the `Installed<S, T>` that
-        // install::<S, T> built (this impl's `(S, T)` names exactly
-        // that pairing), and the field borrow after the cast is an
-        // ordinary safe borrow. Provenance: this impl is only
-        // reachable from the entries mk built for this `S` — and
-        // those entries travel only inside the same `Installed` — so
-        // the erased object passed here is always this pairing's own.
-        unsafe {
-            let installed =
-                erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>;
-            &mut (*installed).state
-        }
+/// The state's own handle: lends the projected handle.
+pub struct StateHandle<'a, S> {
+    handle: Handle<'a, 'a, S>,
+}
+
+impl<'a, S> std::ops::Deref for StateHandle<'a, S> {
+    type Target = Handle<'a, 'a, S>;
+    fn deref(&self) -> &Self::Target {
+        &self.handle
     }
 }
 
-/// Dig the erased object out of a chain handle (the safe deref chain:
-/// handle → box → dyn).
-pub fn erased_mut<'x, T>(
-    h: &'x mut handle::Handle<'_, '_, Erased<T>>,
-) -> &'x mut dyn DerefMut<Target = T> {
-    let b: &mut Erased<T> = &mut *h;
-    &mut **b
+impl<'a, S> std::ops::DerefMut for StateHandle<'a, S> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.handle
+    }
+}
+
+impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
+    fn unwrap_handle<'x>(
+        h: &'x mut Handle<'_, '_, Erased<T>>,
+    ) -> StateHandle<'x, S> {
+        // dig the erased object (safe derefs), then land on this
+        // pairing's Installed
+        let b: &mut Erased<T> = &mut *h;
+        let erased = &mut **b;
+        // SAFETY: the re-type lands on the `Installed<S, T>` that
+        // install::<S, T> built (this impl's `(S, T)` names exactly
+        // that pairing); provenance: only the entries mk built for
+        // this `S` reach this impl, and those travel only inside the
+        // same `Installed`. The state borrow is exclusive.
+        let installed =
+            unsafe { &mut *(erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
+        // SAFETY: the projected node is this Installed's state —
+        // live, exclusively owned by the box this handle wraps, and
+        // no second handle over it exists; the brands/shared ride
+        // with the chain handle. The StateHandle lends it for 'x.
+        let handle = unsafe { h.project(&mut installed.state) };
+        StateHandle { handle }
+    }
 }

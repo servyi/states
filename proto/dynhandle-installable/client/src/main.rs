@@ -1,12 +1,13 @@
-//! The installable shape per the sketch: the chain is
-//! `Handle<Box<dyn DerefMut<Context>>>`; the LIBRARY's
-//! `Installed<S, T>` (generalized over the state and the context)
-//! carries the pairing, the derefs, and the projection — the client
-//! holds only its vocabulary and entries: zero unsafe here.
+#![feature(arbitrary_self_types)]
+//! The installable shape: the chain is `Handle<Box<dyn DerefMut<Context>>>`;
+//! the LIBRARY's `Installed<S, T>` carries the pairing, the derefs, and
+//! the projection; the client holds only its vocabulary and entries —
+//! zero unsafe here. State methods run on `self: &mut Handle<Self>`
+//! (the projected state handle), so EVERY state can safepoint.
 
-use std::ops::{Deref, DerefMut};
+use std::ops::DerefMut;
 
-use dynstate::{Erased, Installed, Proj, UnwrapMut, erased_mut, install};
+use dynstate::{Erased, Proj, StateHandle, Unwrap, install};
 use handle::{Handle, with_pair};
 
 pub struct Env;
@@ -35,51 +36,30 @@ pub struct Context {
 /// The chain's erased node: a box that derefs to the Context.
 pub type Boxed = Erased<Context>;
 
-// ── the vocabulary: INNER states see no handle; OUTER see the chain
-// ── handle alongside their state, so they CAN safepoint mid-run.
+// ── the vocabulary: ONE state trait, methods on the state's own
+// ── projected handle (self: &mut Handle<Self>) — every state can
+// ── safepoint mid-run through it.
 
-/// Inner: object-safe, handle-less (cannot safepoint).
-pub trait InnerState: 'static {
-    fn execute(&mut self, env: &Env) -> Result<Outcome, String>;
-    fn save(&self) -> String;
-}
-
-/// Outer: sees the chain handle; reaches its state by per-use
-/// projection (handle and &mut Self cannot coexist — the projection
-/// goes through the handle, E0499; see W6).
-pub trait OuterState: Sized + 'static {
-    fn execute(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String>;
-    fn save(h: &mut Handle<'_, '_, Boxed>) -> String;
+pub trait State: Sized + 'static {
+    fn execute(self: &mut Handle<'_, '_, Self>, env: &Env) -> Result<Outcome, String>;
+    fn save(self: &mut Handle<'_, '_, Self>) -> String;
 }
 
 // ── entries for both flavors (mk builds them) ─────────────────────
 
-fn inner_execute<S: InnerState>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
-    h.safepoint(); // between transitions — the entry CAN
-    let state = Proj::<S, Context>::unwrap_mut(erased_mut(h));
-    state.execute(env)
+fn execute_entry<S: State>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
+    h.safepoint(); // between transitions
+    let mut sh: StateHandle<'_, S> = Proj::<S, Context>::unwrap_handle(h);
+    S::execute(&mut *sh, env)
 }
 
-fn inner_save<S: InnerState>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    let state = Proj::<S, Context>::unwrap_mut(erased_mut(h));
-    state.save()
+fn save_entry<S: State>(h: &mut Handle<'_, '_, Boxed>) -> String {
+    let mut sh: StateHandle<'_, S> = Proj::<S, Context>::unwrap_handle(h);
+    S::save(&mut *sh)
 }
 
-pub fn inner_entries<S: InnerState>() -> Context {
-    Context { execute: inner_execute::<S>, save: inner_save::<S> }
-}
-
-fn outer_execute<S: OuterState>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
-    h.safepoint();
-    S::execute(h, env)
-}
-
-fn outer_save<S: OuterState>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    S::save(h)
-}
-
-pub fn outer_entries<S: OuterState>() -> Context {
-    Context { execute: outer_execute::<S>, save: outer_save::<S> }
+pub fn entries<S: State>() -> Context {
+    Context { execute: execute_entry::<S>, save: save_entry::<S> }
 }
 
 // ── the states ────────────────────────────────────────────────────
@@ -88,19 +68,19 @@ struct Countdown {
     left: u32,
 }
 
-impl InnerState for Countdown {
-    fn execute(&mut self, _env: &Env) -> Result<Outcome, String> {
+impl State for Countdown {
+    fn execute(self: &mut Handle<'_, '_, Self>, _env: &Env) -> Result<Outcome, String> {
         if self.left == 0 {
             // the successor: an INSTALLED box, carried by the outcome
             return Ok(Outcome::Switch(Box::new(install(
                 Countup { up: 0, limit: COUNTUP_LIMIT },
-                outer_entries::<Countup>,
+                entries::<Countup>,
             ))));
         }
         self.left -= 1;
         Ok(Outcome::Pending)
     }
-    fn save(&self) -> String {
+    fn save(self: &mut Handle<'_, '_, Self>) -> String {
         format!("countdown:{}", self.left)
     }
 }
@@ -110,27 +90,19 @@ struct Countup {
     limit: u64,
 }
 
-/// Countup demonstrates the OUTER flavor: it safepoints mid-run
-/// (before its last increment) through the chain handle, reaching its
-/// state by per-use projection.
-impl OuterState for Countup {
-    fn execute(h: &mut Handle<'_, '_, Boxed>, _env: &Env) -> Result<Outcome, String> {
-        // per-use projection: each borrow of the state ends before
-        // the handle is used again
-        if Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up == COUNTUP_LIMIT {
+impl State for Countup {
+    fn execute(self: &mut Handle<'_, '_, Self>, _env: &Env) -> Result<Outcome, String> {
+        if self.up == COUNTUP_LIMIT {
             return Ok(Outcome::Done(FINAL_RESULT));
         }
-        let near_end = Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up
-            == COUNTUP_LIMIT - LAST_STEP_AT;
-        if near_end {
-            h.safepoint(); // mid-run safepoint — the outer flavor CAN
+        if self.up == COUNTUP_LIMIT - LAST_STEP_AT {
+            self.safepoint(); // mid-run safepoint — EVERY state can
         }
-        Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up += 1;
+        self.up += 1;
         Ok(Outcome::Pending)
     }
-    fn save(h: &mut Handle<'_, '_, Boxed>) -> String {
-        let state = Proj::<Self, Context>::unwrap_mut(erased_mut(h));
-        format!("countup:{}/{}", state.up, state.limit)
+    fn save(self: &mut Handle<'_, '_, Self>) -> String {
+        format!("countup:{}/{}", self.up, self.limit)
     }
 }
 
@@ -158,13 +130,13 @@ fn drive(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<u64, String> {
 
 fn main() {
     let result = with_pair(
-        Box::new(install(Countdown { left: START }, inner_entries::<Countdown>)) as Boxed,
+        Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
         |mut h| drive(&mut h, &Env).expect("chain completes"),
     );
     println!("result: {result}");
 
     with_pair(
-        Box::new(install(Countdown { left: START }, inner_entries::<Countdown>)) as Boxed,
+        Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
         |mut h| {
             let save = (**h).save;
             println!("save: {}", save(&mut h));
