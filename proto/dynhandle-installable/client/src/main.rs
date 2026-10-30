@@ -1,11 +1,12 @@
-//! The installable shape per the sketch — NO DynHandle: the chain is
-//! `Handle<Box<dyn DerefMut<Context>>>`; install pairs a state with
-//! its Context and returns the DerefMut-impl to box; the unwrapper
-//! projects the state out of the box (offset, repr(C)). Client-only:
-//! neither subcrate is touched.
+//! The installable shape per the sketch: the chain is
+//! `Handle<Box<dyn DerefMut<Context>>>`; the LIBRARY's
+//! `Installed<S, T>` (generalized over the state and the context)
+//! carries the pairing, the derefs, and the projection — the client
+//! holds only its vocabulary and entries: zero unsafe here.
 
 use std::ops::{Deref, DerefMut};
 
+use dynstate::{Erased, Installed, Proj, UnwrapMut, erased_mut, install};
 use handle::{Handle, with_pair};
 
 pub struct Env;
@@ -20,12 +21,9 @@ pub enum Outcome {
     Done(u64),
 }
 
-/// The chain's erased node: a box that derefs to the Context. The
-/// Context itself is BRAND-FREE — the entries are higher-ranked over
-/// the handle's brands (that is what lets it be a with_pair node; a
-/// branded Context cannot, see the wall notes at the bottom).
-pub type Boxed = Box<dyn DerefMut<Target = Context>>;
-
+/// The chain's context: BRAND-FREE (W1) — the entries are
+/// higher-ranked over the handle's brands, which is what lets it be a
+/// with_pair node.
 pub struct Context {
     pub execute: for<'x, 'o, 'c> fn(
         &'x mut Handle<'o, 'c, Boxed>,
@@ -34,60 +32,8 @@ pub struct Context {
     pub save: for<'x, 'o, 'c> fn(&'x mut Handle<'o, 'c, Boxed>) -> String,
 }
 
-/// The installed pair: state first (the unwrapper projects it at
-/// offset 0), then the Context.
-#[repr(C)]
-pub struct Installed<S> {
-    state: S,
-    ctx: Context,
-}
-
-impl<S> Deref for Installed<S> {
-    type Target = Context;
-    fn deref(&self) -> &Context {
-        &self.ctx
-    }
-}
-
-impl<S> DerefMut for Installed<S> {
-    fn deref_mut(&mut self) -> &mut Context {
-        &mut self.ctx
-    }
-}
-
-/// The projection: the S-flavored unwrapper, as a zero-sized type so
-/// the (fn-pointer) entries reach it statically without capturing a
-/// value. The only re-typing — created solely by [`install`],
-/// monomorphized in `S`.
-pub struct Proj<S>(std::marker::PhantomData<fn() -> S>);
-
-pub trait UnwrapMut<S> {
-    fn unwrap_mut<'x>(h: &'x mut Handle<'_, '_, Boxed>) -> &'x mut S;
-}
-
-impl<S: 'static> UnwrapMut<S> for Proj<S> {
-    fn unwrap_mut<'x>(h: &'x mut Handle<'_, '_, Boxed>) -> &'x mut S {
-        // Handle -> Box (its node), Box -> the erased object
-        let b: &mut Boxed = &mut *h;
-        let boxed: &mut dyn DerefMut<Target = Context> = &mut **b;
-        // SAFETY: every box this projects from was built by
-        // install::<S> — an Installed<S> (repr(C), state at offset 0);
-        // this impl exists only for that S, so the fat->thin re-type
-        // hits exactly that layout. The borrow is exclusive.
-        unsafe {
-            &mut *(boxed as *mut dyn DerefMut<Target = Context>
-                as *mut Installed<S>
-                as *mut S)
-        }
-    }
-}
-
-/// install(S, mk) -> the DerefMut-impl to box. mk builds the Context
-/// for this S (the sketch's `mk(unwrapper)` — see W5 for why the
-/// unwrapper rides as a TYPE, not a value).
-pub fn install<S: 'static>(state: S, mk: impl FnOnce() -> Context) -> Installed<S> {
-    Installed { ctx: mk(), state }
-}
+/// The chain's erased node: a box that derefs to the Context.
+pub type Boxed = Erased<Context>;
 
 // ── the vocabulary: INNER states see no handle; OUTER see the chain
 // ── handle alongside their state, so they CAN safepoint mid-run.
@@ -110,12 +56,12 @@ pub trait OuterState: Sized + 'static {
 
 fn inner_execute<S: InnerState>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
     h.safepoint(); // between transitions — the entry CAN
-    let state = Proj::<S>::unwrap_mut(h);
+    let state = Proj::<S, Context>::unwrap_mut(erased_mut(h));
     state.execute(env)
 }
 
 fn inner_save<S: InnerState>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    let state = Proj::<S>::unwrap_mut(h);
+    let state = Proj::<S, Context>::unwrap_mut(erased_mut(h));
     state.save()
 }
 
@@ -171,18 +117,19 @@ impl OuterState for Countup {
     fn execute(h: &mut Handle<'_, '_, Boxed>, _env: &Env) -> Result<Outcome, String> {
         // per-use projection: each borrow of the state ends before
         // the handle is used again
-        if Proj::<Self>::unwrap_mut(h).up == COUNTUP_LIMIT {
+        if Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up == COUNTUP_LIMIT {
             return Ok(Outcome::Done(FINAL_RESULT));
         }
-        let near_end = Proj::<Self>::unwrap_mut(h).up == COUNTUP_LIMIT - LAST_STEP_AT;
+        let near_end = Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up
+            == COUNTUP_LIMIT - LAST_STEP_AT;
         if near_end {
             h.safepoint(); // mid-run safepoint — the outer flavor CAN
         }
-        Proj::<Self>::unwrap_mut(h).up += 1;
+        Proj::<Self, Context>::unwrap_mut(erased_mut(h)).up += 1;
         Ok(Outcome::Pending)
     }
     fn save(h: &mut Handle<'_, '_, Boxed>) -> String {
-        let state = Proj::<Self>::unwrap_mut(h);
+        let state = Proj::<Self, Context>::unwrap_mut(erased_mut(h));
         format!("countup:{}/{}", state.up, state.limit)
     }
 }
@@ -236,12 +183,10 @@ fn main() {
 //      name their own pair statically (they see the brands only per
 //      call).
 //
-// W2 — the unwrapper's fat->thin re-type reaches the STATE at offset
-//      0 of the installed box; the Context (entries) sits AFTER it.
-//      That layout is install's own construction (repr(C)), so it is
-//      sound — but it is the one unsafe in the client, and it is the
-//      reason `Installed` can never be constructed any other way
-//      (its fields are private; the DerefMut impl hides the state).
+// W2 — the unwrapper's fat->thin re-type lands on the Installed<S, T>
+//      the LIBRARY's install built, then takes an ordinary field
+//      borrow — no offset assumptions (moved into dynstate with the
+//      rest of the reusable parts; the client has zero unsafe).
 //
 // W3 — flavor mixing at SWITCH works only INTO boxes: the outcome
 //      carries `Box<dyn DerefMut<Context>>`. An outer state cannot

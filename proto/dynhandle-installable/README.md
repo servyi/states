@@ -17,12 +17,19 @@ backstop.
 
 ## The installable exploration (this branch)
 
-Per the 14:39 sketch, the DynHandle is GONE: the chain is
-`Handle<Box<dyn DerefMut<Context>>>`; `install(S, mk)` returns the
-DerefMut-impl to box; the unwrapper projects the state out of the box
-(offset 0, repr(C)); successors are whole-box swaps. Client-only,
-single subcrate dependency (`handle`). Runs: `result: 42` (Countdown
-inner -> Countup OUTER with a mid-run safepoint), `save: countdown:3`.
+Per the 15:50 comment: `Installed<S, T> { ctx: T, state: S }` moved
+INTO the dynstate library, generalized over state and context — the
+wrapper, its derefs, the projection (`Proj<S, T>`, a ZST so the
+fn-pointer entries reach it without capturing), `install`, and the
+safe `erased_mut` dig all live there. The old (unused, wonky)
+DynHandle machinery is deleted from dynstate. The client carries only
+its vocabulary (Env, Outcome, Context, InnerState/OuterState), the
+entries, the states, and the driver — ZERO unsafe. Runs:
+`result: 42` (Countdown inner -> Countup OUTER with a mid-run
+safepoint), `save: countdown:3`.
+
+The projection casts to the WRAPPER and then takes an ordinary field
+borrow — no offset assumptions, any field order.
 
 Walls found (W5/W6 new this round, in the client's notes):
 1. brand-free Context required (with_pair fixes T before the brands);

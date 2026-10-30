@@ -1,67 +1,74 @@
-//! dynstate with the two-brand identity: 'o (pair) + 'c (child).
+//! The dynstate library, rebuilt around `Installed<S, T>` (per the
+//! 15:50 comment): the erased-box pairing, generalized over the state
+//! `S` and the context `T`. All the reusable parts — the wrapper, its
+//! derefs, the projection, install — live here; the client carries
+//! only its vocabulary and entries, zero unsafe.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 
-use handle::Handle;
-
-/// The erased chain node, branded by pair AND child.
-pub struct DynHandle<'o, 'c, T> {
-    pub(crate) handle: Handle<'o, 'c, ()>,
-    pub(crate) data: T,
+/// The installed pair: the context `T` (what the box derefs to) and
+/// the state `S` it is paired with. Built solely by [`install`].
+pub struct Installed<S, T> {
+    ctx: T,
+    state: S,
 }
 
-impl<'o, 'c, T> Deref for DynHandle<'o, 'c, T> {
+impl<S, T> Deref for Installed<S, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        &self.data
+        &self.ctx
     }
 }
-impl<'o, 'c, T> DerefMut for DynHandle<'o, 'c, T> {
+
+impl<S, T> DerefMut for Installed<S, T> {
     fn deref_mut(&mut self) -> &mut T {
-        &mut self.data
+        &mut self.ctx
     }
 }
 
-pub trait Unwrap<'o, 'c> {
-    type Type: 'static;
-    fn unwrap_mut<'x, T>(
-        dh: &'x mut DynHandle<'o, 'c, T>,
-    ) -> &'x mut Handle<'o, 'c, Self::Type>;
+/// The erased box: what a chain's handle wraps. The box derefs to the
+/// context `T`.
+pub type Erased<T> = Box<dyn DerefMut<Target = T>>;
+
+/// install(S, mk) — the DerefMut-impl to box: mk builds the context
+/// (the entries) for this `S`; the pairing leaves together.
+pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
+    Installed { ctx: mk(), state }
 }
 
-pub struct Unwrapper<'o, 'c, S> {
-    _private: (),
-    _p: PhantomData<fn(&'o (), &'c (), S)>,
+/// The projection's carrier: a zero-sized type per `(S, T)`, so the
+/// (fn-pointer) entries reach the unwrapper statically without
+/// capturing a value.
+pub struct Proj<S, T>(PhantomData<fn() -> (S, T)>);
+
+pub trait UnwrapMut<S, T> {
+    /// Recover `&mut S` from the erased box.
+    fn unwrap_mut<'x>(erased: &'x mut dyn DerefMut<Target = T>) -> &'x mut S;
 }
 
-impl<'o, 'c, S: 'static> Unwrap<'o, 'c> for Unwrapper<'o, 'c, S> {
-    type Type = S;
-    fn unwrap_mut<'x, T>(
-        dh: &'x mut DynHandle<'o, 'c, T>,
-    ) -> &'x mut Handle<'o, 'c, S> {
-        // SAFETY: repr(C) layout identity + install's pairing + BOTH
-        // brands: the pair pins the tree, the child brand pins the
-        // node within it — a capability minted for child A does not
-        // typecheck against child B's DynHandle.
+impl<S: 'static, T: 'static> UnwrapMut<S, T> for Proj<S, T> {
+    fn unwrap_mut<'x>(erased: &'x mut dyn DerefMut<Target = T>) -> &'x mut S {
+        // SAFETY: the re-type lands on the `Installed<S, T>` that
+        // install::<S, T> built (this impl's `(S, T)` names exactly
+        // that pairing), and the field borrow after the cast is an
+        // ordinary safe borrow. Provenance: this impl is only
+        // reachable from the entries mk built for this `S` — and
+        // those entries travel only inside the same `Installed` — so
+        // the erased object passed here is always this pairing's own.
         unsafe {
-            &mut *(&mut dh.handle as *mut Handle<'o, 'c, ()>
-                as *mut Handle<'o, 'c, S>)
+            let installed =
+                erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>;
+            &mut (*installed).state
         }
     }
 }
 
-pub trait ContextData<'o, 'c, S>: Sized {
-    fn new<U: Unwrap<'o, 'c, Type = S>>() -> Self;
-}
-
-pub fn install<'o, 'c, S: 'static, T: ContextData<'o, 'c, S>>(
-    h: Handle<'o, 'c, S>,
-) -> DynHandle<'o, 'c, T> {
-    // SAFETY: the owned erase — repr(C) layout identity; node stays
-    // solely owned; both brands move with the value; the pairing
-    // (erased S node + Unwrapper<'o, 'c, S>) leaves together.
-    let erased: Handle<'o, 'c, ()> = unsafe { std::mem::transmute(h) };
-    let data = T::new::<Unwrapper<'o, 'c, S>>();
-    DynHandle { handle: erased, data }
+/// Dig the erased object out of a chain handle (the safe deref chain:
+/// handle → box → dyn).
+pub fn erased_mut<'x, T>(
+    h: &'x mut handle::Handle<'_, '_, Erased<T>>,
+) -> &'x mut dyn DerefMut<Target = T> {
+    let b: &mut Erased<T> = &mut *h;
+    &mut **b
 }
