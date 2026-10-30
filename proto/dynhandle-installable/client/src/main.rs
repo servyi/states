@@ -1,70 +1,142 @@
-//! The client subcrate — ZERO unsafe. The "installable" exploration:
-//! the chain's erased state is a `Box<dyn InnerState>` (an
-//! object-safe trait, inner execute: no handle, so no mid-run
-//! safepoint); the child holds `Handle<Box<dyn InnerState>>`, whose
-//! deref makes the box OVERWRITABLE — successors install as plain box
-//! writes, no crate successor machinery.
+//! The installable shape per the sketch — NO DynHandle: the chain is
+//! `Handle<Box<dyn DerefMut<Context>>>`; install pairs a state with
+//! its Context and returns the DerefMut-impl to box; the unwrapper
+//! projects the state out of the box (offset, repr(C)). Client-only:
+//! neither subcrate is touched.
 
-use dynstate::{ContextData, DynHandle, Unwrap, install};
-use handle::with_pair;
+use std::ops::{Deref, DerefMut};
+
+use handle::{Handle, with_pair};
 
 pub struct Env;
 
-/// The object-safe inner vocabulary: execute over `&mut self` only —
-/// an inner state CANNOT call `h.safepoint()` (it never sees a
-/// handle). Safepoints happen between transitions, at the entry.
-pub trait InnerState {
-    fn execute(&mut self, env: &Env) -> Result<Outcome, String>;
-    fn save(&self) -> String;
-}
-
-/// The erased state: the box whose content is overwritten on switch.
-pub type Erased = Box<dyn InnerState>;
-
-/// What a transition decides. `Switch` carries the successor as a
-/// fresh boxed inner state — the OVERWRITE material.
+/// What a transition decides. `Switch` carries the successor box.
 pub enum Outcome {
     /// Keep driving this state.
     Pending,
-    /// Overwrite the box with this successor.
-    Switch(Erased),
+    /// Overwrite with this successor (an already-installed box).
+    Switch(Box<dyn DerefMut<Target = Context>>),
     /// The chain's result.
     Done(u64),
 }
 
-/// The chain's data: its two entry pointers inline.
-pub struct Context<'o, 'c> {
-    execute: for<'x> fn(
-        &'x mut DynHandle<'o, 'c, Context<'o, 'c>>,
+/// The chain's erased node: a box that derefs to the Context. The
+/// Context itself is BRAND-FREE — the entries are higher-ranked over
+/// the handle's brands (that is what lets it be a with_pair node; a
+/// branded Context cannot, see the wall notes at the bottom).
+pub type Boxed = Box<dyn DerefMut<Target = Context>>;
+
+pub struct Context {
+    pub execute: for<'x, 'o, 'c> fn(
+        &'x mut Handle<'o, 'c, Boxed>,
         &Env,
     ) -> Result<Outcome, String>,
-    save: for<'x> fn(&'x mut DynHandle<'o, 'c, Context<'o, 'c>>) -> String,
+    pub save: for<'x, 'o, 'c> fn(&'x mut Handle<'o, 'c, Boxed>) -> String,
 }
 
-/// ONE Context for every inner state: the pairing is with the BOX
-/// (`Erased`), not with each concrete state — the two-state wall of
-/// the direct-installs dissolves.
-impl<'o, 'c> ContextData<'o, 'c, Erased> for Context<'o, 'c> {
-    fn new<U: Unwrap<'o, 'c, Type = Erased>>() -> Self {
-        let execute: for<'x> fn(
-            &'x mut DynHandle<'o, 'c, Context<'o, 'c>>,
-            &Env,
-        ) -> Result<Outcome, String> = |dh, env| {
-            let typed = U::unwrap_mut(dh);
-            typed.safepoint(); // between transitions — the entry CAN
-            let boxed: &mut Erased = &mut **typed; // Handle -> Box
-            boxed.execute(env)
-        };
-        let save: for<'x> fn(&'x mut DynHandle<'o, 'c, Context<'o, 'c>>) -> String = |dh| {
-            let typed = U::unwrap_mut(dh);
-            let boxed: &Erased = &**typed;
-            boxed.save()
-        };
-        Context { execute, save }
+/// The installed pair: state first (the unwrapper projects it at
+/// offset 0), then the Context.
+#[repr(C)]
+pub struct Installed<S> {
+    state: S,
+    ctx: Context,
+}
+
+impl<S> Deref for Installed<S> {
+    type Target = Context;
+    fn deref(&self) -> &Context {
+        &self.ctx
     }
 }
 
-// ── the states: inner, composable, overwrite-installed ────────────
+impl<S> DerefMut for Installed<S> {
+    fn deref_mut(&mut self) -> &mut Context {
+        &mut self.ctx
+    }
+}
+
+/// The projection: the S-flavored unwrapper, as a zero-sized type so
+/// the (fn-pointer) entries reach it statically without capturing a
+/// value. The only re-typing — created solely by [`install`],
+/// monomorphized in `S`.
+pub struct Proj<S>(std::marker::PhantomData<fn() -> S>);
+
+pub trait UnwrapMut<S> {
+    fn unwrap_mut<'x>(h: &'x mut Handle<'_, '_, Boxed>) -> &'x mut S;
+}
+
+impl<S: 'static> UnwrapMut<S> for Proj<S> {
+    fn unwrap_mut<'x>(h: &'x mut Handle<'_, '_, Boxed>) -> &'x mut S {
+        // Handle -> Box (its node), Box -> the erased object
+        let b: &mut Boxed = &mut *h;
+        let boxed: &mut dyn DerefMut<Target = Context> = &mut **b;
+        // SAFETY: every box this projects from was built by
+        // install::<S> — an Installed<S> (repr(C), state at offset 0);
+        // this impl exists only for that S, so the fat->thin re-type
+        // hits exactly that layout. The borrow is exclusive.
+        unsafe {
+            &mut *(boxed as *mut dyn DerefMut<Target = Context>
+                as *mut Installed<S>
+                as *mut S)
+        }
+    }
+}
+
+/// install(S, mk) -> the DerefMut-impl to box. mk builds the Context
+/// for this S (the sketch's `mk(unwrapper)` — see W5 for why the
+/// unwrapper rides as a TYPE, not a value).
+pub fn install<S: 'static>(state: S, mk: impl FnOnce() -> Context) -> Installed<S> {
+    Installed { ctx: mk(), state }
+}
+
+// ── the vocabulary: INNER states see no handle; OUTER see the chain
+// ── handle alongside their state, so they CAN safepoint mid-run.
+
+/// Inner: object-safe, handle-less (cannot safepoint).
+pub trait InnerState: 'static {
+    fn execute(&mut self, env: &Env) -> Result<Outcome, String>;
+    fn save(&self) -> String;
+}
+
+/// Outer: sees the chain handle; reaches its state by per-use
+/// projection (handle and &mut Self cannot coexist — the projection
+/// goes through the handle, E0499; see W6).
+pub trait OuterState: Sized + 'static {
+    fn execute(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String>;
+    fn save(h: &mut Handle<'_, '_, Boxed>) -> String;
+}
+
+// ── entries for both flavors (mk builds them) ─────────────────────
+
+fn inner_execute<S: InnerState>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
+    h.safepoint(); // between transitions — the entry CAN
+    let state = Proj::<S>::unwrap_mut(h);
+    state.execute(env)
+}
+
+fn inner_save<S: InnerState>(h: &mut Handle<'_, '_, Boxed>) -> String {
+    let state = Proj::<S>::unwrap_mut(h);
+    state.save()
+}
+
+pub fn inner_entries<S: InnerState>() -> Context {
+    Context { execute: inner_execute::<S>, save: inner_save::<S> }
+}
+
+fn outer_execute<S: OuterState>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
+    h.safepoint();
+    S::execute(h, env)
+}
+
+fn outer_save<S: OuterState>(h: &mut Handle<'_, '_, Boxed>) -> String {
+    S::save(h)
+}
+
+pub fn outer_entries<S: OuterState>() -> Context {
+    Context { execute: outer_execute::<S>, save: outer_save::<S> }
+}
+
+// ── the states ────────────────────────────────────────────────────
 
 struct Countdown {
     left: u32,
@@ -73,9 +145,11 @@ struct Countdown {
 impl InnerState for Countdown {
     fn execute(&mut self, _env: &Env) -> Result<Outcome, String> {
         if self.left == 0 {
-            // the successor: boxed, carried by the outcome; the driver
-            // overwrites the box — no re-pairing, no crate machinery
-            return Ok(Outcome::Switch(Box::new(Countup { up: 0, limit: COUNTUP_LIMIT })));
+            // the successor: an INSTALLED box, carried by the outcome
+            return Ok(Outcome::Switch(Box::new(install(
+                Countup { up: 0, limit: COUNTUP_LIMIT },
+                outer_entries::<Countup>,
+            ))));
         }
         self.left -= 1;
         Ok(Outcome::Pending)
@@ -90,16 +164,26 @@ struct Countup {
     limit: u64,
 }
 
-impl InnerState for Countup {
-    fn execute(&mut self, _env: &Env) -> Result<Outcome, String> {
-        if self.up == self.limit {
+/// Countup demonstrates the OUTER flavor: it safepoints mid-run
+/// (before its last increment) through the chain handle, reaching its
+/// state by per-use projection.
+impl OuterState for Countup {
+    fn execute(h: &mut Handle<'_, '_, Boxed>, _env: &Env) -> Result<Outcome, String> {
+        // per-use projection: each borrow of the state ends before
+        // the handle is used again
+        if Proj::<Self>::unwrap_mut(h).up == COUNTUP_LIMIT {
             return Ok(Outcome::Done(FINAL_RESULT));
         }
-        self.up += 1;
+        let near_end = Proj::<Self>::unwrap_mut(h).up == COUNTUP_LIMIT - LAST_STEP_AT;
+        if near_end {
+            h.safepoint(); // mid-run safepoint — the outer flavor CAN
+        }
+        Proj::<Self>::unwrap_mut(h).up += 1;
         Ok(Outcome::Pending)
     }
-    fn save(&self) -> String {
-        format!("countup:{}/{}", self.up, self.limit)
+    fn save(h: &mut Handle<'_, '_, Boxed>) -> String {
+        let state = Proj::<Self>::unwrap_mut(h);
+        format!("countup:{}/{}", state.up, state.limit)
     }
 }
 
@@ -109,23 +193,17 @@ const START: u32 = 3;
 const COUNTUP_LIMIT: u64 = 5;
 /// The two-state test's final result.
 const FINAL_RESULT: u64 = 42;
+/// When the outer state safepoints mid-run.
+const LAST_STEP_AT: u64 = 1;
 
-/// The driver: the entry dispatches; on Switch, the box is
-/// OVERWRITTEN through the same unwrap — the installable successor.
-fn drive<'o, 'c>(dh: &mut DynHandle<'o, 'c, Context<'o, 'c>>, env: &Env) -> Result<u64, String> {
+/// The driver: the entry dispatches through the deref chain; on
+/// Switch, the box is swapped wholesale — the installed successor.
+fn drive(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<u64, String> {
     loop {
-        let execute = dh.execute; // fn ptr: Copy
-        match execute(dh, env)? {
+        let execute = (**h).execute; // Handle -> Box -> Context (deref)
+        match execute(h, env)? {
             Outcome::Pending => {}
-            Outcome::Switch(next) => {
-                // the overwrite: Handle<Box<dyn InnerState>> derefs to
-                // the box; *boxed = next installs the successor.
-                // the entries live in the CONTEXT (the data), which the
-                // overwrite does not touch — only the box swaps.
-                let typed =
-                    <dynstate::Unwrapper<'o, 'c, Erased> as Unwrap<'o, 'c>>::unwrap_mut(dh);
-                **typed = next;
-            }
+            Outcome::Switch(next) => **h = next,
             Outcome::Done(k) => return Ok(k),
         }
     }
@@ -133,90 +211,60 @@ fn drive<'o, 'c>(dh: &mut DynHandle<'o, 'c, Context<'o, 'c>>, env: &Env) -> Resu
 
 fn main() {
     let result = with_pair(
-        Box::new(Countdown { left: START }) as Erased,
-        |h| {
-            let mut dh: DynHandle<'_, '_, Context> = install::<Erased, Context>(h);
-            drive(&mut dh, &Env).expect("chain completes")
-        },
+        Box::new(install(Countdown { left: START }, inner_entries::<Countdown>)) as Boxed,
+        |mut h| drive(&mut h, &Env).expect("chain completes"),
     );
     println!("result: {result}");
 
-    // save through the erased box, mid-chain
     with_pair(
-        Box::new(Countdown { left: START }) as Erased,
-        |h| {
-            let mut dh: DynHandle<'_, '_, Context> = install::<Erased, Context>(h);
-            let save = dh.save;
-            println!("save: {}", save(&mut dh));
-            drive(&mut dh, &Env).expect("chain completes")
+        Box::new(install(Countdown { left: START }, inner_entries::<Countdown>)) as Boxed,
+        |mut h| {
+            let save = (**h).save;
+            println!("save: {}", save(&mut h));
+            drive(&mut h, &Env).expect("chain completes")
         },
     );
 }
 
-// ── the OUTER flavor probes (walls documented by compiler) ────────
+// WALLS (noted while building):
 //
-// Jonas's note: outer states are "State-like structs with outer
-// execute(Handle<??? Self>)" that CAN call h.safepoint. The ??? is
-// the question. Probes:
-mod outer_probes {
-    use super::*;
-    use dynstate::{ContextData, DynHandle, Unwrap};
-    use handle::Handle;
-
-    // WALL 1 — one Context cannot serve both flavors. The box client
-    // needs `impl ContextData<'o,'c, Erased> for Context`; the direct
-    // flavor needs `impl<S: ..> ContextData<'o,'c, S> for Context`.
-    // `Erased` is `'static`, so the generic impl already covers it:
-    //
-    // impl<'o, 'c, S: 'static> ContextData<'o, 'c, S> for Context<'o, 'c> { .. }
-    // impl<'o, 'c> ContextData<'o, 'c, Erased> for Context<'o, 'c> { .. }
-    //
-    // error[E0119]: conflicting implementations — the second is covered
-    // by the first. No negative bounds exist to exclude `Erased`.
-
-    // WALL 2 — two Context types split the chain. Give the direct
-    // flavor its own data type and both compile independently:
-    pub struct DirectContext<'o, 'c> {
-        pub execute: for<'x> fn(
-            &'x mut DynHandle<'o, 'c, DirectContext<'o, 'c>>,
-            &Env,
-        ) -> Result<u64, String>,
-    }
-
-    impl<'o, 'c, S: 'static> ContextData<'o, 'c, S> for DirectContext<'o, 'c> {
-        fn new<U: Unwrap<'o, 'c, Type = S>>() -> Self {
-            DirectContext {
-                execute: |dh, env| {
-                    // THE OUTER EXECUTE: over the state's own type —
-                    // this flavor CAN safepoint mid-run
-                    let typed = U::unwrap_mut(dh);
-                    typed.safepoint();
-                    let state: &mut S = probe_ctx(typed);
-                    let _ = (state, env);
-                    unreachable!("probe shape only")
-                },
-            }
-        }
-    }
-
-    // The direct flavor needs its state typed; for the probe, the
-    // vocabulary would live here (the twobrand client's State trait).
-    fn probe_ctx<'x, 'o, 'c, S>(_typed: &'x mut Handle<'o, 'c, S>) -> &'x mut S {
-        unreachable!("probe shape only")
-    }
-
-    // WALL 3 — the flavors cannot interleave in one chain: a chain is
-    // `DynHandle<'o, 'c, Ctx>` for ONE Ctx. A box-flavor Switch
-    // carries `Erased`; a direct-flavor switch would need a fresh
-    // pairing (`install` of a concrete `Handle<S>`) which no inner
-    // state can obtain — it holds no handle to re-install from.
-    // Concretely: `Outcome::Switch(Erased)` cannot express a direct
-    // successor, and `install` requires a `Handle<S>` that only
-    // exists at `with_pair`/`fanout` mint points.
-
-    // WALL 4 — inner states structurally cannot safepoint mid-run:
-    // the object-safe method is `execute(&mut self, ..)` — no handle
-    // is in scope inside the box. The entry safepoints BETWEEN
-    // transitions (verified in the main flow); a long-running inner
-    //  execute delays the park until it returns.
-}
+// W1 — the Context must be BRAND-FREE. with_pair instantiates the
+//      node type BEFORE the brands exist (`for<'o> FnOnce(Handle<'o,
+//      'o, T>)` with T fixed), so a Context<'o, 'c> naming the brands
+//      cannot be the node. Hence the entries are higher-ranked over
+//      the brands instead — workable, but it means the entries cannot
+//      name their own pair statically (they see the brands only per
+//      call).
+//
+// W2 — the unwrapper's fat->thin re-type reaches the STATE at offset
+//      0 of the installed box; the Context (entries) sits AFTER it.
+//      That layout is install's own construction (repr(C)), so it is
+//      sound — but it is the one unsafe in the client, and it is the
+//      reason `Installed` can never be constructed any other way
+//      (its fields are private; the DerefMut impl hides the state).
+//
+// W3 — flavor mixing at SWITCH works only INTO boxes: the outcome
+//      carries `Box<dyn DerefMut<Context>>`. An outer state cannot
+//      switch to a "direct" (unboxed) successor — but nothing needs
+//      one: both flavors install into boxes, and the outer flavor's
+//      handle access survives (W1's entries pass the chain handle).
+//
+// W6 — outer states cannot receive (handle, &mut Self) together:
+//      the state is projected THROUGH the handle, so the two borrows
+//      alias (E0499). The outer flavor therefore takes the handle
+//      alone and projects per use — each state borrow ends before the
+//      handle is used again. The ??? of "outer execute(Handle<???
+//      Self>)" resolves to: the BOX handle, with Self reached by
+//      projection inside.
+//
+// W5 — the entries are fn POINTERS, so a closure capturing the
+//      unwrapper VALUE cannot coerce into them (E0308). The sketch's
+//      `mk(unwrapper)` therefore rides as a zero-sized TYPE (Proj<S>)
+//      whose impl is the unwrapper — reachable statically by the
+//      monomorphized entry fns, no capture. The unwrapper-as-value
+//      exists only inside install::<S>.
+//
+// W4 — the box swap (`**h = next`) replaces the WHOLE installed pair
+//      (state + entries together). That is the modular successor —
+//      but it also means the entries of the outgoing state are
+//      dropped with it; per-state entry tables are not shared.

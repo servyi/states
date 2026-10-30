@@ -17,7 +17,27 @@ backstop.
 
 ## The installable exploration (this branch)
 
-The client runs the `Box<dyn InnerState>` shape end to end:
+Per the 14:39 sketch, the DynHandle is GONE: the chain is
+`Handle<Box<dyn DerefMut<Context>>>`; `install(S, mk)` returns the
+DerefMut-impl to box; the unwrapper projects the state out of the box
+(offset 0, repr(C)); successors are whole-box swaps. Client-only,
+single subcrate dependency (`handle`). Runs: `result: 42` (Countdown
+inner -> Countup OUTER with a mid-run safepoint), `save: countdown:3`.
+
+Walls found (W5/W6 new this round, in the client's notes):
+1. brand-free Context required (with_pair fixes T before the brands);
+2. the unwrapper's fat->thin offset projection is the one unsafe;
+3. flavor mixing works only into boxes (both flavors install);
+4. box swap replaces state+entries together;
+5. fn-pointer entries cannot capture the unwrapper value (E0308) —
+   it rides as a ZST projection type;
+6. outer states cannot receive (handle, &mut Self) together (E0499) —
+   they take the handle and project per use; the ??? of
+   `Handle<??? Self>` resolves to the BOX handle.
+
+Earlier round (the DynHandle-based box flavor, now superseded but kept
+below in git history): the client ran the `Box<dyn InnerState>` shape
+end to end:
 `result: 42` (Countdown -> Countup through the box OVERWRITE),
 `save: countdown:3`. ONE `Context` for every inner state (the pairing
 is with the box, `Erased`); successors install as plain `*boxed =
