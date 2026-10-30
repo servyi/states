@@ -7,7 +7,7 @@
 
 use std::ops::DerefMut;
 
-use dynstate::{Erased, Proj, Unwrap, install};
+use dynstate::{ContextData, Erased, UnwrapMut, install};
 use handle::{Handle, with_pair};
 
 pub struct Env;
@@ -47,19 +47,19 @@ pub trait State: Sized + 'static {
 
 // ── entries for both flavors (mk builds them) ─────────────────────
 
-fn execute_entry<S: State>(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<Outcome, String> {
-    h.safepoint(); // between transitions
-    // the temporary Handle<S> (chain's brands) lives inside the
-    // closure; the state's execute runs on it
-    Proj::<S, Context>::unwrap_mut(h, |typed| S::execute(typed, env))
-}
-
-fn save_entry<S: State>(h: &mut Handle<'_, '_, Boxed>) -> String {
-    Proj::<S, Context>::unwrap_mut(h, |typed| S::save(typed))
-}
-
-pub fn entries<S: State>() -> Context {
-    Context { execute: execute_entry::<S>, save: save_entry::<S> }
+/// The secondary impl: generic over the capability `U` (pinned by
+/// install's instantiation), the entries are non-capturing closures —
+/// plain fn pointers: static, no allocation, nothing captured.
+impl<S: State + 'static> ContextData<S> for Context {
+    fn new<U: UnwrapMut<Type = S>>() -> Context {
+        Context {
+            execute: |h, env| {
+                h.safepoint(); // between transitions
+                U::unwrap_mut(h, |typed| S::execute(typed, env))
+            },
+            save: |h| U::unwrap_mut(h, |typed| S::save(typed)),
+        }
+    }
 }
 
 // ── the states ────────────────────────────────────────────────────
@@ -72,9 +72,8 @@ impl State for Countdown {
     fn execute(self: &mut Handle<'_, '_, Self>, _env: &Env) -> Result<Outcome, String> {
         if self.left == 0 {
             // the successor: an INSTALLED box, carried by the outcome
-            return Ok(Outcome::Switch(Box::new(install(
+            return Ok(Outcome::Switch(Box::new(install::<Countup, Context>(
                 Countup { up: 0, limit: COUNTUP_LIMIT },
-                entries::<Countup>,
             ))));
         }
         self.left -= 1;
@@ -130,13 +129,13 @@ fn drive(h: &mut Handle<'_, '_, Boxed>, env: &Env) -> Result<u64, String> {
 
 fn main() {
     let result = with_pair(
-        Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
+        Box::new(install::<Countdown, Context>(Countdown { left: START })) as Boxed,
         |mut h| drive(&mut h, &Env).expect("chain completes"),
     );
     println!("result: {result}");
 
     with_pair(
-        Box::new(install(Countdown { left: START }, entries::<Countdown>)) as Boxed,
+        Box::new(install::<Countdown, Context>(Countdown { left: START })) as Boxed,
         |mut h| {
             let save = (**h).save;
             println!("save: {}", save(&mut h));

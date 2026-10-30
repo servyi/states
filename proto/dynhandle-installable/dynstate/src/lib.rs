@@ -1,8 +1,9 @@
-//! The dynstate library, rebuilt around `Installed<S, T>` (per the
-//! 15:50 comment): the erased-box pairing, generalized over the state
-//! `S` and the context `T`. All the reusable parts — the wrapper, its
-//! derefs, the projection, install — live here; the client carries
-//! only its vocabulary and entries, zero unsafe.
+//! The dynstate library, per the two-trait sketch: the TRAIT is
+//! public (client entries are generic over it, monomorphized into
+//! plain fn pointers — static, no allocation, nothing captured);
+//! the STRUCT implementing it is private, so the capability is only
+//! reachable where `install` instantiates it for the matching
+//! pairing. No values are handed out at all.
 
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
@@ -33,45 +34,47 @@ impl<S, T> DerefMut for Installed<S, T> {
 /// context `T`.
 pub type Erased<T> = Box<dyn DerefMut<Target = T>>;
 
-/// install(S, mk) — the DerefMut-impl to box: mk builds the context
-/// (the entries) for this `S`; the pairing leaves together.
-pub fn install<S, T>(state: S, mk: impl FnOnce() -> T) -> Installed<S, T> {
-    Installed { ctx: mk(), state }
-}
-
-/// The projection's carrier: a zero-sized type per `(S, T)`, so the
-/// (fn-pointer) entries reach the unwrapper statically without
-/// capturing a value.
-pub struct Proj<S, T>(PhantomData<fn() -> (S, T)>);
-
-pub trait Unwrap<S, T> {
-    /// Run `f` with the state's own handle — `&mut Handle<'o, 'c, S>`
-    /// — built as a TEMPORARY inside: the node pointer differs from
-    /// the chain handle's (the state lives inside the box), so the
-    /// handle is constructed, not cast; its BRANDS are the chain's
-    /// (tree identity preserved — no rebranding); the closure scopes
-    /// its lifetime, so no ownership is given out.
-    fn unwrap_mut<'o, 'c, R>(
+/// The capability trait — PUBLIC, but its method is only reachable
+/// through a generic `U: UnwrapMut`, and the only implementor is the
+/// private [`Unwrapper`], instantiated solely by [`install`] for the
+/// pairing it is building. A client cannot name the implementor, so
+/// it cannot call the method on a foreign chain; generic client code
+/// receives `U` already pinned to the right pairing.
+pub trait UnwrapMut {
+    /// The state this capability may project.
+    type Type: 'static;
+    /// Lend the state's own handle — `&mut Handle<'o, 'c, Self::Type>`
+    /// — as a TEMPORARY inside `f`: the node pointer differs from the
+    /// chain handle's (the state lives inside the box), so the handle
+    /// is constructed, not cast; its BRANDS are the chain's (tree
+    /// identity preserved); the closure scopes its lifetime.
+    fn unwrap_mut<'o, 'c, T, R>(
         h: &mut Handle<'o, 'c, Erased<T>>,
-        f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
+        f: impl FnOnce(&mut Handle<'o, 'c, Self::Type>) -> R,
     ) -> R;
 }
 
-impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
-    fn unwrap_mut<'o, 'c, R>(
+/// The private implementor: zero-sized, per state type, constructed
+/// nowhere but inside `install`.
+struct Unwrapper<S> {
+    _p: PhantomData<fn(S)>,
+}
+
+impl<S: 'static> UnwrapMut for Unwrapper<S> {
+    type Type = S;
+    fn unwrap_mut<'o, 'c, T, R>(
         h: &mut Handle<'o, 'c, Erased<T>>,
         f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
     ) -> R {
-        // dig the erased object (safe derefs)
-        let b: &mut Erased<T> = &mut *h;
-        let erased = &mut **b;
-        // SAFETY: the re-type lands on the `Installed<S, T>` that
-        // install::<S, T> built (this impl's `(S, T)` names exactly
-        // that pairing); provenance: only the entries mk built for
-        // this `S` reach this impl, and those travel only inside the
-        // same `Installed`.
+        // dig the erased object: Handle derefs to its node (the
+        // Erased<T> box); borrow the box, then the trait object.
+        let b: &mut Erased<T> = &mut **h;
+        let dyn_ref: &mut dyn DerefMut<Target = T> = &mut **b;
+        // SAFETY: the re-type lands on the `Installed<S, T>` built by
+        // the `install` that instantiated this impl for its `S` — the
+        // struct is private, so no other instantiation path exists.
         let installed =
-            unsafe { &mut *(erased as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
+            unsafe { &mut *(dyn_ref as *mut dyn DerefMut<Target = T> as *mut Installed<S, T>) };
         let node = std::ptr::from_mut(&mut installed.state);
         // SAFETY: the node is this Installed's state — live and
         // exclusively owned by the box this handle wraps; the brands
@@ -79,4 +82,17 @@ impl<S: 'static, T: 'static> Unwrap<S, T> for Proj<S, T> {
         // dies inside, so the borrow is scoped.
         unsafe { h.with_projected(node, f) }
     }
+}
+
+/// The secondary trait on the client's context: `new<U>` is generic
+/// over the capability, so the client's entries are monomorphized
+/// plain fn pointers (static, zero-sized, no capture).
+pub trait ContextData<S>: Sized {
+    fn new<U: UnwrapMut<Type = S>>() -> Self;
+}
+
+/// install — per the sketch: `T::new::<Unwrapper<S>>()`. No values
+/// are handed out; the pairing is the instantiation itself.
+pub fn install<S: 'static, T: ContextData<S>>(state: S) -> Installed<S, T> {
+    Installed { ctx: T::new::<Unwrapper<S>>(), state }
 }
