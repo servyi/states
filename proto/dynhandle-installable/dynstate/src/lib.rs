@@ -122,7 +122,13 @@ pub fn install_chain<'o, 'c, S: 'static, T: ContextData<'o, 'c, S> + 'c>(
 where
     'o: 'c,
 {
-    // the whole move-out + box + re-point, safely: one method on
-    // Handle, unsafe confined inside it.
-    h.replace_with_boxed(|state| Box::new(Box::new(install(state)) as Erased<'c, T>))
+    // the whole move-out + box + re-point, one method on Handle.
+    // SAFETY: the pair node's storage is with_pair's frame; the
+    // moved state now lives (and drops) inside the box chain —
+    // with_pair's own drop of the moved-from slot is the prototype's
+    // standing caveat, documented on replace_with_boxed (no test
+    // state implements Drop).
+    unsafe {
+        h.replace_with_boxed(|state| Box::new(Box::new(install(state)) as Erased<'c, T>))
+    }
 }

@@ -40,18 +40,22 @@ impl<'o, 'c, T> Handle<'o, 'c, T> {
 impl<'o, 'c, T> Handle<'o, 'c, T> {
     /// Consume this handle, move its node out, and hand back a handle
     /// over a freshly boxed node of a different type — the brands
-    /// ride with the value. One method, SAFE to call: both unsafe
-    /// steps (the move-out under exclusive ownership; the repr(C)
-    /// re-type of the handle shell) live inside, under the documented
-    /// type invariant.
-    pub fn replace_with_boxed<U>(
+    /// ride with the value.
+    ///
+    /// # Safety
+    ///
+    /// The move-out is NOT Deref's authority (DerefMut only lends;
+    /// values go back) — it leaves the storage holding a moved-from
+    /// value. The caller must guarantee the old node's storage will
+    /// never drop it again (a `with_pair`-owned node whose value went
+    /// into `make` must be forgotten or owned-once from there);
+    /// otherwise a `T: Drop` double-drops.
+    pub unsafe fn replace_with_boxed<U>(
         self,
         make: impl FnOnce(T) -> Box<U>,
     ) -> Handle<'o, 'c, U> {
-        // SAFETY: the node is exclusively owned by this handle (the
-        // type invariant); moving it out is the same authority Deref
-        // uses, and the handle is consumed so the old node is never
-        // touched again.
+        // SAFETY: per the contract above — the storage's owner will
+        // not drop the moved-from value.
         let old: T = unsafe { std::ptr::read(self.node) };
         let node = Box::into_raw(make(old));
         // SAFETY: repr(C) layout identity — the type parameter sits
