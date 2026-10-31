@@ -111,24 +111,8 @@ where
     Installed { ctx: T::new::<Unwrapper<S>>(), state }
 }
 
-/// install_chain — the TOP-LEVEL entry: consumes the handle over the
-/// raw state (the `with_pair` node), moves the state into the
-/// installed box, and returns the CHAIN handle (same brands, node
-/// re-pointed at the box). The successor path (`Switch`) needs no
-/// handle: `install(state)` boxes directly under the chain's brands.
-pub fn install_chain<'o, 'c, S: 'static, T: ContextData<'o, 'c, S> + 'c>(
-    h: Handle<'o, 'c, S>,
-) -> Handle<'o, 'c, Erased<'c, T>>
-where
-    'o: 'c,
-{
-    // the whole move-out + box + re-point, one method on Handle.
-    // SAFETY: the pair node's storage is with_pair's frame; the
-    // moved state now lives (and drops) inside the box chain —
-    // with_pair's own drop of the moved-from slot is the prototype's
-    // standing caveat, documented on replace_with_boxed (no test
-    // state implements Drop).
-    unsafe {
-        h.replace_with_boxed(|state| Box::new(Box::new(install(state)) as Erased<'c, T>))
-    }
-}
+// (no install_chain: per the sketch, install is S -> T-ish — a plain
+// value constructor, no Handles. Successors store into the box; the
+// first chain is minted where the brands exist — the fanout action,
+// the designed chain source. The prototype's top-level wiring lives
+// in the client, documented there.)

@@ -9,7 +9,7 @@ pub struct Shared(());
 
 // ── delta vs main: the second brand + #[repr(C)] ──────────────────
 #[repr(C)]
-pub struct Handle<'o, 'c, T> {
+pub struct Handle<'o, 'c, T: ?Sized> {
     pub(crate) node: *mut T,
     pub(crate) shared: &'o Shared,
     /// Invariant in BOTH brands: the pair brand cannot shrink to a
@@ -17,7 +17,7 @@ pub struct Handle<'o, 'c, T> {
     pub(crate) _brand: PhantomData<fn(&'o (), &'c ()) -> (&'o (), &'c ())>,
 }
 
-impl<'o, 'c, T> Deref for Handle<'o, 'c, T> {
+impl<'o, 'c, T: ?Sized> Deref for Handle<'o, 'c, T> {
     type Target = T;
     fn deref(&self) -> &T {
         // SAFETY: the node is exclusively owned by this handle and
@@ -26,45 +26,15 @@ impl<'o, 'c, T> Deref for Handle<'o, 'c, T> {
     }
 }
 
-impl<'o, 'c, T> DerefMut for Handle<'o, 'c, T> {
+impl<'o, 'c, T: ?Sized> DerefMut for Handle<'o, 'c, T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as Deref, exclusive.
         unsafe { &mut *self.node }
     }
 }
 
-impl<'o, 'c, T> Handle<'o, 'c, T> {
+impl<'o, 'c, T: ?Sized> Handle<'o, 'c, T> {
     pub fn safepoint(&mut self) {}
-}
-
-impl<'o, 'c, T> Handle<'o, 'c, T> {
-    /// Consume this handle, move its node out, and hand back a handle
-    /// over a freshly boxed node of a different type — the brands
-    /// ride with the value.
-    ///
-    /// # Safety
-    ///
-    /// The move-out is NOT Deref's authority (DerefMut only lends;
-    /// values go back) — it leaves the storage holding a moved-from
-    /// value. The caller must guarantee the old node's storage will
-    /// never drop it again (a `with_pair`-owned node whose value went
-    /// into `make` must be forgotten or owned-once from there);
-    /// otherwise a `T: Drop` double-drops.
-    pub unsafe fn replace_with_boxed<U>(
-        self,
-        make: impl FnOnce(T) -> Box<U>,
-    ) -> Handle<'o, 'c, U> {
-        // SAFETY: per the contract above — the storage's owner will
-        // not drop the moved-from value.
-        let old: T = unsafe { std::ptr::read(self.node) };
-        let node = Box::into_raw(make(old));
-        // SAFETY: repr(C) layout identity — the type parameter sits
-        // only behind a thin pointer; `shared` and the brands are
-        // untouched by the parameter change.
-        let mut h: Handle<'o, 'c, U> = unsafe { std::mem::transmute(self) };
-        h.node = node;
-        h
-    }
 }
 
 impl<'o, 'c, T> Handle<'o, 'c, T> {
@@ -79,7 +49,7 @@ impl<'o, 'c, T> Handle<'o, 'c, T> {
     /// `node` must point at a live, exclusively-owned `S` for the
     /// whole call, and this must not create a second concurrent
     /// handle over the same node.
-    pub unsafe fn with_projected<S, R>(
+    pub unsafe fn with_projected<S: ?Sized, R>(
         &mut self,
         node: *mut S,
         f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,

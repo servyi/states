@@ -142,20 +142,39 @@ const LAST_STEP_AT: u64 = 1;
 
 
 fn main() {
-    // the top-level pair: the node is the RAW state; install_chain
-    // consumes its handle and returns the chain handle (same brands,
-    // node re-pointed at the installed box).
-    let result = with_pair(Countdown { left: START }, |h| {
-        let mut chain = dynstate::install_chain::<Countdown, Context<'_, '_>>(h);
-        drive(&mut chain, &Env).expect("chain completes")
+    // Top-level wiring (the OPEN point, documented): install is
+    // S -> T-ish per the sketch — a plain value constructor, no
+    // Handles — so the first chain's box must be built where the
+    // brands exist. The DESIGNED source is the fanout action (the
+    // fanout is not built yet); this harness wires the top with the
+    // one brand-scope tool available, the closure-scoped projection
+    // of your 13:53 sketch, over a locally-owned box. One unsafe in
+    // the harness main; everything else is the sketch's shape.
+    let result = with_pair((), |mut h: Handle<'_, '_, ()>| {
+        let mut boxed: Erased<'_, Context<'_, '_>> =
+            Box::new(install::<Countdown, Context<'_, '_>>(Countdown { left: START }));
+        // SAFETY: the projected node is the locally-owned box —
+        // live and exclusive for the whole call; the projection is
+        // closure-scoped (dies before `boxed`).
+        unsafe {
+            h.with_projected(std::ptr::from_mut(&mut boxed), |chain| {
+                drive(chain, &Env).expect("chain completes")
+            })
+        }
     });
     println!("result: {result}");
 
-    with_pair(Countdown { left: START }, |h| {
-        let mut chain = dynstate::install_chain::<Countdown, Context<'_, '_>>(h);
-        let save = (**chain).save;
-        println!("save: {}", save(&mut chain));
-        drive(&mut chain, &Env).expect("chain completes")
+    with_pair((), |mut h: Handle<'_, '_, ()>| {
+        let mut boxed: Erased<'_, Context<'_, '_>> =
+            Box::new(install::<Countdown, Context<'_, '_>>(Countdown { left: START }));
+        // SAFETY: as above.
+        unsafe {
+            h.with_projected(std::ptr::from_mut(&mut boxed), |chain| {
+                let save = (**chain).save;
+                println!("save: {}", save(chain));
+                drive(chain, &Env).expect("chain completes")
+            })
+        }
     });
 }
 
