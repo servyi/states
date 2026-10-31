@@ -38,31 +38,25 @@ impl<'o, 'c, T> Handle<'o, 'c, T> {
 }
 
 impl<'o, 'c, T> Handle<'o, 'c, T> {
-    /// The node pointer (crate-family internal: the move-out and the
-    /// re-point below are the library's owned-erase steps — public
-    /// only to the sibling crates of this workspace).
-    #[doc(hidden)]
-    pub fn node_ptr(&mut self) -> *mut T {
-        self.node
-    }
-
-    /// Re-point this (consumed) handle at a fresh boxed node of a
-    /// DIFFERENT type: the brands ride with the value.
-    ///
-    /// # Safety
-    ///
-    /// The caller must have moved out of (or dropped) the old node,
-    /// and must pass sole ownership of `boxed`. The old node must
-    /// never be touched again through this handle.
-    #[doc(hidden)]
-    pub unsafe fn repoint_boxed<U>(
+    /// Consume this handle, move its node out, and hand back a handle
+    /// over a freshly boxed node of a different type — the brands
+    /// ride with the value. One method, SAFE to call: both unsafe
+    /// steps (the move-out under exclusive ownership; the repr(C)
+    /// re-type of the handle shell) live inside, under the documented
+    /// type invariant.
+    pub fn replace_with_boxed<U>(
         self,
-        boxed: Box<U>,
+        make: impl FnOnce(T) -> Box<U>,
     ) -> Handle<'o, 'c, U> {
-        let node = Box::into_raw(boxed);
-        // SAFETY (caller-provided): repr(C) layout identity — the
-        // type parameter sits only behind a thin pointer; shared and
-        // the brands are untouched by the parameter change.
+        // SAFETY: the node is exclusively owned by this handle (the
+        // type invariant); moving it out is the same authority Deref
+        // uses, and the handle is consumed so the old node is never
+        // touched again.
+        let old: T = unsafe { std::ptr::read(self.node) };
+        let node = Box::into_raw(make(old));
+        // SAFETY: repr(C) layout identity — the type parameter sits
+        // only behind a thin pointer; `shared` and the brands are
+        // untouched by the parameter change.
         let mut h: Handle<'o, 'c, U> = unsafe { std::mem::transmute(self) };
         h.node = node;
         h

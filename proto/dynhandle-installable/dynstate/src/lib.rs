@@ -117,20 +117,12 @@ where
 /// re-pointed at the box). The successor path (`Switch`) needs no
 /// handle: `install(state)` boxes directly under the chain's brands.
 pub fn install_chain<'o, 'c, S: 'static, T: ContextData<'o, 'c, S> + 'c>(
-    mut h: Handle<'o, 'c, S>,
+    h: Handle<'o, 'c, S>,
 ) -> Handle<'o, 'c, Erased<'c, T>>
 where
     'o: 'c,
 {
-    // SAFETY: the node is exclusively owned by this handle (the type
-    // invariant); moving out leaves it never touched again — the
-    // handle is consumed, and the pair's node dies unobserved.
-    let state: S = unsafe { std::ptr::read(h.node_ptr()) };
-    let boxed: Box<Erased<'c, T>> =
-        Box::new(Box::new(install(state)) as Erased<'c, T>);
-    // SAFETY: the owned re-point — the fresh box is solely owned by
-    // the returned handle from here; the brands ride with the value
-    // (repr(C) layout identity, the parameter only behind a thin
-    // pointer).
-    unsafe { h.repoint_boxed(boxed) }
+    // the whole move-out + box + re-point, safely: one method on
+    // Handle, unsafe confined inside it.
+    h.replace_with_boxed(|state| Box::new(Box::new(install(state)) as Erased<'c, T>))
 }
