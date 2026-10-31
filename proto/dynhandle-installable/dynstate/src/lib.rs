@@ -30,9 +30,11 @@ impl<S, T> DerefMut for Installed<S, T> {
     }
 }
 
-/// The erased box: what a chain's handle wraps. The box derefs to the
-/// context `T`.
-pub type Erased<T> = Box<dyn DerefMut<Target = T>>;
+/// The erased box: what a chain's handle wraps. The box derefs to
+/// the context `T`; its object lifetime is the CHILD brand `'c` (the
+/// shorter one — the node lives within the child's scope; the context
+/// type itself carries both brands).
+pub type Erased<'c, T> = Box<dyn DerefMut<Target = T> + 'c>;
 
 /// The capability trait — PUBLIC, but its method is only reachable
 /// through a generic `U: UnwrapMut`, and the only implementor is the
@@ -49,7 +51,7 @@ pub trait UnwrapMut {
     /// is constructed, not cast; its BRANDS are the chain's (tree
     /// identity preserved); the closure scopes its lifetime.
     fn unwrap_mut<'o, 'c, T, R>(
-        h: &mut Handle<'o, 'c, Erased<T>>,
+        h: &mut Handle<'o, 'c, Erased<'c, T>>,
         f: impl FnOnce(&mut Handle<'o, 'c, Self::Type>) -> R,
     ) -> R;
 }
@@ -63,12 +65,12 @@ struct Unwrapper<S> {
 impl<S: 'static> UnwrapMut for Unwrapper<S> {
     type Type = S;
     fn unwrap_mut<'o, 'c, T, R>(
-        h: &mut Handle<'o, 'c, Erased<T>>,
+        h: &mut Handle<'o, 'c, Erased<'c, T>>,
         f: impl FnOnce(&mut Handle<'o, 'c, S>) -> R,
     ) -> R {
         // dig the erased object: Handle derefs to its node (the
         // Erased<T> box); borrow the box, then the trait object.
-        let b: &mut Erased<T> = &mut **h;
+        let b: &mut Erased<'c, T> = &mut **h;
         let dyn_ref: &mut dyn DerefMut<Target = T> = &mut **b;
         // SAFETY: the re-type lands on the `Installed<S, T>` built by
         // the `install` that instantiated this impl for its `S` — the
@@ -86,13 +88,49 @@ impl<S: 'static> UnwrapMut for Unwrapper<S> {
 
 /// The secondary trait on the client's context: `new<U>` is generic
 /// over the capability, so the client's entries are monomorphized
-/// plain fn pointers (static, zero-sized, no capture).
-pub trait ContextData<S>: Sized {
-    fn new<U: UnwrapMut<Type = S>>() -> Self;
+/// plain fn pointers (static, zero-sized, no capture). The BRANDS
+/// are parameters of the context: the entries are pinned to ONE
+/// pair and ONE child — a fn pointer lifted out of one chain does
+/// not typecheck against another (the brands are invariant).
+pub trait ContextData<'o, 'c, S>: Sized {
+    fn new<U: UnwrapMut<Type = S>>() -> Self
+    where
+        'o: 'c; // the child brand is a SUBSET of the pair's
 }
 
 /// install — per the sketch: `T::new::<Unwrapper<S>>()`. No values
-/// are handed out; the pairing is the instantiation itself.
-pub fn install<S: 'static, T: ContextData<S>>(state: S) -> Installed<S, T> {
+/// are handed out; the pairing is the instantiation itself. The
+/// brands come from the chain the box is being installed INTO (the
+/// state's receiver handle supplies them at the Switch site).
+pub fn install<'o, 'c, S: 'static, T: ContextData<'o, 'c, S>>(
+    state: S,
+) -> Installed<S, T>
+where
+    'o: 'c,
+{
     Installed { ctx: T::new::<Unwrapper<S>>(), state }
+}
+
+/// install_chain — the TOP-LEVEL entry: consumes the handle over the
+/// raw state (the `with_pair` node), moves the state into the
+/// installed box, and returns the CHAIN handle (same brands, node
+/// re-pointed at the box). The successor path (`Switch`) needs no
+/// handle: `install(state)` boxes directly under the chain's brands.
+pub fn install_chain<'o, 'c, S: 'static, T: ContextData<'o, 'c, S> + 'c>(
+    mut h: Handle<'o, 'c, S>,
+) -> Handle<'o, 'c, Erased<'c, T>>
+where
+    'o: 'c,
+{
+    // SAFETY: the node is exclusively owned by this handle (the type
+    // invariant); moving out leaves it never touched again — the
+    // handle is consumed, and the pair's node dies unobserved.
+    let state: S = unsafe { std::ptr::read(h.node_ptr()) };
+    let boxed: Box<Erased<'c, T>> =
+        Box::new(Box::new(install(state)) as Erased<'c, T>);
+    // SAFETY: the owned re-point — the fresh box is solely owned by
+    // the returned handle from here; the brands ride with the value
+    // (repr(C) layout identity, the parameter only behind a thin
+    // pointer).
+    unsafe { h.repoint_boxed(boxed) }
 }
