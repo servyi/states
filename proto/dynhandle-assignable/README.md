@@ -1,40 +1,42 @@
 # The issue #18 assignable exploration (two-piece shape, 16:38 sketch)
 
-Handle subcrate: `InnerHandle<T> { ptr, status: Arc<Shared> }` — no
-lifetimes; `Shared` is Arc-OWNED with a `Mutex<Vec<Weak<Shared>>>`
-children registry (register on new, merge-on-drop with closed
-filtering) — the borrow-based registry is gone, and with it the
-Shared-inside-the-node aliasing question.
+Rebuilt to follow the sketch literally after review: **the Assignable
+is a Box a new value can be stored into** — a STABLE CELL at a fixed
+heap address, whose content (a `Box<V>`) is swapped by `store`.
+Inner handles point AT the cell (`*mut dyn Cell`), not at the value;
+`set` follows the sketch's four steps verbatim: (1) store the new
+value into the cell; (2) the old typed view is forgotten (the outer
+box replaces it); (3) the membership Arc is cloned; (4) a fresh typed
+handle is minted over the SAME cell, and the outer `Box<dyn State>`
+swaps to it.
 
-Dynstate subcrate: the **`Assignable`** — the swappable storage IN the
-tree (one heap'd value + its membership). `new(value, parent)` heaps
-the value, registers membership; **`set(value)`** is the successor
-install: allocate the new value, re-mint the inner handle over it with
-the SAME membership, drop the old value by the OLD dropper. The
-`HandleAble` blanket (the sketch's shortcut path) also lives here.
+Pieces:
+- handle: `Cell` trait (stable address, interior-mutable content:
+  `data_ptr`/`data_ptr_mut`), `Shared` (Arc-owned, Weak children,
+  register/merge-on-drop), `InnerHandle<T>` (points at the cell,
+  carries the membership, derefs through the cell to the typed
+  content — valid because handles are re-minted after every store).
+- dynstate: `Assignable<V>` (RefCell<Option<Box<V>>> — shared
+  borrows only on the cell itself), `mint`, `set`, `erase`.
+- client: vocabulary on the inner handles (`impl State for
+  InnerHandle<Countdown>` — mid-run safepoints work), `Switch`
+  carries the successor through a typed `Install` seam (store +
+  re-mint); the chain holds the cell as a raw pointer (stable
+  address, sole ownership, manual drop).
 
-Client — variant A (the chain): vocabulary on the INNER handles
-(`impl State for InnerHandle<Countdown>` — every state method runs on
-its handle and CAN safepoint mid-run; Countup does). The chain = an
-`Assignable` + the current `Box<dyn State>`; `Switch` carries the
-successor VALUE (type-erased via a client `Next` seam); the install is
-the ONE door — `assignable.set(value)` — value swapped, membership
-KEPT, fresh inner handle minted over the new value. Runs: `result: 42`
-(Countdown -> Countup with a mid-run safepoint), `save: countdown:3`.
-**Miri clean** — after catching a real bug (set() dropped the old
-value by the NEW dropper: type confusion; now old-data/old-dropper).
+Runs `result: 42` (Countdown -> Countup, mid-run safepoint through
+the handle), `save: countdown:3`. **Miri clean**, clippy clean.
 
-Client — variant B (the sketch-literal path): states call their own
-`box_innerhandle()` and the outer `Box<dyn State>` is swapped
-wholesale. Difference vs A: the minted handle's membership is a FRESH
-root — nothing parks it from a parent; the whole old box (state +
-membership) dies on swap. This is exactly the sketch's "missing
-Assignable in the tree" gap, which A closes.
+Miri taught three lessons on the way (all fixed):
+1. the cell must be at a stable address — moving it (even boxing then
+   moving the Box) dangles every handle minted over it;
+2. the cell must only ever be borrowed SHAREDLY after the first mint
+   — a `&mut` reborrow pops the handles' raw-pointer tags (Stacked
+   Borrows); stores go through RefCell interior mutability;
+3. the write path (DerefMut) must derive its pointer with write
+   intent (borrow_mut), the read path without — one shared `data_ptr`
+   cannot serve both.
 
-Challenges (details on the issue):
-- `dyn HandleAble<V>` is not dyn-compatible (the `InnerHandle<Self>:
-  Unsize<V>` where-clause cannot hold for the erased Self) — the
-  erasure happens at the vocabulary trait instead.
-- `set` must drop old by old dropper (Miri-caught).
-- The successor payload needs its own type-erasure seam (`Next`), since
-  `Switch` cannot name the state type.
+Known gap vs a full port: fanout/`box_innerhandle` (variant B of the
+earlier round) is not re-wired onto the cell yet; the sketch's
+`new_child` registration exists but no state exercises it.
