@@ -259,7 +259,7 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
     /// guard at once. Concurrent `request`s serialize internally: a
     /// second request blocks until the first guard is dropped and the
     /// world resumed.
-    pub fn request(&self) -> Option<CheckpointGuard<'_, K>> {
+    pub fn request(&self) -> CheckpointGuard<'_, K> {
         // Closed is not a failure: the mutator side is gone and will
         // never mutate again, so access is free — hand out the guard
         // at once.
@@ -268,26 +268,25 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
             if self.shared.is_pending() {
                 self.shared.release_request();
             }
-            return Some(CheckpointGuard {
+            return CheckpointGuard {
                 slot: self.slot,
                 shared: &self.shared,
                 request_lock,
                 _marker: PhantomData,
-            });
+            };
         }
         let request_lock = self.shared.request_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.shared.is_pending() {
             self.shared.release_request();
         }
-        let guard = match self.shared.request_until_parked() {
+        match self.shared.request_until_parked() {
             Handshake::Parked | Handshake::Closed => CheckpointGuard {
                 slot: self.slot,
                 shared: &self.shared,
                 request_lock,
                 _marker: PhantomData,
             },
-        };
-        Some(guard)
+        }
     }
 }
 

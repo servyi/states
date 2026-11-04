@@ -56,7 +56,7 @@ fn main() {
         // the guard holds the root slot while every mutator parks
         let ck = checkpointer.clone();
         let checker = std::thread::spawn(move || {
-            let guard = ck.request().expect("tree closed early");
+            let guard = ck.request();
             let _root: &Slot = &guard;
             println!("checkpoint: world stopped, root held");
             drop(guard);
