@@ -90,7 +90,9 @@ where
         let erased_slot: *mut dyn DerefMut<Target = dyn HandleAble<V>> = slot;
         // SAFETY: the caller's contract above.
         let erased: &mut dyn HandleAble<V> = unsafe { &mut **erased_slot };
-        let current = erased.box_innerhandle(erased_slot);
+        // the chain's ORIGIN: a fresh root Shared moves in
+        let shared = Arc::new(Shared { children: Vec::new() });
+        let current = erased.box_innerhandle(erased_slot, shared);
         OuterHandle { current, _slot: PhantomData }
     }
 
@@ -108,6 +110,9 @@ where
         // derefs — the handle is replaced, not driven, in this method).
         let current: &mut InnerHandle<(), V> =
             unsafe { &mut *(self.current.as_mut() as *mut V as *mut InnerHandle<(), V>) };
+        // the old handle's shared is PASSED ON to the successor — the
+        // chain's membership survives the install
+        let shared = current.status.clone();
         // 2) load its ptr, cast it to the slot
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
@@ -126,7 +131,10 @@ where
         // raw — one borrow stack.
         let fresh: Box<V> = unsafe {
             let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
-            erased.box_innerhandle(slot as *mut dyn DerefMut<Target = dyn HandleAble<V>>)
+            erased.box_innerhandle(
+                slot as *mut dyn DerefMut<Target = dyn HandleAble<V>>,
+                shared,
+            )
         };
         self.current = fresh;
     }
@@ -151,6 +159,7 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     fn box_innerhandle(
         &mut self,
         holder: *mut dyn DerefMut<Target = dyn HandleAble<V>>,
+        shared: Arc<Shared>,
     ) -> Box<V>;
 }
 
@@ -161,12 +170,13 @@ where
     fn box_innerhandle(
         &mut self,
         holder: *mut dyn DerefMut<Target = dyn HandleAble<V>>,
+        shared: Arc<Shared>,
     ) -> Box<V> {
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
             ptr: holder,
-            status: Arc::new(Shared { children: Vec::new() }),
+            status: shared,
             _marker: PhantomData,
         });
         handle
@@ -225,6 +235,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         // MINT THE BOXES: each slot becomes a Box<V> via the blanket
         // impl — the receiver derives from the raw (one borrow
         // stack), the holder pointer is the raw itself.
+        let parent_shared = self.status.clone();
         let boxes: Vec<Box<V>> = child_raws
             .into_iter()
             .map(|raw| {
@@ -232,7 +243,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                     // SAFETY: the split yielded each child exactly
                     // once, disjointly; exclusive for this mint.
                     unsafe { &mut **raw };
-                erased.box_innerhandle(raw)
+                erased.box_innerhandle(raw, parent_shared.clone())
             })
             .collect();
         // THEN THREADS: one dedicated scoped thread per box (std, per
