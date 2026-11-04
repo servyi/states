@@ -1,6 +1,8 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
+use std::ops::DerefMut;
+
 use hslib::{HandleAble, InnerHandle, OuterHandle};
 
 trait Trait: Send {
@@ -13,8 +15,7 @@ trait Trait: Send {
 type Slot = Box<dyn HandleAble<dyn Trait> + 'static>;
 
 struct MyStruct {
-    child: Slot,
-    child2: Slot,
+    children: Vec<Slot>,
 }
 struct YourStruct {
     val: i32,
@@ -24,7 +25,14 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) {
         println!("MyStruct");
         self.fanout(
-            &|m: &mut MyStruct| vec![&mut m.child, &mut m.child2],
+            &|m: &mut MyStruct| {
+                // per-element coercion (collect won't unsized-coerce):
+                // &mut Box<...> -> &mut *box -> &mut dyn DerefMut<...>
+                m.children
+                    .iter_mut()
+                    .map(|s| &mut *s as &mut dyn DerefMut<Target = dyn HandleAble<dyn Trait>>)
+                    .collect()
+            },
             |mut b: Box<dyn Trait>| b.bark(),
         );
     }
@@ -46,15 +54,17 @@ fn outer_over(slot: &mut Slot) -> OuterHandle<Slot, dyn Trait> {
 
 fn main() {
     let mut m: Slot = Box::new(MyStruct {
-        child: Box::new(YourStruct { val: 5 }),
-        child2: Box::new(YourStruct { val: 7 }),
+        children: vec![
+            Box::new(YourStruct { val: 5 }),
+            Box::new(YourStruct { val: 7 }),
+        ],
     });
     let mut outer = outer_over(&mut m);
     // bark fans the child out: the child registers into the parent's
     // vec — observable via the live_children snapshot (under the
     // lock, released — the convention)
     outer.bark();
-    // both children ran (5 and 7 above); they are TRANSIENT — joined
+    // the children ran (5 and 7 above); they are TRANSIENT — joined
     // and dropped inside bark, so their Weaks are dead here (deleted
     // = closed) — 0.
     let kids = outer.shared().live_children();
