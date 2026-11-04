@@ -1,9 +1,7 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use std::ops::{Deref, DerefMut};
-
-use hslib::{HandleAble, InnerHandle};
+use hslib::{HandleAble, InnerHandle, OuterHandle};
 
 trait Trait: Send {
     fn bark(&mut self);
@@ -37,31 +35,31 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
     }
 }
 
-/// Mint over a LIVE slot the driver owns (the slot must outlive the
-/// handle — the discipline the OuterHandle will own next step).
-fn mint_over(slot: &mut Slot) -> Box<dyn Trait> {
-    let holder = (slot
-        as &mut dyn DerefMut<Target = dyn HandleAble<dyn Trait>>)
-        as *mut dyn DerefMut<Target = dyn HandleAble<dyn Trait>>;
-    // SAFETY: the slot is live for the whole drive (the caller owns
-    // it beside the handle); the receiver derives from the same
-    // borrow as the holder pointer — one borrow stack.
-    let erased: &mut dyn HandleAble<dyn Trait> = unsafe { &mut **holder };
-    erased.box_innerhandle(holder)
+/// Wrap a LIVE driver-owned slot in the OuterHandle (the library's
+/// over_slot does the mint).
+fn outer_over(slot: &mut Slot) -> OuterHandle<Slot, dyn Trait> {
+    // SAFETY: the slot lives for the whole drive (main owns it
+    // beside the outer handle).
+    unsafe { OuterHandle::over_slot(std::ptr::from_mut(slot)) }
 }
 
 fn main() {
     let mut m: Slot = Box::new(MyStruct {
         child: Box::new(YourStruct { val: 5 }),
     });
-    let mut h: Box<dyn Trait> = mint_over(&mut m);
-    h.bark();
-    drop(h);
+    let mut outer = outer_over(&mut m);
+    outer.bark();
+    // THE INSTALL: the OuterHandle walks to the slot through the
+    // current inner handle, swaps it, re-mints, keeps the fresh one
+    let successor: Slot = Box::new(YourStruct { val: 42 });
+    outer.replace(successor);
+    outer.bark();
+    drop(outer);
     drop(m);
 
     let mut y: Slot = Box::new(YourStruct { val: 5 });
-    let mut h2: Box<dyn Trait> = mint_over(&mut y);
-    h2.bark();
-    drop(h2);
+    let mut outer2 = outer_over(&mut y);
+    outer2.bark();
+    drop(outer2);
     drop(y);
 }

@@ -26,6 +26,17 @@ pub struct Shared {
 /// The erased slot any holder presents: derefs to the erased state.
 pub type ErasedSlot<V> = dyn DerefMut<Target = dyn HandleAble<V>>;
 
+/// The OUTER handle: purely a type marker over the current inner
+/// handle (`Box<V>`, which it knows is an `InnerHandle<_, V>`
+/// pointing at a `K`-shaped slot) — it owns NO slot. `replace` is
+/// the successor install: walk to the slot through the current
+/// inner handle's own pointer, swap the slot via `K: ReplaceAble<V>`,
+/// re-mint, and keep the fresh inner handle in the box.
+pub struct OuterHandle<K: ?Sized, V: ?Sized> {
+    current: Box<V>,
+    _slot: PhantomData<fn(*mut K, *mut V)>,
+}
+
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
     ptr: *mut dyn DerefMut<Target = dyn HandleAble<V>>,
     status: Arc<Shared>,
@@ -37,6 +48,83 @@ pub struct InnerHandle<T: ?Sized, V: ?Sized> {
 // thread moves the exclusive access with it. T: Send because the
 // pointee crosses with it (the big-PR lesson, applied here).
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
+
+// The marker's K crosses threads only as a type; the box's Send is
+// the payload that matters.
+unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
+
+impl<K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<K, V> {
+    type Target = Box<V>;
+    fn deref(&self) -> &Box<V> {
+        &self.current
+    }
+}
+
+impl<K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<K, V> {
+    fn deref_mut(&mut self) -> &mut Box<V> {
+        &mut self.current
+    }
+}
+
+impl<K, V: ?Sized + 'static> OuterHandle<K, V>
+where
+    K: ReplaceAble<V> + DerefMut<Target = dyn HandleAble<V>> + 'static,
+{
+    /// Mint over a live slot the driver owns (the slot must outlive
+    /// every handle minted over it — the driver's discipline).
+    ///
+    /// # Safety
+    ///
+    /// `slot` must stay live and exclusively reachable through this
+    /// chain for the OuterHandle's whole life.
+    pub unsafe fn over_slot(slot: *mut K) -> Self
+    where
+        K: Sized,
+    {
+        let erased_slot: *mut dyn DerefMut<Target = dyn HandleAble<V>> = slot;
+        // SAFETY: the caller's contract above.
+        let erased: &mut dyn HandleAble<V> = unsafe { &mut **erased_slot };
+        let current = erased.box_innerhandle(erased_slot);
+        OuterHandle { current, _slot: PhantomData }
+    }
+
+    /// The successor install, per the sketch: walk to the slot through
+    /// the CURRENT inner handle's own pointer, swap the slot via
+    /// `K: ReplaceAble<V>`, then re-mint through the replacement's
+    /// `HandleAble` and keep the fresh inner handle in the box.
+    pub fn replace(&mut self, val: Box<dyn HandleAble<V> + 'static>) {
+        // 1) the current inner handle: the box IS one (the OuterHandle's
+        //    invariant); view it as &mut InnerHandle<(), V> to load the
+        //    pointer without naming the state type
+        // SAFETY: OuterHandle's invariant — current is always an
+        // InnerHandle<_, V> minted over a K-shaped slot; viewing it as
+        // InnerHandle<(), V> only reads the ptr field (the () never
+        // derefs — the handle is replaced, not driven, in this method).
+        let current: &mut InnerHandle<(), V> =
+            unsafe { &mut *(self.current.as_mut() as *mut V as *mut InnerHandle<(), V>) };
+        // 2) load its ptr, cast it to the slot
+        // SAFETY: the slot is live and exclusively reachable through
+        // this chain (the mint's discipline; the old inner handle is
+        // about to be dropped with the box swap).
+        let slot: *mut K = current.ptr as *mut K;
+        // 3) swap the slot through ReplaceAble — the slot now HOLDS val
+        // SAFETY: as above — the write lands in the K-shaped slot the
+        // current chain exclusively owns.
+        unsafe { *slot = K::new(val) };
+        // 4) re-mint: use the HandleAble OF val — reachable through the
+        // slot it now lives in (K's own DerefMut) — to create a new
+        // InnerHandle pointing at that same slot, and assign it into
+        // the own box
+        // SAFETY: the mint's discipline over the fresh slot content;
+        // the receiver and the holder pointer derive from the same
+        // raw — one borrow stack.
+        let fresh: Box<V> = unsafe {
+            let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
+            erased.box_innerhandle(slot as *mut dyn DerefMut<Target = dyn HandleAble<V>>)
+        };
+        self.current = fresh;
+    }
+}
 
 /// Anything that can be viewed as an erased `K`, by handing out a
 /// boxed inner handle to it. The `Unsize` where-clause is the whole
