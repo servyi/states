@@ -93,8 +93,34 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 // the payload that matters.
 unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
 
+/// The root task's checkpointing companion: shares the root's
+/// `Shared` (the whole tree's identity). The synchronization
+/// protocol is the next step; this is the carrying shape.
+pub struct Checkpointer {
+    shared: Arc<Shared>,
+}
+
+/// The root task: mint the `OuterHandle` over `slot`, hand the
+/// callback BOTH the outer handle and its `Checkpointer`, and keep
+/// `slot` inaccessible (borrowed) for the whole call — the
+/// discipline is structural, not by-convention.
+pub fn independent_task_root<K, V: ?Sized + 'static, R>(
+    slot: &mut K,
+    f: impl FnOnce(OuterHandle<K, V>, Checkpointer) -> R,
+) -> R
+where
+    K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + 'static,
+{
+    // SAFETY: slot is exclusively borrowed for the whole call (the
+    // fn signature itself); the outer and the checkpointer die
+    // before it returns.
+    let mut outer = unsafe { OuterHandle::over_slot(std::ptr::from_mut(slot)) };
+    // the Checkpointer shares the ROOT's Shared (the chain's origin)
+    let checkpointer = Checkpointer { shared: outer.shared().clone() };
+    f(outer, checkpointer)
+}
+
 impl<K: ?Sized, V: ?Sized> OuterHandle<K, V> {
-    /// The current chain's membership (for registry probes).
     pub fn shared(&self) -> &Arc<Shared> {
         // SAFETY: the box is an InnerHandle<_, V> (the invariant) —
         // reading its status field through the erased view.
