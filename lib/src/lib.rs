@@ -10,14 +10,54 @@
 
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 /// The parking/membership state shared by a handle and its children
 /// (the sketch's `status`): children are weakly registered here —
-/// managed like before, deleted = closed. Management itself is NOT
-/// part of this step; only the structure.
+/// managed like before, deleted = closed.
+///
+/// # The lock convention
+///
+/// The children vec lives behind a Mutex, and every user follows the
+/// same rule to avoid the insert/check deadlock: **open the mutex
+/// only for the immediate operation — insert, or snapshot — and
+/// never hold it across anything that can itself insert** (driving a
+/// child, parking, minting). Checkers snapshot under the lock,
+/// release, then act on the snapshot; mutators insert under the lock
+/// and release. A thread holding the lock while another wants to
+/// insert right before it reads the children's status would deadlock
+/// — the convention above is the guard, and it is easy to maintain
+/// because the lock guard never crosses a call.
 pub struct Shared {
-    children: Vec<Weak<Shared>>,
+    children: Mutex<Vec<Weak<Shared>>>,
+}
+
+impl Shared {
+    fn new() -> Self {
+        Shared { children: Mutex::new(Vec::new()) }
+    }
+
+    /// Register a child (insert under the lock, release — the
+    /// convention). The child stays alive by its owner's Arc.
+    fn register_child(&self, child: &Arc<Shared>) {
+        self.children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Arc::downgrade(child));
+    }
+
+    /// The live (not-yet-dead) children, snapshotted under the lock
+    /// and released — the checker's half of the convention. A Weak
+    /// that no longer upgrades is a closed child (deleted = closed)
+    /// and is skipped.
+    pub fn live_children(&self) -> Vec<Arc<Shared>> {
+        self.children
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
 }
 
 /// Deref/DerefMut land on `T` through the holder chain: the fat
@@ -52,6 +92,17 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 // The marker's K crosses threads only as a type; the box's Send is
 // the payload that matters.
 unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
+
+impl<K: ?Sized, V: ?Sized> OuterHandle<K, V> {
+    /// The current chain's membership (for registry probes).
+    pub fn shared(&self) -> &Arc<Shared> {
+        // SAFETY: the box is an InnerHandle<_, V> (the invariant) —
+        // reading its status field through the erased view.
+        unsafe {
+            &(*(self.current.as_ref() as *const V as *const InnerHandle<(), V>)).status
+        }
+    }
+}
 
 impl<K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<K, V> {
     type Target = V;
@@ -91,7 +142,7 @@ where
         // SAFETY: the caller's contract above.
         let erased: &mut dyn HandleAble<V> = unsafe { &mut **erased_slot };
         // the chain's ORIGIN: a fresh root Shared moves in
-        let shared = Arc::new(Shared { children: Vec::new() });
+        let shared = Arc::new(Shared::new());
         let current = erased.box_innerhandle(erased_slot, shared);
         OuterHandle { current, _slot: PhantomData }
     }
@@ -235,7 +286,6 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         // MINT THE BOXES: each slot becomes a Box<V> via the blanket
         // impl — the receiver derives from the raw (one borrow
         // stack), the holder pointer is the raw itself.
-        let parent_shared = self.status.clone();
         let boxes: Vec<Box<V>> = child_raws
             .into_iter()
             .map(|raw| {
@@ -243,7 +293,12 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                     // SAFETY: the split yielded each child exactly
                     // once, disjointly; exclusive for this mint.
                     unsafe { &mut **raw };
-                erased.box_innerhandle(raw, parent_shared.clone())
+                // each child gets its OWN Shared (its parking
+                // identity), weakly registered into the parent's vec
+                // — insert under the lock, release (the convention)
+                let child_shared = Arc::new(Shared::new());
+                self.status.register_child(&child_shared);
+                erased.box_innerhandle(raw, child_shared)
             })
             .collect();
         // THEN THREADS: one dedicated scoped thread per box (std, per
@@ -281,5 +336,37 @@ impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
         // 3) cast that into &mut T
         // SAFETY: as Deref — exclusive, the minted-for T.
         unsafe { &mut *(erased as *mut dyn HandleAble<V> as *mut T) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Two live children registered, snapshot sees both.
+    #[test]
+    fn registry_snapshots_live_children() {
+        let parent = Arc::new(Shared::new());
+        let a = Arc::new(Shared::new());
+        let b = Arc::new(Shared::new());
+        parent.register_child(&a);
+        parent.register_child(&b);
+        assert_eq!(parent.live_children().len(), 2);
+    }
+
+    /// A dropped child is closed: its Weak no longer upgrades, the
+    /// snapshot skips it (deleted = closed) — no lock is held while
+    /// the child dies (the convention).
+    #[test]
+    fn dropped_child_is_closed() {
+        let parent = Arc::new(Shared::new());
+        let transient = Arc::new(Shared::new());
+        let keeper = Arc::new(Shared::new());
+        parent.register_child(&transient);
+        parent.register_child(&keeper);
+        drop(transient);
+        let live = parent.live_children();
+        assert_eq!(live.len(), 1);
+        assert!(Arc::ptr_eq(&live[0], &keeper));
     }
 }

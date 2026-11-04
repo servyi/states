@@ -48,7 +48,14 @@ fn main() {
         child: Box::new(YourStruct { val: 5 }),
     });
     let mut outer = outer_over(&mut m);
+    // bark fans the child out: the child registers into the parent's
+    // vec — observable via the live_children snapshot (under the
+    // lock, released — the convention)
     outer.bark();
+    // the fanout's children are TRANSIENT: joined and dropped inside
+    // bark, so their Weaks are dead here (deleted = closed) — 0.
+    let kids = outer.shared().live_children();
+    println!("live children after fanout: {}", kids.len());
     // THE INSTALL: the OuterHandle walks to the slot through the
     // current inner handle, swaps it, re-mints, keeps the fresh one
     let successor: Slot = Box::new(YourStruct { val: 42 });
