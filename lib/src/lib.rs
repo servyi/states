@@ -52,23 +52,22 @@ unsafe impl<K: ?Sized, T: ?Sized + Send, V: ?Sized> Send for InnerHandle<K, T, V
 /// Raw aliases cannot express that (E0391 cycle); a NEWTYPE can
 /// (the linked-list indirection), so the intended K in practice is
 /// the newtype wrapping that Box.
+/// # Safety
+///
+/// `holder` must point at the holder exclusively-live for the minted
+/// handle's whole life, holding `Self` at mint time.
 pub unsafe trait HandleAble<K: ?Sized, V: ?Sized>: Send {
-    /// # Safety
-    ///
-    /// `holder` must point at the holder exclusively-live for the
-    /// minted handle's whole life, holding `Self` at mint time.
     fn box_innerhandle(&mut self, holder: *mut K) -> Box<V>;
 }
 
 /// A holder that can REPLACE itself with a fresh `T` (the successor
 /// install): `new<T: HandleAble<K, V>>(T) -> K`. The K parameter
 /// is the holder being replaced (Self's own type).
+/// # Safety
+///
+/// The replacement must be held exclusively by the new Self; the
+/// caller must have dropped every handle minted over the old content.
 pub unsafe trait ReplaceAble<K: ?Sized, V: ?Sized> {
-    /// # Safety
-    ///
-    /// The replacement must be held exclusively by the new Self; the
-    /// caller must have dropped every handle minted over the old
-    /// content.
     fn new(replacement: Box<dyn HandleAble<K, V> + 'static>) -> Self
     where
         Self: Sized;
