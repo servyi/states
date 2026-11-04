@@ -264,13 +264,14 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// the demo — any DerefMut-to-dyn holder works). Each element
     /// becomes a `Box<V>` via `box_innerhandle`, and `f` runs on one
     /// scoped thread per box.
-    pub fn fanout<F>(
+    pub fn fanout<K, F>(
         &mut self,
-        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut ErasedSlot<V>> + Send + Sync),
+        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync),
         f: F,
     ) where
         T: Send,
         V: Send,
+        K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
         F: Fn(Box<V>) + Send + Sync,
     {
         // Collect offsite under the &mut node borrow (the root's
@@ -279,7 +280,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         // the receiver (`&mut **raw`, a Unique DERIVED from the raw)
         // and the holder pointer (`raw` itself) live in the same
         // borrow stack — no sibling retag ever invalidates the other.
-        let child_raws: Vec<*mut ErasedSlot<V>> = {
+        let child_raws: Vec<*mut K> = {
             let node: &mut T = self;
             split(node).into_iter().map(std::ptr::from_mut).collect()
         };
@@ -289,16 +290,20 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         let boxes: Vec<Box<V>> = child_raws
             .into_iter()
             .map(|raw| {
-                let erased: &mut dyn HandleAble<V> =
-                    // SAFETY: the split yielded each child exactly
-                    // once, disjointly; exclusive for this mint.
-                    unsafe { &mut **raw };
+                // the erased SLOT pointer first (raw, no borrow):
+                // SAFETY: the split yielded each child exactly
+                // once, disjointly; exclusive for this mint.
+                let slot_ptr: *mut ErasedSlot<V> = raw as *mut ErasedSlot<V>;
+                // the erased receiver: through the slot's own
+                // DerefMut — derived from the raw, one borrow stack
+                // SAFETY: as above.
+                let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)
                 let child_shared = Arc::new(Shared::new());
                 self.status.register_child(&child_shared);
-                erased.box_innerhandle(raw, child_shared)
+                erased.box_innerhandle(slot_ptr, child_shared)
             })
             .collect();
         // THEN THREADS: one dedicated scoped thread per box (std, per

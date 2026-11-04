@@ -1,8 +1,6 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use std::ops::DerefMut;
-
 use hslib::{HandleAble, InnerHandle, OuterHandle};
 
 trait Trait: Send {
@@ -25,14 +23,10 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) {
         println!("MyStruct");
         self.fanout(
-            &|m: &mut MyStruct| {
-                // per-element coercion (collect won't unsized-coerce):
-                // &mut Box<...> -> &mut *box -> &mut dyn DerefMut<...>
-                m.children
-                    .iter_mut()
-                    .map(|s| &mut *s as &mut dyn DerefMut<Target = dyn HandleAble<dyn Trait>>)
-                    .collect()
-            },
+            // &mut K directly — K = Slot; the library does the
+            // erased coercion internally. iter_mut().collect() just
+            // works now (no unsized coercion needed at the call site).
+            &|m: &mut MyStruct| m.children.iter_mut().collect(),
             |mut b: Box<dyn Trait>| b.bark(),
         );
     }
