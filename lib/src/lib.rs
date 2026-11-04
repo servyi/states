@@ -54,15 +54,21 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
 
 impl<K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<K, V> {
-    type Target = Box<V>;
-    fn deref(&self) -> &Box<V> {
-        &self.current
+    type Target = V;
+    fn deref(&self) -> &V {
+        // the box is the load-bearing invariant (always an
+        // InnerHandle<_, V> over the K-shaped slot) — deref lands on
+        // the V through it, the box itself is never handed out
+        // SAFETY: the box holds an InnerHandle<_, V> (the invariant);
+        // viewing it as the V it erases is the Unsize correspondence.
+        unsafe { &*(self.current.as_ref() as *const V) }
     }
 }
 
 impl<K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<K, V> {
-    fn deref_mut(&mut self) -> &mut Box<V> {
-        &mut self.current
+    fn deref_mut(&mut self) -> &mut V {
+        // SAFETY: as Deref — exclusive.
+        unsafe { &mut *(self.current.as_mut() as *mut V) }
     }
 }
 
