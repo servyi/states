@@ -57,7 +57,7 @@ impl Trait for InnerHandle<Holder<dyn Trait>, YourStruct, dyn Trait> {
 fn main() {
     // the roots are stored erased (the tree's shape): the mint
     // receives the box SLOT, the handle points there
-    let mut m: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> =
+    let m: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> =
         Box::new(MyStruct {
             child: Holder(Box::new(YourStruct { val: 5 })),
         });
@@ -73,7 +73,7 @@ fn main() {
     let mut h: Box<dyn Trait> = erased.box_innerhandle(root_holder);
     h.bark();
 
-    let mut y: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> = Box::new(YourStruct { val: 5 });
+    let y: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> = Box::new(YourStruct { val: 5 });
     let mut root_y = Holder(y);
     let y_holder: *mut Holder<dyn Trait> = &mut root_y;
     let erased_y: &mut dyn HandleAble<Holder<dyn Trait>, dyn Trait> = &mut *root_y.0;
