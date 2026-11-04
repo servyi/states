@@ -315,9 +315,8 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         // THEN THREADS: one dedicated scoped thread per outer (std, per
         // the 23:55 step — rayon left only noise in Miri)
         std::thread::scope(|scope| {
-            let f = &f;
             for o in outers {
-                scope.spawn(move || f(o));
+                scope.spawn(|| f(o));
             }
         });
     }
