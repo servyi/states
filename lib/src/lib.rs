@@ -14,8 +14,10 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
 
 /// The parking/membership state shared by a handle and its children
-/// (the sketch's `status`): children are weakly registered here —
-/// managed like before, deleted = closed.
+/// (the sketch's `status`): children are weakly registered here.
+/// A child's `Shared` stays alive only while its own handle does —
+/// the registry keeps no strong reference, so a dead child is one
+/// whose Weak no longer upgrades.
 ///
 /// # The lock convention
 ///
@@ -30,27 +32,23 @@ use std::time::Duration;
 /// — the convention above is the guard, and it is easy to maintain
 /// because the lock guard never crosses a call.
 ///
-/// # The handshake protocol (first draft: the protocol on main)
+/// # The handshake protocol (the simplified requester side)
 ///
-/// A requester (the `Checkpointer`) sets `pending_request` and waits
-/// for the mutator to park; a mutator parks at its `safepoint`s (and
-/// a fan-out parent in its join loop) — children first, then itself —
-/// and resumes its children once it runs again. `closed` marks a
-/// mutator that is gone for good: a parent waiting for it to park
-/// sees it instead of blocking forever.
+/// A requester sets `pending_request` and waits for the mutator to
+/// park; a mutator parks at its `safepoint`s (and a fan-out parent in
+/// its join loop) — children first, then itself — and resumes its
+/// children once it runs again. There is no `closed` flag: the
+/// requester side NEVER holds an `Arc`/`&Shared` across a wait — it
+/// looks the mutator up through the Weak each round, with every CV
+/// wait bounded by [`REQUEST_WAIT_MS`]. A mutator that drops in an
+/// inopportune moment (never parking again) therefore does not hang
+/// anyone: its drop releases the last strong `Arc`, the next Weak
+/// lookup fails, and the requester learns it is gone.
 pub struct Shared {
     children: Mutex<Vec<Weak<Shared>>>,
     /// A checkpoint has been requested: mutators park at the next
     /// safepoint.
     pending_request: std::sync::atomic::AtomicBool,
-    /// The owning mutator (outer handle) is dropped: it will never
-    /// park again — access is free.
-    closed: std::sync::atomic::AtomicBool,
-    /// Serializes requesters for a whole guard's lifetime: a request
-    /// made while a guard is out would be swallowed (mutators park
-    /// only once) and its requester would wait forever. The mutator
-    /// never takes this lock.
-    request_lock: Mutex<()>,
     /// Poisoning invariant: only pure bool stores/loads and condvar
     /// waits run under this lock — no code that can panic ever holds
     /// it, so the lock cannot be poisoned.
@@ -59,33 +57,33 @@ pub struct Shared {
     resume_cv: Condvar,
 }
 
-/// Outcome of the stop request handshake (main's shape).
+/// Outcome of the stop request handshake.
 enum Handshake {
     /// The mutator is parked and holds no references.
     Parked,
-    /// The mutator is gone (its outer handle was dropped) — it will
-    /// never park again; access is free.
+    /// The Weak no longer upgrades: the mutator side is gone (its
+    /// drop released the last strong `Arc`) — it will never park
+    /// again; access is free.
     Closed,
 }
 
 /// How long the join loop sleeps between finished-checks (main's).
 const JOIN_POLL_INTERVAL_MS: u64 = 1;
 
+/// How long any requester-side CV wait may block before the Weak is
+/// consulted again — the whole death-detection scheme rides on this
+/// being short.
+const REQUEST_WAIT_MS: u64 = 10;
+
 impl Shared {
     fn new() -> Self {
         Shared {
             children: Mutex::new(Vec::new()),
             pending_request: std::sync::atomic::AtomicBool::new(false),
-            closed: std::sync::atomic::AtomicBool::new(false),
-            request_lock: Mutex::new(()),
             parked: Mutex::new(false),
             park_cv: Condvar::new(),
             resume_cv: Condvar::new(),
         }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.closed.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn is_pending(&self) -> bool {
@@ -98,63 +96,23 @@ impl Shared {
         self.parked.lock().expect("parked handshake lock: see lock_parked's invariant")
     }
 
-    /// Wait for the other side to park.
-    fn wait_park<'g>(&self, parked: MutexGuard<'g, bool>) -> MutexGuard<'g, bool> {
-        self.park_cv.wait(parked).expect("parked handshake: see lock_parked's invariant")
-    }
-
-    /// Wait for the request to be released.
+    /// Wait for the request to be released (the MUTATOR side wait —
+    /// untimed on purpose: only the requester side must re-look
+    /// through the Weak, and only its waits carry the death window).
     fn wait_resume<'g>(&self, parked: MutexGuard<'g, bool>) -> MutexGuard<'g, bool> {
         self.resume_cv.wait(parked).expect("parked handshake: see lock_parked's invariant")
     }
 
-    /// THE stop request: set the flag and wait until the mutator parks
-    /// or closes. The one implementation of the request half of the
-    /// handshake.
-    fn request_until_parked(&self) -> Handshake {
-        self.pending_request.store(true, std::sync::atomic::Ordering::SeqCst);
-        let mut parked = self.lock_parked();
-        loop {
-            if *parked {
-                return Handshake::Parked;
-            }
-            if self.is_closed() {
-                self.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
-                return Handshake::Closed;
-            }
-            parked = self.wait_park(parked);
-        }
-    }
-
-    /// THE release: wake the parked side and wait until it has
-    /// resumed. Flag update and notify are atomic with the parked
-    /// thread's check-then-wait (both under the `parked` mutex).
-    fn release_request(&self) {
-        let mut parked = self.lock_parked();
-        self.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
-        self.resume_cv.notify_all();
-        while *parked && !self.is_closed() {
-            parked = self.wait_park(parked);
-        }
-    }
-
-    /// Mark this mutator closed and wake anyone waiting for it to park.
-    fn close(&self) {
-        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
-        let _guard = self.lock_parked();
-        self.park_cv.notify_all();
-    }
-
-    /// The parking dance (main's `park_self_fields`, children from the
-    /// registry): request every open child subtree first (bottom-up),
-    /// then this thread; resume the children after it runs again.
+    /// The parking dance (children from the registry): request every
+    /// still-live child subtree first (bottom-up), then this thread;
+    /// resume the children after it runs again.
     fn park_self(&self) {
-        // snapshot under the lock, release — the convention — then act
-        let children = self.live_children();
-        for child in children.iter() {
-            if !child.is_closed() {
-                let _ = child.request_until_parked();
-            }
+        // snapshot the Weaks under the lock, release — the convention —
+        // then act; a Weak that stops upgrading mid-dance is a child
+        // that died, skipped by the lookup itself
+        let children = self.child_weaks();
+        for weak in children.iter() {
+            let _ = request_until_parked(weak);
         }
         let mut parked = self.lock_parked();
         *parked = true;
@@ -164,9 +122,9 @@ impl Shared {
         }
         *parked = false;
         self.park_cv.notify_all();
-        for child in children.iter() {
-            if !child.is_closed() {
-                child.release_request();
+        for weak in children.iter() {
+            if let Some(child) = weak.upgrade() {
+                release_request(&child);
             }
         }
     }
@@ -180,18 +138,64 @@ impl Shared {
             .push(Arc::downgrade(child));
     }
 
-    /// The live (not-yet-dead) children, snapshotted under the lock
-    /// and released — the checker's half of the convention. A Weak
-    /// that no longer upgrades is a closed child (deleted = closed)
-    /// and is skipped.
-    pub fn live_children(&self) -> Vec<Arc<Shared>> {
+    /// The registered children as Weaks, cloned under the lock and
+    /// released — the requester-side half of the convention: no Arc
+    /// leaves this method, so a child can die under our feet and the
+    /// next upgrade simply fails.
+    fn child_weaks(&self) -> Vec<Weak<Shared>> {
         self.children
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter_map(Weak::upgrade)
-            .collect()
+            .clone()
     }
+}
+
+/// THE stop request, the requester side: set the flag and wait until
+/// the mutator parks — or the Weak stops upgrading. Never holds an
+/// `Arc`/`&Shared` across a wait: each round looks the mutator up
+/// fresh, and every CV wait is bounded by [`REQUEST_WAIT_MS`], so a
+/// mutator that drops without parking is noticed on the next lookup
+/// instead of hanging the requester forever.
+fn request_until_parked(weak: &Weak<Shared>) -> Handshake {
+    // the flag first; the mutator keeps its own Arc while it runs,
+    // so the Shared cannot die here unless the mutator is already
+    // gone (in which case the store was on a Shared the mutator still
+    // owned a moment ago — or nobody's, see the lookup below)
+    if let Some(shared) = weak.upgrade() {
+        shared.pending_request.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    loop {
+        let Some(shared) = weak.upgrade() else {
+            return Handshake::Closed;
+        };
+        let parked = shared.lock_parked();
+        if *parked {
+            // returning with the flag set: the mutator stays parked
+            // until OUR release clears it
+            return Handshake::Parked;
+        }
+        let (guard, _) = shared
+            .park_cv
+            .wait_timeout(parked, Duration::from_millis(REQUEST_WAIT_MS))
+            .expect("parked handshake: see lock_parked's invariant");
+        // drop the guard AND the Arc before looking again — the death
+        // window is exactly this gap
+        drop(guard);
+        drop(shared);
+    }
+}
+
+/// THE release (requester side): wake the parked side. No wait for
+/// the resume — waiting would hold the `&Shared` across a wait. The
+/// parked side re-checks the flag under its own wait loop, so a
+/// follow-up request that re-sets the flag before the parked thread
+/// wakes keeps it parked: back-to-back guards hand off seamlessly
+/// without the requester ever observing the resume.
+fn release_request(shared: &Shared) {
+    let parked = shared.lock_parked();
+    shared.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
+    shared.resume_cv.notify_all();
+    drop(parked);
 }
 
 /// Deref/DerefMut land on `T` through the holder chain: the fat
@@ -227,14 +231,23 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 // the payload that matters.
 unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
 
-/// The root task's checkpointing companion: shares the root's
-/// `Shared` (the whole tree's identity) and points at the root slot —
-/// the stable storage `independent_task_root` borrows for the whole
-/// task. `request` runs the stop-the-world handshake and hands back a
+/// The root task's checkpointing companion: knows the root only
+/// through a **Weak** (the mutator side owns the last strong `Arc` —
+/// its drop IS the close) and points at the root slot — the stable
+/// storage `independent_task_root` borrows for the whole task.
+/// `request` runs the stop-the-world handshake and hands back a
 /// guard with direct access to the slot while every mutator parks.
+///
+/// Requester serialization lives in `gate`, shared by every clone —
+/// two concurrent requesters must not both observe `Parked` (each
+/// would take a guard over the same stopped world). It was `Shared`'s
+/// `request_lock`; the guard can no longer borrow a lock out of a
+/// `Shared` the requester only holds weakly, so the gate moved here.
+/// The mutator never takes it, as before.
 pub struct Checkpointer<K, V: ?Sized> {
     slot: *mut K,
-    shared: Arc<Shared>,
+    weak: Weak<Shared>,
+    gate: Arc<Mutex<()>>,
     _marker: PhantomData<fn(*mut K, *mut V)>,
 }
 
@@ -247,7 +260,12 @@ unsafe impl<K: Send, V: ?Sized> Sync for Checkpointer<K, V> {}
 
 impl<K, V: ?Sized> Clone for Checkpointer<K, V> {
     fn clone(&self) -> Self {
-        Self { slot: self.slot, shared: self.shared.clone(), _marker: PhantomData }
+        Self {
+            slot: self.slot,
+            weak: self.weak.clone(),
+            gate: self.gate.clone(),
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -255,34 +273,36 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
     /// Perform the stop-the-world handshake: request all mutators to
     /// park (the top handle parks its subtree first) and return a
     /// guard with direct access to the root slot. Blocks until
-    /// parked. A closed tree (mutator side dropped) hands out the
-    /// guard at once. Concurrent `request`s serialize internally: a
-    /// second request blocks until the first guard is dropped and the
-    /// world resumed.
+    /// parked. A gone tree (mutator side dropped, the Weak empty)
+    /// hands out the guard at once — nothing will ever mutate again.
+    /// Concurrent `request`s serialize on the gate: a second request
+    /// blocks until the first guard is dropped and the world resumed.
     pub fn request(&self) -> CheckpointGuard<'_, K> {
-        // Closed is not a failure: the mutator side is gone and will
-        // never mutate again, so access is free — hand out the guard
-        // at once.
-        if self.shared.is_closed() {
-            let request_lock = self.shared.request_lock.lock().unwrap_or_else(|e| e.into_inner());
-            if self.shared.is_pending() {
-                self.shared.release_request();
+        // held for the whole guard life — the serialization
+        let request_lock = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        // a stale pending from a requester that died mid-handshake:
+        // reset the world before asking again (the mutator, parked
+        // under that dead request, re-checks the flag and resumes)
+        if let Some(shared) = self.weak.upgrade() {
+            if shared.is_pending() {
+                release_request(&shared);
             }
-            return CheckpointGuard {
+            drop(shared);
+        }
+        match request_until_parked(&self.weak) {
+            Handshake::Parked => CheckpointGuard {
                 slot: self.slot,
-                shared: &self.shared,
+                // the mutator is parked under OUR pending — its own
+                // Arc keeps the Shared alive, so the lookup cannot
+                // fail here; held for the guard's life so the drop's
+                // release lands on a live Shared
+                shared: self.weak.upgrade(),
                 request_lock,
                 _marker: PhantomData,
-            };
-        }
-        let request_lock = self.shared.request_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if self.shared.is_pending() {
-            self.shared.release_request();
-        }
-        match self.shared.request_until_parked() {
-            Handshake::Parked | Handshake::Closed => CheckpointGuard {
+            },
+            Handshake::Closed => CheckpointGuard {
                 slot: self.slot,
-                shared: &self.shared,
+                shared: None,
                 request_lock,
                 _marker: PhantomData,
             },
@@ -296,7 +316,10 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
 /// Dropping the guard resumes the world.
 pub struct CheckpointGuard<'a, K> {
     slot: *mut K,
-    shared: &'a Shared,
+    /// Some: the world is stopped under our request — the drop
+    /// releases it. None: the mutator side was already gone — access
+    /// is free and the drop has nothing to resume.
+    shared: Option<Arc<Shared>>,
     /// Held for the guard's whole life: concurrent requesters block
     /// until this guard (and therefore the stop it caused) is done.
     /// Never read — its existence IS the lock.
@@ -309,8 +332,8 @@ impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
     type Target = K;
     fn deref(&self) -> &K {
         // SAFETY: the guard exists only while the handshake proved
-        // every mutator parked; the reborrow is tied to the guard, so
-        // the world cannot resume underneath it.
+        // every mutator parked (or gone); the reborrow is tied to the
+        // guard, so the world cannot resume underneath it.
         unsafe { &*self.slot }
     }
 }
@@ -326,7 +349,9 @@ impl<K> std::ops::DerefMut for CheckpointGuard<'_, K> {
 
 impl<K> Drop for CheckpointGuard<'_, K> {
     fn drop(&mut self) {
-        self.shared.release_request();
+        if let Some(shared) = self.shared.take() {
+            release_request(&shared);
+        }
         // request_lock drops with the struct, releasing the requesters.
     }
 }
@@ -350,12 +375,13 @@ where
     // before it returns.
     let slot_ptr: *mut K = std::ptr::from_mut(slot);
     let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
-    // the Checkpointer guards the ROOT SLOT (stable for the whole
-    // task — the borrow is the discipline) and shares the root's
-    // Shared (the chain's origin)
+    // the Checkpointer knows the root's Shared only WEAKLY — the
+    // outer's own Arc is the last strong one, so its drop IS the
+    // close; the gate serializes the requester side (see Checkpointer)
     let checkpointer = Checkpointer {
         slot: slot_ptr,
-        shared: outer.shared().clone(),
+        weak: Arc::downgrade(outer.shared()),
+        gate: Arc::new(Mutex::new(())),
         _marker: PhantomData,
     };
     f(outer, checkpointer)
@@ -368,16 +394,6 @@ impl<K: ?Sized, V: ?Sized> OuterHandle<K, V> {
         unsafe {
             &(*(self.current.as_ref() as *const V as *const InnerHandle<(), V>)).status
         }
-    }
-}
-
-impl<K: ?Sized, V: ?Sized> Drop for OuterHandle<K, V> {
-    fn drop(&mut self) {
-        // A parent waiting to park this subtree must observe the close
-        // instead of blocking on a park that will never come. The
-        // OUTER closes (not the inner: replace() swaps inner handles
-        // while the chain — and its mutator — lives on).
-        self.shared().close();
     }
 }
 
@@ -657,23 +673,24 @@ impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
 mod tests {
     use super::*;
 
-    /// Two live children registered, snapshot sees both.
+    /// Two registered children, both listed in the Weak snapshot.
     #[test]
-    fn registry_snapshots_live_children() {
+    fn registry_lists_children() {
         let parent = Arc::new(Shared::new());
         let a = Arc::new(Shared::new());
         let b = Arc::new(Shared::new());
         parent.register_child(&a);
         parent.register_child(&b);
-        assert_eq!(parent.live_children().len(), 2);
+        assert_eq!(parent.child_weaks().len(), 2);
     }
 
-    /// The handshake dance, thread-to-Shared: a mutator that parks at
+    /// The handshake dance, thread-to-Weak: a mutator that parks at
     /// its safepoint releases the requester's `request_until_parked`,
     /// and the requester's release lets the mutator run again.
     #[test]
     fn handshake_parks_and_resumes() {
         let shared = Arc::new(Shared::new());
+        let weak = Arc::downgrade(&shared);
         let mutator = shared.clone();
         let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let saw_park = parked.clone();
@@ -687,43 +704,52 @@ mod tests {
             mutator.park_self();
             saw_park.store(true, std::sync::atomic::Ordering::SeqCst);
         });
-        // the requester: waits until the mutator parks
-        let _ = shared.request_until_parked();
+        // the requester: waits until the mutator parks (through the
+        // weak, like every requester-side look)
+        match request_until_parked(&weak) {
+            Handshake::Parked => {}
+            Handshake::Closed => panic!("live mutator answered Closed"),
+        }
         // release: the mutator runs again and finishes
-        shared.release_request();
+        release_request(&shared);
         side.join().expect("mutator panicked");
         assert!(parked.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// A closed mutator answers a request with Closed instead of
-    /// blocking forever.
+    /// A gone mutator (its Arc dropped) answers a request with Closed
+    /// instead of blocking — the real death-detection path.
     #[test]
-    fn closed_mutator_never_blocks() {
-        let shared = Arc::new(Shared::new());
-        shared.close();
-        // request_until_parked on a closed side returns promptly
-        let mut saw_closed = false;
-        // (park_self on a closed side is never called; the requester
-        // path observes the flag)
-        if shared.is_closed() {
-            saw_closed = true;
+    fn gone_mutator_never_blocks() {
+        let weak = {
+            let shared = Arc::new(Shared::new());
+            Arc::downgrade(&shared)
+            // the last strong Arc dies here: the mutator side is gone
+        };
+        match request_until_parked(&weak) {
+            Handshake::Closed => {}
+            Handshake::Parked => panic!("a gone mutator cannot park"),
         }
-        assert!(saw_closed);
     }
 
-    /// A dropped child is closed: its Weak no longer upgrades, the
-    /// snapshot skips it (deleted = closed) — no lock is held while
-    /// the child dies (the convention).
+    /// A dropped child is gone: its Weak no longer upgrades — still
+    /// listed in the registry, but the parking request skips it (the
+    /// lookup itself is the skip).
     #[test]
-    fn dropped_child_is_closed() {
+    fn dropped_child_is_gone() {
         let parent = Arc::new(Shared::new());
         let transient = Arc::new(Shared::new());
         let keeper = Arc::new(Shared::new());
         parent.register_child(&transient);
         parent.register_child(&keeper);
+        let transient_weak = Arc::downgrade(&transient);
         drop(transient);
-        let live = parent.live_children();
-        assert_eq!(live.len(), 1);
-        assert!(Arc::ptr_eq(&live[0], &keeper));
+        assert!(transient_weak.upgrade().is_none());
+        // the registry entry survives (a Weak can), the child doesn't
+        assert_eq!(parent.child_weaks().len(), 2);
+        // and the request through it answers Closed, not a hang
+        match request_until_parked(&transient_weak) {
+            Handshake::Closed => {}
+            Handshake::Parked => panic!("a dropped child cannot park"),
+        }
     }
 }
