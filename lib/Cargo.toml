@@ -2,7 +2,6 @@
 name = "hslib"
 version = "0.1.0"
 edition = "2021"
-rayon = "1.12"
 
 [dependencies]
 rayon = "1"
