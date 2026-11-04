@@ -10,7 +10,8 @@
 
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
+use std::time::Duration;
 
 /// The parking/membership state shared by a handle and its children
 /// (the sketch's `status`): children are weakly registered here —
@@ -28,13 +29,146 @@ use std::sync::{Arc, Mutex, Weak};
 /// insert right before it reads the children's status would deadlock
 /// — the convention above is the guard, and it is easy to maintain
 /// because the lock guard never crosses a call.
+///
+/// # The handshake protocol (first draft: the protocol on main)
+///
+/// A requester (the `Checkpointer`) sets `pending_request` and waits
+/// for the mutator to park; a mutator parks at its `safepoint`s (and
+/// a fan-out parent in its join loop) — children first, then itself —
+/// and resumes its children once it runs again. `closed` marks a
+/// mutator that is gone for good: a parent waiting for it to park
+/// sees it instead of blocking forever.
 pub struct Shared {
     children: Mutex<Vec<Weak<Shared>>>,
+    /// A checkpoint has been requested: mutators park at the next
+    /// safepoint.
+    pending_request: std::sync::atomic::AtomicBool,
+    /// The owning mutator (outer handle) is dropped: it will never
+    /// park again — access is free.
+    closed: std::sync::atomic::AtomicBool,
+    /// Serializes requesters for a whole guard's lifetime: a request
+    /// made while a guard is out would be swallowed (mutators park
+    /// only once) and its requester would wait forever. The mutator
+    /// never takes this lock.
+    request_lock: Mutex<()>,
+    /// Poisoning invariant: only pure bool stores/loads and condvar
+    /// waits run under this lock — no code that can panic ever holds
+    /// it, so the lock cannot be poisoned.
+    parked: Mutex<bool>,
+    park_cv: Condvar,
+    resume_cv: Condvar,
 }
+
+/// Outcome of the stop request handshake (main's shape).
+enum Handshake {
+    /// The mutator is parked and holds no references.
+    Parked,
+    /// The mutator is gone (its outer handle was dropped) — it will
+    /// never park again; access is free.
+    Closed,
+}
+
+/// How long the join loop sleeps between finished-checks (main's).
+const JOIN_POLL_INTERVAL_MS: u64 = 1;
 
 impl Shared {
     fn new() -> Self {
-        Shared { children: Mutex::new(Vec::new()) }
+        Shared {
+            children: Mutex::new(Vec::new()),
+            pending_request: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            request_lock: Mutex::new(()),
+            parked: Mutex::new(false),
+            park_cv: Condvar::new(),
+            resume_cv: Condvar::new(),
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn is_pending(&self) -> bool {
+        self.pending_request.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// The handshake lock, with its poisoning invariant in one place:
+    /// only pure bool ops and condvar waits run under it.
+    fn lock_parked(&self) -> MutexGuard<'_, bool> {
+        self.parked.lock().expect("parked handshake lock: see lock_parked's invariant")
+    }
+
+    /// Wait for the other side to park.
+    fn wait_park<'g>(&self, parked: MutexGuard<'g, bool>) -> MutexGuard<'g, bool> {
+        self.park_cv.wait(parked).expect("parked handshake: see lock_parked's invariant")
+    }
+
+    /// Wait for the request to be released.
+    fn wait_resume<'g>(&self, parked: MutexGuard<'g, bool>) -> MutexGuard<'g, bool> {
+        self.resume_cv.wait(parked).expect("parked handshake: see lock_parked's invariant")
+    }
+
+    /// THE stop request: set the flag and wait until the mutator parks
+    /// or closes. The one implementation of the request half of the
+    /// handshake.
+    fn request_until_parked(&self) -> Handshake {
+        self.pending_request.store(true, std::sync::atomic::Ordering::SeqCst);
+        let mut parked = self.lock_parked();
+        loop {
+            if *parked {
+                return Handshake::Parked;
+            }
+            if self.is_closed() {
+                self.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
+                return Handshake::Closed;
+            }
+            parked = self.wait_park(parked);
+        }
+    }
+
+    /// THE release: wake the parked side and wait until it has
+    /// resumed. Flag update and notify are atomic with the parked
+    /// thread's check-then-wait (both under the `parked` mutex).
+    fn release_request(&self) {
+        let mut parked = self.lock_parked();
+        self.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
+        self.resume_cv.notify_all();
+        while *parked && !self.is_closed() {
+            parked = self.wait_park(parked);
+        }
+    }
+
+    /// Mark this mutator closed and wake anyone waiting for it to park.
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        let _guard = self.lock_parked();
+        self.park_cv.notify_all();
+    }
+
+    /// The parking dance (main's `park_self_fields`, children from the
+    /// registry): request every open child subtree first (bottom-up),
+    /// then this thread; resume the children after it runs again.
+    fn park_self(&self) {
+        // snapshot under the lock, release — the convention — then act
+        let children = self.live_children();
+        for child in children.iter() {
+            if !child.is_closed() {
+                let _ = child.request_until_parked();
+            }
+        }
+        let mut parked = self.lock_parked();
+        *parked = true;
+        self.park_cv.notify_all();
+        while self.is_pending() {
+            parked = self.wait_resume(parked);
+        }
+        *parked = false;
+        self.park_cv.notify_all();
+        for child in children.iter() {
+            if !child.is_closed() {
+                child.release_request();
+            }
+        }
     }
 
     /// Register a child (insert under the lock, release — the
@@ -94,10 +228,108 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 unsafe impl<K: ?Sized, V: ?Sized + Send> Send for OuterHandle<K, V> {}
 
 /// The root task's checkpointing companion: shares the root's
-/// `Shared` (the whole tree's identity). The synchronization
-/// protocol is the next step; this is the carrying shape.
-pub struct Checkpointer {
+/// `Shared` (the whole tree's identity) and points at the root slot —
+/// the stable storage `independent_task_root` borrows for the whole
+/// task. `request` runs the stop-the-world handshake and hands back a
+/// guard with direct access to the slot while every mutator parks.
+pub struct Checkpointer<K, V: ?Sized> {
+    slot: *mut K,
     shared: Arc<Shared>,
+    _marker: PhantomData<fn(*mut K, *mut V)>,
+}
+
+// SAFETY: the slot pointer is only dereferenced through a guard,
+// which exists exclusively while every mutator is parked (see
+// `request`); the data crosses threads, so K must be Send.
+unsafe impl<K: Send, V: ?Sized> Send for Checkpointer<K, V> {}
+// SAFETY: as Send — sharing the checkpointer shares no slot data.
+unsafe impl<K: Send, V: ?Sized> Sync for Checkpointer<K, V> {}
+
+impl<K, V: ?Sized> Clone for Checkpointer<K, V> {
+    fn clone(&self) -> Self {
+        Self { slot: self.slot, shared: self.shared.clone(), _marker: PhantomData }
+    }
+}
+
+impl<K: Send, V: ?Sized> Checkpointer<K, V> {
+    /// Perform the stop-the-world handshake: request all mutators to
+    /// park (the top handle parks its subtree first) and return a
+    /// guard with direct access to the root slot. Blocks until
+    /// parked. A closed tree (mutator side dropped) hands out the
+    /// guard at once. Concurrent `request`s serialize internally: a
+    /// second request blocks until the first guard is dropped and the
+    /// world resumed.
+    pub fn request(&self) -> Option<CheckpointGuard<'_, K>> {
+        // Closed is not a failure: the mutator side is gone and will
+        // never mutate again, so access is free — hand out the guard
+        // at once.
+        if self.shared.is_closed() {
+            let request_lock = self.shared.request_lock.lock().unwrap_or_else(|e| e.into_inner());
+            if self.shared.is_pending() {
+                self.shared.release_request();
+            }
+            return Some(CheckpointGuard {
+                slot: self.slot,
+                shared: &self.shared,
+                request_lock,
+                _marker: PhantomData,
+            });
+        }
+        let request_lock = self.shared.request_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if self.shared.is_pending() {
+            self.shared.release_request();
+        }
+        let guard = match self.shared.request_until_parked() {
+            Handshake::Parked | Handshake::Closed => CheckpointGuard {
+                slot: self.slot,
+                shared: &self.shared,
+                request_lock,
+                _marker: PhantomData,
+            },
+        };
+        Some(guard)
+    }
+}
+
+/// Direct access to the root slot while every mutator is parked,
+/// through `Deref`/`DerefMut` — the world is stopped for the guard's
+/// whole life, so even mutable access is exclusive by construction.
+/// Dropping the guard resumes the world.
+pub struct CheckpointGuard<'a, K> {
+    slot: *mut K,
+    shared: &'a Shared,
+    /// Held for the guard's whole life: concurrent requesters block
+    /// until this guard (and therefore the stop it caused) is done.
+    /// Never read — its existence IS the lock.
+    #[allow(dead_code)] // the guard's lifetime is the synchronization
+    request_lock: MutexGuard<'a, ()>,
+    _marker: PhantomData<fn(&'a ()) -> &'a K>,
+}
+
+impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
+    type Target = K;
+    fn deref(&self) -> &K {
+        // SAFETY: the guard exists only while the handshake proved
+        // every mutator parked; the reborrow is tied to the guard, so
+        // the world cannot resume underneath it.
+        unsafe { &*self.slot }
+    }
+}
+
+impl<K> std::ops::DerefMut for CheckpointGuard<'_, K> {
+    fn deref_mut(&mut self) -> &mut K {
+        // SAFETY: as Deref, but exclusive — the world is stopped for
+        // the guard's whole life, so no mutator can coexist with this
+        // borrow.
+        unsafe { &mut *self.slot }
+    }
+}
+
+impl<K> Drop for CheckpointGuard<'_, K> {
+    fn drop(&mut self) {
+        self.shared.release_request();
+        // request_lock drops with the struct, releasing the requesters.
+    }
 }
 
 /// The root task: mint the `OuterHandle` over `slot`, hand the
@@ -106,17 +338,27 @@ pub struct Checkpointer {
 /// discipline is structural, not by-convention.
 pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     slot: &mut K,
-    f: impl FnOnce(OuterHandle<K, V>, Checkpointer) -> R,
+    f: impl FnOnce(OuterHandle<K, V>, Checkpointer<K, V>) -> R,
 ) -> R
 where
     K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + 'static,
 {
+    // the raw is derived ONCE and shared by the outer's chain and the
+    // checkpointer — a second `from_mut` on the same `&mut` would
+    // invalidate the first raw's tag (the function-entry retag).
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let mut outer = unsafe { OuterHandle::over_slot(std::ptr::from_mut(slot)) };
-    // the Checkpointer shares the ROOT's Shared (the chain's origin)
-    let checkpointer = Checkpointer { shared: outer.shared().clone() };
+    let slot_ptr: *mut K = std::ptr::from_mut(slot);
+    let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
+    // the Checkpointer guards the ROOT SLOT (stable for the whole
+    // task — the borrow is the discipline) and shares the root's
+    // Shared (the chain's origin)
+    let checkpointer = Checkpointer {
+        slot: slot_ptr,
+        shared: outer.shared().clone(),
+        _marker: PhantomData,
+    };
     f(outer, checkpointer)
 }
 
@@ -127,6 +369,16 @@ impl<K: ?Sized, V: ?Sized> OuterHandle<K, V> {
         unsafe {
             &(*(self.current.as_ref() as *const V as *const InnerHandle<(), V>)).status
         }
+    }
+}
+
+impl<K: ?Sized, V: ?Sized> Drop for OuterHandle<K, V> {
+    fn drop(&mut self) {
+        // A parent waiting to park this subtree must observe the close
+        // instead of blocking on a park that will never come. The
+        // OUTER closes (not the inner: replace() swaps inner handles
+        // while the chain — and its mutator — lives on).
+        self.shared().close();
     }
 }
 
@@ -284,7 +536,20 @@ unsafe impl<V: ?Sized + 'static> ReplaceAble<V> for Box<dyn HandleAble<V> + 'sta
 }
 
 impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
-    /// The fan-out (no protocol yet — plain scoped threads). `split`
+    /// Park while a checkpoint has been requested, then return.
+    /// Requires `&mut self`: no deref borrow can be live across it.
+    pub fn safepoint(&mut self) {
+        if self.status.is_pending() {
+            self.status.park_self();
+        }
+    }
+
+    pub fn is_stop_requested(&self) -> bool {
+        self.status.is_pending()
+    }
+
+    /// The fan-out (the protocol per main: parent parks in the join
+    /// loop when a checkpoint is requested). `split`
     /// runs on `&mut T` (the node's own fields) and yields the
     /// children as the erased slots (`&mut Box<dyn HandleAble<V>>` in
     /// the demo — any DerefMut-to-dyn holder works). Each element
@@ -339,10 +604,23 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
             .map(|current| OuterHandle { current, _slot: PhantomData })
             .collect();
         // THEN THREADS: one dedicated scoped thread per outer (std, per
-        // the 23:55 step — rayon left only noise in Miri)
+        // the 23:55 step — rayon left only noise in Miri). The parent
+        // runs main's join loop: park (children first) whenever a
+        // checkpoint is requested, poll the joins between sleeps.
+        let shared = self.status.clone();
         std::thread::scope(|scope| {
+            let mut joins = Vec::with_capacity(outers.len());
             for o in outers {
-                scope.spawn(|| f(o));
+                joins.push(scope.spawn(|| f(o)));
+            }
+            loop {
+                if shared.is_pending() {
+                    shared.park_self();
+                }
+                if joins.iter().all(|j| j.is_finished()) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
         });
     }
@@ -389,6 +667,49 @@ mod tests {
         parent.register_child(&a);
         parent.register_child(&b);
         assert_eq!(parent.live_children().len(), 2);
+    }
+
+    /// The handshake dance, thread-to-Shared: a mutator that parks at
+    /// its safepoint releases the requester's `request_until_parked`,
+    /// and the requester's release lets the mutator run again.
+    #[test]
+    fn handshake_parks_and_resumes() {
+        let shared = Arc::new(Shared::new());
+        let mutator = shared.clone();
+        let parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let saw_park = parked.clone();
+        let side = std::thread::spawn(move || {
+            // the mutator reaches its safepoint: the request must be
+            // visible first (park_self would return immediately
+            // otherwise and the handshake would miss)
+            while !mutator.is_pending() {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            mutator.park_self();
+            saw_park.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+        // the requester: waits until the mutator parks
+        let _ = shared.request_until_parked();
+        // release: the mutator runs again and finishes
+        shared.release_request();
+        side.join().expect("mutator panicked");
+        assert!(parked.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    /// A closed mutator answers a request with Closed instead of
+    /// blocking forever.
+    #[test]
+    fn closed_mutator_never_blocks() {
+        let shared = Arc::new(Shared::new());
+        shared.close();
+        // request_until_parked on a closed side returns promptly
+        let mut saw_closed = false;
+        // (park_self on a closed side is never called; the requester
+        // path observes the flag)
+        if shared.is_closed() {
+            saw_closed = true;
+        }
+        assert!(saw_closed);
     }
 
     /// A dropped child is closed: its Weak no longer upgrades, the

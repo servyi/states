@@ -1,7 +1,7 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use hslib::{HandleAble, InnerHandle, OuterHandle, independent_task_root};
+use hslib::{HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self);
@@ -29,6 +29,8 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
             |mut o: hslib::OuterHandle<Slot, dyn Trait>| o.bark(),
         );
+        // the SAFETY POINT: park here while a checkpoint runs
+        self.safepoint();
     }
 }
 
@@ -49,13 +51,24 @@ fn main() {
     });
     // the ROOT task: the slot is inaccessible inside (borrowed by the
     // call); the outer handle and its Checkpointer travel together
-    independent_task_root(&mut m, |mut outer, _checkpointer| {
+    independent_task_root(&mut m, |mut outer, checkpointer| {
+        // a CHECKER: mid-run, from its own thread, stop the world —
+        // the guard holds the root slot while every mutator parks
+        let ck = checkpointer.clone();
+        let checker = std::thread::spawn(move || {
+            let guard = ck.request().expect("tree closed early");
+            let _root: &Slot = &guard;
+            println!("checkpoint: world stopped, root held");
+            drop(guard);
+            println!("checkpoint: world resumed");
+        });
         outer.bark();
         // THE INSTALL: the OuterHandle walks to the slot through the
         // current inner handle, swaps it, re-mints, keeps the fresh one
         let successor: Slot = Box::new(YourStruct { val: 42 });
         outer.replace(successor);
         outer.bark();
+        checker.join().expect("checker panicked");
     });
 
     let mut y: Slot = Box::new(YourStruct { val: 5 });
