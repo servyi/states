@@ -270,9 +270,9 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         f: F,
     ) where
         T: Send,
-        V: Send,
-        K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
-        F: Fn(Box<V>) + Send + Sync,
+        V: Send + 'static,
+        K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
+        F: Fn(OuterHandle<K, V>) + Send + Sync,
     {
         // Collect offsite under the &mut node borrow (the root's
         // conversion, the earliest point — the ROOT's pattern, which
@@ -306,11 +306,18 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 erased.box_innerhandle(slot_ptr, child_shared)
             })
             .collect();
-        // THEN THREADS: one dedicated scoped thread per box (std, per
+        // wrap each box in the OUTER handle (marker + current) so the
+        // callback can drive AND replace its subtree; then threads
+        let outers: Vec<OuterHandle<K, V>> = boxes
+            .into_iter()
+            .map(|current| OuterHandle { current, _slot: PhantomData })
+            .collect();
+        // THEN THREADS: one dedicated scoped thread per outer (std, per
         // the 23:55 step — rayon left only noise in Miri)
         std::thread::scope(|scope| {
-            for b in boxes {
-                scope.spawn(|| f(b));
+            let f = &f;
+            for o in outers {
+                scope.spawn(move || f(o));
             }
         });
     }

@@ -27,7 +27,7 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
             // erased coercion internally. iter_mut().collect() just
             // works now (no unsized coercion needed at the call site).
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
-            |mut b: Box<dyn Trait>| b.bark(),
+            |mut o: hslib::OuterHandle<Slot, dyn Trait>| o.bark(),
         );
     }
 }
