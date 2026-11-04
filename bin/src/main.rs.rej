@@ -1,0 +1,11 @@
+--- bin/src/main.rs
++++ bin/src/main.rs
+@@ -11,7 +11,7 @@ use hslib::{HandleAble, InnerHandle};
+ /// and provides the chain's DerefMut through the inner Box.
+ struct Holder<V: ?Sized + 'static>(Box<dyn HandleAble<Holder<V>, V> + 'static>);
+ 
+-impl<V: ?Sized + 'static> hslib::ReplaceAble<V> for Holder<V> {
++impl<V: ?Sized + 'static> hslib::ReplaceAble<Holder<V>, V> for Holder<V> {
+     fn new(replacement: Box<dyn HandleAble<Holder<V>, V> + 'static>) -> Self {
+         Holder(replacement)
+     }

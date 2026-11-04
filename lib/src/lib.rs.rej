@@ -1,0 +1,44 @@
+--- lib/src/lib.rs
++++ lib/src/lib.rs
+@@ -72,19 +72,31 @@ pub unsafe trait HandleAble<K: ?Sized, V: ?Sized>: Send {
+     fn box_innerhandle(&mut self, holder: *mut K) -> Box<V>;
+ }
+ 
+-/// A holder that can REPLACE itself with a fresh `T` (the successor
+-/// install): `new<T: HandleAble<K, V>>(T) -> K`. The K parameter
+-/// is the holder being replaced (Self's own type).
+-pub trait ReplaceAble<V: ?Sized> {
+-    fn new(replacement: Box<dyn HandleAble<Self, V> + 'static>) -> Self
++/// A holder that can REPLACE itself (the successor install):
++/// `new(Box<dyn HandleAble<K, V>>) -> Self`. The K is an explicit
++/// parameter — decoupled from Self — so `Box<dyn HandleAble<K, V>>`
++/// implements it generically (the pass-through), and the
++/// self-referential holders (Holder) implement it with K =
++/// themselves. The client's reading — "a holder replaces with
++/// things held in holders of its own kind" — holds at every use
++/// site; the type system no longer enforces Held == Self.
++pub trait ReplaceAble<K: ?Sized, V: ?Sized> {
++    fn new(replacement: Box<dyn HandleAble<K, V> + 'static>) -> Self
+     where
+         Self: Sized;
+ }
+-// A library-side `impl ReplaceAble<V> for Box<dyn HandleAble<K, V>>`
+-// requires `Self == K` (the method's HandleAble<Self, V>), i.e.
+-// K = Box<dyn HandleAble<K, V>> — the recursion only a client
+-// newtype names. The Box impl therefore exists only where K is
+-// named; the client (Holder) carries it. See the issue round.
++
++// the Box form, fully generic in the library (orphan rules would
++// reject it client-side: uncovered V): the box replaces itself by
++// being the replacement box — the erased successor arrives
++// ready-made.
++impl<K: ?Sized + 'static, V: ?Sized + 'static> ReplaceAble<K, V>
++    for Box<dyn HandleAble<K, V> + 'static>
++{
++    fn new(replacement: Box<dyn HandleAble<K, V> + 'static>) -> Self {
++        replacement
++    }
++}
+ 
+ unsafe impl<K: ?Sized + DerefMut<Target = dyn HandleAble<K, V>>, T: Send, V: ?Sized>
+     HandleAble<K, V> for T
