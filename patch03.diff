@@ -1,0 +1,17 @@
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 30d4977..a5bf8b1 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -34,8 +34,9 @@ pub struct InnerHandle<T: ?Sized> {
+ 
+ // The raw pointer is exclusively owned by this handle for its whole
+ // life (the HandleAble contract) — moving the handle to another
+-// thread moves the exclusive access with it.
+-unsafe impl<T: ?Sized> Send for InnerHandle<T> where Arc<Shared>: Send {}
++// thread moves the exclusive access with it. T: Send because the
++// pointee crosses with it (the big-PR lesson, applied here).
++unsafe impl<T: ?Sized + Send> Send for InnerHandle<T> {}
+ 
+ /// Anything that can be viewed as an erased `K`, by handing out a
+ /// boxed inner handle to it. The `Unsize` where-clause is the whole
+

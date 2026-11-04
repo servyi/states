@@ -4,7 +4,7 @@
 
 use hslib::{HandleAble, InnerHandle};
 
-trait Trait {
+trait Trait: Send {
     fn bark(&mut self);
 }
 
@@ -17,7 +17,14 @@ struct YourStruct {
 
 impl Trait for InnerHandle<MyStruct> {
     fn bark(&mut self) {
-        println!("MyStruct")
+        println!("MyStruct");
+        // fan the erased child out: split over &mut MyStruct yields
+        // &mut Box<dyn HandleAble<dyn Trait>>; each element becomes
+        // a Box<dyn Trait> via box_innerhandle; the action barks it.
+        self.fanout(
+            &|m: &mut MyStruct| vec![&mut m.child],
+            |mut b: Box<dyn Trait>| b.bark(),
+        );
     }
 }
 
@@ -38,3 +45,4 @@ fn main() {
     h = (*y).box_innerhandle();
     h.bark();
 }
+

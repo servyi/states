@@ -1,0 +1,291 @@
+diff --git a/bin/src/main.rs b/bin/src/main.rs
+index 8c1442a..4aa3469 100644
+--- a/bin/src/main.rs
++++ b/bin/src/main.rs
+@@ -2,22 +2,39 @@
+ //! and the two structs — everything that directly references them —
+ //! plus the demo main that reassigns the outer `Box<dyn Trait>`.
+ 
+-use std::ops::DerefMut;
++use std::ops::{Deref, DerefMut};
+ 
+ use hslib::{HandleAble, InnerHandle};
+ 
++/// The holder type, Jonas's recursion: K = Box<dyn HandleAble<V, K>>.
++/// A raw alias cycles (E0391); the newtype indirection names it —
++/// and provides the chain's DerefMut through the inner Box.
++struct Holder<V: ?Sized + 'static>(Box<dyn HandleAble<Holder<V>, V> + 'static>);
++
++impl<V: ?Sized + 'static> Deref for Holder<V> {
++    type Target = dyn HandleAble<Holder<V>, V>;
++    fn deref(&self) -> &Self::Target {
++        &*self.0
++    }
++}
++impl<V: ?Sized + 'static> DerefMut for Holder<V> {
++    fn deref_mut(&mut self) -> &mut Self::Target {
++        &mut *self.0
++    }
++}
++
+ trait Trait: Send {
+     fn bark(&mut self);
+ }
+ 
+ struct MyStruct {
+-    child: Box<dyn HandleAble<dyn Trait, dyn Trait>>,
++    child: Holder<dyn Trait>,
+ }
+ struct YourStruct {
+     val: i32,
+ }
+ 
+-impl Trait for InnerHandle<MyStruct, dyn Trait> {
++impl Trait for InnerHandle<MyStruct, Holder<dyn Trait>, dyn Trait> {
+     fn bark(&mut self) {
+         println!("MyStruct");
+         // fan the erased child out: split over &mut MyStruct yields
+@@ -30,7 +47,7 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
+     }
+ }
+ 
+-impl Trait for InnerHandle<YourStruct, dyn Trait> {
++impl Trait for InnerHandle<YourStruct, Holder<dyn Trait>, dyn Trait> {
+     fn bark(&mut self) {
+         println!("{}", self.val) // through DerefMut onto YourStruct
+     }
+@@ -39,23 +56,27 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
+ fn main() {
+     // the roots are stored erased (the tree's shape): the mint
+     // receives the box SLOT, the handle points there
+-    let mut m: Box<dyn HandleAble<dyn Trait, dyn Trait>> = Box::new(MyStruct {
+-        child: Box::new(YourStruct { val: 5 }),
+-    });
++    let mut m: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> =
++        Box::new(MyStruct {
++            child: Holder(Box::new(YourStruct { val: 5 })),
++        });
+     // the holder crosses as the fat erased pointer
+-    fn erased_holder(
+-        m: &mut Box<dyn HandleAble<dyn Trait, dyn Trait>>,
+-    ) -> *mut dyn DerefMut<Target = dyn HandleAble<dyn Trait, dyn Trait>> {
+-        let h: &mut dyn DerefMut<Target = dyn HandleAble<dyn Trait, dyn Trait>> = m;
+-        h as *mut _
+-    }
+-    let m_holder = erased_holder(&mut m);
+-    let mut h: Box<dyn Trait> = (*m).box_innerhandle(m_holder);
++    // the root's holder is a GENUINE Holder wrapping the erased box
++    // (the Holder newtype exists to name the recursive type; no
++    // layout puns)
++    let mut root = Holder(m);
++    let root_holder: *mut Holder<dyn Trait> = &mut root;
++    // SAFETY: root exclusively owns the box; the mint's dispatch
++    // receiver reborrows through the Holder's DerefMut.
++    let erased: &mut dyn HandleAble<Holder<dyn Trait>, dyn Trait> = &mut *root.0;
++    let mut h: Box<dyn Trait> = erased.box_innerhandle(root_holder);
+     h.bark();
+ 
+-    let mut y: Box<dyn HandleAble<dyn Trait, dyn Trait>> = Box::new(YourStruct { val: 5 });
+-    let y_holder = erased_holder(&mut y);
+-    h = (*y).box_innerhandle(y_holder);
++    let mut y: Box<dyn HandleAble<Holder<dyn Trait>, dyn Trait>> = Box::new(YourStruct { val: 5 });
++    let mut root_y = Holder(y);
++    let y_holder: *mut Holder<dyn Trait> = &mut root_y;
++    let erased_y: &mut dyn HandleAble<Holder<dyn Trait>, dyn Trait> = &mut *root_y.0;
++    h = erased_y.box_innerhandle(y_holder);
+     h.bark();
+ }
+ 
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 17c62a9..9ece52a 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -29,17 +29,23 @@ pub struct Shared {
+ /// Deref/DerefMut land on `T` through the holder chain: the fat
+ /// pointer -> &mut dyn DerefMut<..> -> derefmut -> &mut dyn
+ /// HandleAble<V> -> cast -> &mut T.
+-pub struct InnerHandle<T: ?Sized, V: ?Sized> {
+-    ptr: *mut dyn DerefMut<Target = dyn HandleAble<V, V>>,
++pub struct InnerHandle<T: ?Sized, K: ?Sized, V: ?Sized>
++where
++    K: DerefMut<Target = dyn HandleAble<K, V>>,
++{
++    ptr: *mut K,
+     status: Arc<Shared>,
+-    _marker: PhantomData<fn(*mut T, *mut V)>,
++    _marker: PhantomData<fn(*mut T, *mut K, *mut V)>,
+ }
+ 
+ // The raw pointer is exclusively owned by this handle for its whole
+ // life (the HandleAble contract) — moving the handle to another
+ // thread moves the exclusive access with it. T: Send because the
+ // pointee crosses with it (the big-PR lesson, applied here).
+-unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
++unsafe impl<T: ?Sized + Send, K: ?Sized, V: ?Sized> Send for InnerHandle<T, K, V> where
++    K: DerefMut<Target = dyn HandleAble<K, V>>,
++{
++}
+ 
+ /// Anything that can be viewed as an erased `K`, by handing out a
+ /// boxed inner handle to it. The `Unsize` where-clause is the whole
+@@ -56,29 +62,25 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
+ /// (Not on the trait definition — the erased `Self` at dyn call
+ /// sites is statically unknowable, so the clause could never be
+ /// checked there; maintainer ruling, #19.)
+-/// HandleAble<T, K>: K is the erased vocabulary. The HOLDER's
+-/// target names the next level's trait object — for a holder of
+-/// HandleAble<T, K> things, that is `dyn HandleAble<K, K2>` with
+-/// K2 the holder-level vocabulary... which for a Box holding
+-/// HandleAble things is itself. First attempt, as instructed.
+-pub unsafe trait HandleAble<K: ?Sized, K2: ?Sized>: Send {
+-    fn box_innerhandle(
+-        &mut self,
+-        holder: *mut dyn DerefMut<Target = dyn HandleAble<K, K2>>,
+-    ) -> Box<K>;
++/// HandleAble<T, K, V>: V is the erased vocabulary, K is the HOLDER
++/// type (static again). In the design's own terms:
++/// `K = Box<dyn HandleAble<V, K>>` — K occurs in its own definition.
++/// Raw aliases cannot express that (E0391 cycle); a NEWTYPE can
++/// (the linked-list indirection), so the intended K in practice is
++/// the newtype wrapping that Box.
++pub unsafe trait HandleAble<K: ?Sized, V: ?Sized>: Send {
++    fn box_innerhandle(&mut self, holder: *mut K) -> Box<V>;
+ }
+ 
+-unsafe impl<T: Send, K: ?Sized> HandleAble<K, K> for T
++unsafe impl<T: Send, K: ?Sized + DerefMut<Target = dyn HandleAble<K, V>>, V: ?Sized>
++    HandleAble<K, V> for T
+ where
+-    InnerHandle<T, K>: Unsize<K>,
++    InnerHandle<T, K, V>: Unsize<V>,
+ {
+-    fn box_innerhandle(
+-        &mut self,
+-        holder: *mut dyn DerefMut<Target = dyn HandleAble<K, K>>,
+-    ) -> Box<K> {
++    fn box_innerhandle(&mut self, holder: *mut K) -> Box<V> {
+         // bind at the sized type, then let the return coerce
+-        // Box<InnerHandle<T, K>> -> Box<K> (the Unsize where-clause).
+-        let handle: Box<InnerHandle<T, K>> = Box::new(InnerHandle {
++        // Box<InnerHandle<T, K, V>> -> Box<V> (the Unsize where-clause).
++        let handle: Box<InnerHandle<T, K, V>> = Box::new(InnerHandle {
+             ptr: holder,
+             status: Arc::new(Shared { children: Vec::new() }),
+             _marker: PhantomData,
+@@ -87,17 +89,22 @@ where
+     }
+ }
+ 
+-impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
+-    /// The fan-out (no protocol yet — plain rayon). `split` runs on
+-    /// `&mut T` (the node's own fields) and yields the erased
+-    /// children `&mut Box<dyn HandleAble<V>>`; each element is turned
+-    /// into a `Box<V>` via `box_innerhandle`, and `f` runs on one
+-    /// rayon task per box.
+-    pub fn fanout<H2, F>(&mut self, split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut H2> + Send + Sync), f: F)
++impl<T: Sized, K: ?Sized, V: ?Sized> InnerHandle<T, K, V>
++where
++    K: DerefMut<Target = dyn HandleAble<K, V>>,
++{
++    /// The fan-out (no protocol yet — plain scoped threads). `split`
++    /// runs on `&mut T` (the node's own fields) and yields the
++    /// children `&mut K` — the SAME static holder type as this
++    /// handle's (with K static, there is no erasure between the
++    /// tree's holders and the minted handles' holders; they must
++    /// agree). Each element becomes a `Box<V>` via `box_innerhandle`,
++    /// and `f` runs on one scoped thread per box.
++    pub fn fanout<F>(&mut self, split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync), f: F)
+     where
+         T: Send,
+         V: Send,
+-        H2: DerefMut<Target = dyn HandleAble<V, V>> + Sized + Send + 'static,
++        K: Sized + Send + 'static,
+         F: Fn(Box<V>) + Send + Sync,
+     {
+         // Collect offsite under the &mut node borrow (the root's
+@@ -105,24 +112,23 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
+         // conversion, the earliest point — the ROOT's pattern, which
+         // also solves the tag problem: once only raws exist, both
+         // the receiver (`&mut **raw`, a Unique DERIVED from the raw)
+-        // and the holder pointer (`raw` itself, erased) live in the
+-        // same borrow stack — no sibling retag ever invalidates the
+-        // other (the Miri lesson of this step, twice over).
+-        let child_raws: Vec<*mut H2> = {
++        // and the holder pointer (`raw` itself) live in the same
++        // borrow stack — no sibling retag ever invalidates the other.
++        let child_raws: Vec<*mut K> = {
+             let node: &mut T = self;
+             split(node).into_iter().map(std::ptr::from_mut).collect()
+         };
+         // MINT THE BOXES: each holder becomes a Box<V> via the
+         // blanket impl — the receiver derives from the raw, the
+-        // holder crosses as the FAT erased pointer.
++        // holder pointer is the raw, typed K2.
+         let boxes: Vec<Box<V>> = child_raws
+             .into_iter()
+             .map(|raw| {
+-                let erased: &mut dyn HandleAble<V, V> =
++                let erased: &mut dyn HandleAble<K, V> =
+                     // SAFETY: the split yielded each child exactly
+                     // once, disjointly; exclusive for this mint.
+                     unsafe { &mut **raw };
+-                let holder: *mut dyn DerefMut<Target = dyn HandleAble<V, V>> = raw;
++                let holder: *mut K = raw;
+                 erased.box_innerhandle(holder)
+             })
+             .collect();
+@@ -139,35 +145,37 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
+     }
+ }
+ 
+-impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
++impl<T: Sized, K: ?Sized, V: ?Sized> Deref for InnerHandle<T, K, V>
++where
++    K: DerefMut<Target = dyn HandleAble<K, V>>,
++{
+     type Target = T;
+     fn deref(&self) -> &T {
+-        // 1) the holder, erased (the fat pointer carries its
+-        //    vtable); derived as a reborrow of the mut raw pointer —
+-        //    the same tag family DerefMut uses, so reads stay in the
+-        //    borrow stack the mint created.
++        // 1) the holder (shared read path; the same tag family
++        //    DerefMut derives from — the mut raw)
+         // SAFETY: exclusively-live per the HandleAble contract.
+-        let holder: &dyn DerefMut<Target = dyn HandleAble<V, V>> =
+-            unsafe { &*(self.ptr as *mut dyn DerefMut<Target = dyn HandleAble<V, V>>) };
++        let holder: &K = unsafe { &*self.ptr };
+         // 2) deref that into the erased view
+-        let erased: &dyn HandleAble<V, V> = &**holder;
++        let erased: &dyn HandleAble<K, V> = &**holder;
+         // 3) cast that into &T
+         // SAFETY: the HandleAble contract — the holder holds the `T`
+         // this handle was minted for, exclusively-live.
+-        unsafe { &*(erased as *const dyn HandleAble<V, V> as *const T) }
++        unsafe { &*(erased as *const dyn HandleAble<K, V> as *const T) }
+     }
+ }
+ 
+-impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
++impl<T: Sized, K: ?Sized, V: ?Sized> DerefMut for InnerHandle<T, K, V>
++where
++    K: DerefMut<Target = dyn HandleAble<K, V>>,
++{
+     fn deref_mut(&mut self) -> &mut T {
+-        // 1) the holder, erased: &mut dyn DerefMut<Target = dyn HandleAble<V, V>>
++        // 1) the holder
+         // SAFETY: exclusively-live per the HandleAble contract.
+-        let holder: &mut dyn DerefMut<Target = dyn HandleAble<V, V>> =
+-            unsafe { &mut *self.ptr };
+-        // 2) derefmut that into &mut dyn HandleAble<V, V>
+-        let erased: &mut dyn HandleAble<V, V> = holder.deref_mut();
++        let holder: &mut K = unsafe { &mut *self.ptr };
++        // 2) derefmut that into the erased view
++        let erased: &mut dyn HandleAble<K, V> = holder.deref_mut();
+         // 3) cast that into &mut T
+         // SAFETY: as Deref — exclusive, the minted-for T.
+-        unsafe { &mut *(erased as *mut dyn HandleAble<V, V> as *mut T) }
++        unsafe { &mut *(erased as *mut dyn HandleAble<K, V> as *mut T) }
+     }
+ }
+

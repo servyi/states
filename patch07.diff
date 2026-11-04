@@ -1,0 +1,120 @@
+diff --git a/bin/src/main.rs b/bin/src/main.rs
+index 4aa3469..e6a572f 100644
+--- a/bin/src/main.rs
++++ b/bin/src/main.rs
+@@ -11,6 +11,13 @@ use hslib::{HandleAble, InnerHandle};
+ /// and provides the chain's DerefMut through the inner Box.
+ struct Holder<V: ?Sized + 'static>(Box<dyn HandleAble<Holder<V>, V> + 'static>);
+ 
++unsafe impl<V: ?Sized + 'static> hslib::ReplaceAble<V> for Holder<V> {
++    fn new(replacement: Box<dyn HandleAble<Holder<V>, V> + 'static>) -> Self {
++        Holder(replacement)
++    }
++}
++
++
+ impl<V: ?Sized + 'static> Deref for Holder<V> {
+     type Target = dyn HandleAble<Holder<V>, V>;
+     fn deref(&self) -> &Self::Target {
+@@ -34,7 +41,7 @@ struct YourStruct {
+     val: i32,
+ }
+ 
+-impl Trait for InnerHandle<MyStruct, Holder<dyn Trait>, dyn Trait> {
++impl Trait for InnerHandle<Holder<dyn Trait>, MyStruct, dyn Trait> {
+     fn bark(&mut self) {
+         println!("MyStruct");
+         // fan the erased child out: split over &mut MyStruct yields
+@@ -47,7 +54,7 @@ impl Trait for InnerHandle<MyStruct, Holder<dyn Trait>, dyn Trait> {
+     }
+ }
+ 
+-impl Trait for InnerHandle<YourStruct, Holder<dyn Trait>, dyn Trait> {
++impl Trait for InnerHandle<Holder<dyn Trait>, YourStruct, dyn Trait> {
+     fn bark(&mut self) {
+         println!("{}", self.val) // through DerefMut onto YourStruct
+     }
+diff --git a/lib/src/lib.rs b/lib/src/lib.rs
+index 9ece52a..c525a6c 100644
+--- a/lib/src/lib.rs
++++ b/lib/src/lib.rs
+@@ -29,7 +29,7 @@ pub struct Shared {
+ /// Deref/DerefMut land on `T` through the holder chain: the fat
+ /// pointer -> &mut dyn DerefMut<..> -> derefmut -> &mut dyn
+ /// HandleAble<V> -> cast -> &mut T.
+-pub struct InnerHandle<T: ?Sized, K: ?Sized, V: ?Sized>
++pub struct InnerHandle<K: ?Sized, T: ?Sized, V: ?Sized>
+ where
+     K: DerefMut<Target = dyn HandleAble<K, V>>,
+ {
+@@ -42,7 +42,7 @@ where
+ // life (the HandleAble contract) — moving the handle to another
+ // thread moves the exclusive access with it. T: Send because the
+ // pointee crosses with it (the big-PR lesson, applied here).
+-unsafe impl<T: ?Sized + Send, K: ?Sized, V: ?Sized> Send for InnerHandle<T, K, V> where
++unsafe impl<K: ?Sized, T: ?Sized + Send, V: ?Sized> Send for InnerHandle<K, T, V> where
+     K: DerefMut<Target = dyn HandleAble<K, V>>,
+ {
+ }
+@@ -72,15 +72,29 @@ pub unsafe trait HandleAble<K: ?Sized, V: ?Sized>: Send {
+     fn box_innerhandle(&mut self, holder: *mut K) -> Box<V>;
+ }
+ 
+-unsafe impl<T: Send, K: ?Sized + DerefMut<Target = dyn HandleAble<K, V>>, V: ?Sized>
++/// A holder that can REPLACE itself with a fresh `T` (the successor
++/// install): `new<T: HandleAble<K, V>>(T) -> K`. The K parameter
++/// is the holder being replaced (Self's own type).
++pub unsafe trait ReplaceAble<V: ?Sized> {
++    fn new(replacement: Box<dyn HandleAble<Self, V> + 'static>) -> Self
++    where
++        Self: Sized;
++}
++// A library-side `impl ReplaceAble<V> for Box<dyn HandleAble<K, V>>`
++// requires `Self == K` (the method's HandleAble<Self, V>), i.e.
++// K = Box<dyn HandleAble<K, V>> — the recursion only a client
++// newtype names. The Box impl therefore exists only where K is
++// named; the client (Holder) carries it. See the issue round.
++
++unsafe impl<K: ?Sized + DerefMut<Target = dyn HandleAble<K, V>>, T: Send, V: ?Sized>
+     HandleAble<K, V> for T
+ where
+-    InnerHandle<T, K, V>: Unsize<V>,
++    InnerHandle<K, T, V>: Unsize<V>,
+ {
+     fn box_innerhandle(&mut self, holder: *mut K) -> Box<V> {
+         // bind at the sized type, then let the return coerce
+-        // Box<InnerHandle<T, K, V>> -> Box<V> (the Unsize where-clause).
+-        let handle: Box<InnerHandle<T, K, V>> = Box::new(InnerHandle {
++        // Box<InnerHandle<K, T, V>> -> Box<V> (the Unsize where-clause).
++        let handle: Box<InnerHandle<K, T, V>> = Box::new(InnerHandle {
+             ptr: holder,
+             status: Arc::new(Shared { children: Vec::new() }),
+             _marker: PhantomData,
+@@ -89,7 +103,7 @@ where
+     }
+ }
+ 
+-impl<T: Sized, K: ?Sized, V: ?Sized> InnerHandle<T, K, V>
++impl<K: ?Sized, T: Sized, V: ?Sized> InnerHandle<K, T, V>
+ where
+     K: DerefMut<Target = dyn HandleAble<K, V>>,
+ {
+@@ -145,7 +159,7 @@ where
+     }
+ }
+ 
+-impl<T: Sized, K: ?Sized, V: ?Sized> Deref for InnerHandle<T, K, V>
++impl<K: ?Sized, T: Sized, V: ?Sized> Deref for InnerHandle<K, T, V>
+ where
+     K: DerefMut<Target = dyn HandleAble<K, V>>,
+ {
+@@ -164,7 +178,7 @@ where
+     }
+ }
+ 
+-impl<T: Sized, K: ?Sized, V: ?Sized> DerefMut for InnerHandle<T, K, V>
++impl<K: ?Sized, T: Sized, V: ?Sized> DerefMut for InnerHandle<K, T, V>
+ where
+     K: DerefMut<Target = dyn HandleAble<K, V>>,
+ {
+
