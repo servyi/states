@@ -469,10 +469,7 @@ where
     ///   derives from this `&mut`).
     /// - The `K` must not be reachable by shared reference from other
     ///   threads while the handle lives: its `Deref` would alias the
-    ///   pointee the chain owns exclusively. (The Target type
-    ///   `dyn HandleAble<V>` is `!Sync`, but that alone does not stop
-    ///   a `Sync` wrapper K or a `dyn (HandleAble<V> + Sync)`-shaped
-    ///   holder — so it is a requirement, not a static fact.)
+    ///   pointee the chain owns exclusively.
     /// - Every `&mut` into the slot that is active during the
     ///   handle's lifetime must be derived from this pointer.
     /// - Such a `&mut` must either come from `DerefMut` (the chain's
@@ -572,10 +569,7 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// - The K container's pointee must be `self`.
     /// - The `K` must not be reachable by shared reference from other
     ///   threads while the handle lives: its `Deref` would alias the
-    ///   pointee this handle owns exclusively (the Target type is
-    ///   `!Sync`, but the K object is only a proxy — a `Sync` wrapper
-    ///   K would defeat that, so it is a requirement, not a static
-    ///   fact).
+    ///   pointee this handle owns exclusively.
     ///
     /// The `SharedRef` argument is the seal as well as the payload:
     /// it is an opaque shell (`Shared` private, the field private),
