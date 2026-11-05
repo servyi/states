@@ -1,10 +1,10 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use hslib::{HandleAble, InstallHandle, independent_task_root};
+use hslib::{HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
-    fn bark(&mut self);
+    fn bark(&mut self) -> i32;
 }
 
 /// The demo's slot shape: the erased box (no Holder needed — with
@@ -19,27 +19,30 @@ struct YourStruct {
     val: i32,
 }
 
-impl Trait for InstallHandle<MyStruct, dyn Trait> {
-    fn bark(&mut self) {
+impl Trait for InnerHandle<MyStruct, dyn Trait> {
+    fn bark(&mut self) -> i32 {
         println!("MyStruct");
-        self.fanout(
+        let sums: Vec<i32> = self.fanout(
             // &mut K directly — K = Slot; the library does the
             // erased coercion internally. iter_mut().collect() just
             // works now (no unsized coercion needed at the call site).
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
             // the child outers arrive branded with this fanout's 'o —
             // unnameable here, so they cannot be stored anywhere that
-            // outlives the call
+            // outlives the call; each child's bark result rides the
+            // Vec<R> back
             |mut o| o.bark(),
         );
         // the SAFETY POINT: park here while a checkpoint runs
         self.safepoint();
+        sums.iter().sum()
     }
 }
 
-impl Trait for InstallHandle<YourStruct, dyn Trait> {
-    fn bark(&mut self) {
-        println!("{}", self.val) // through DerefMut onto YourStruct
+impl Trait for InnerHandle<YourStruct, dyn Trait> {
+    fn bark(&mut self) -> i32 {
+        println!("{}", self.val); // through DerefMut onto YourStruct
+        self.val
     }
 }
 
@@ -68,12 +71,14 @@ fn main() {
                 drop(guard);
                 println!("checkpoint: world resumed");
             });
-            outer.bark();
+            let first = outer.bark();
+            println!("sum: {}", first);
             // THE INSTALL: the OuterHandle walks to the slot through the
-            // current install handle, swaps it, re-mints, keeps the fresh one
+            // current inner handle, swaps it, re-mints, keeps the fresh one
             let successor: Slot = Box::new(YourStruct { val: 42 });
             outer.replace(successor);
-            outer.bark();
+            let second = outer.bark();
+            println!("sum: {}", second);
             checker.join().expect("checker panicked");
         });
     });
