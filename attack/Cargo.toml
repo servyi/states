@@ -32,3 +32,18 @@ required-features = ["never"]
 name = "attack-selfrequest"
 path = "src/selfrequest.rs"
 required-features = ["never"]
+
+[[bin]]
+name = "attack-leaksplit"
+path = "src/leaksplit.rs"
+required-features = ["never"]
+
+[[bin]]
+name = "attack-stash"
+path = "src/stash.rs"
+required-features = ["never"]
+
+[[bin]]
+name = "attack-forgetguard"
+path = "src/forgetguard.rs"
+required-features = ["never"]
