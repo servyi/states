@@ -49,7 +49,14 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
-            |mut o| o.bark(),
+            |mut o| {
+                // THE CHILD-CALLBACK INSTALL: the callback owns its
+                // outer, constructs the successor K at the call site,
+                // and swaps its own subtree from its own thread
+                let successor: SaveSlot = Box::new(YourStruct { val: 99 });
+                o.replace(successor);
+                o.bark()
+            },
         );
         self.safepoint();
         sums.iter().sum()
@@ -91,7 +98,7 @@ fn main() {
                 println!("checkpoint snapshot: {}", guard.save());
             });
             let first = outer.bark();
-            println!("sum: {}", first);
+            println!("sum: {} (99+99: the children replaced themselves)", first);
             let successor: SaveSlot = Box::new(YourStruct { val: 42 });
             outer.replace(successor);
             let second = outer.bark();
