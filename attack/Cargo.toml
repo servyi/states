@@ -26,6 +26,7 @@ required-features = ["never"]
 [[bin]]
 name = "attack-typeconfusion"
 path = "src/typeconfusion.rs"
+required-features = ["never"]
 
 [[bin]]
 name = "attack-selfrequest"
