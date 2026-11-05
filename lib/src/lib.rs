@@ -345,10 +345,15 @@ impl<'o, K: Send> Checkpointer<'o, K> {
     }
 }
 
-/// Direct access to the root slot while every mutator is parked,
-/// through `Deref`/`DerefMut` — the world is stopped for the guard's
-/// whole life, so even mutable access is exclusive by construction.
-/// Dropping the guard resumes the world.
+/// Read-only access to the root slot while every mutator is parked,
+/// through `Deref` — the snapshot. There is deliberately NO
+/// `DerefMut`: a write could install a state of a different type
+/// under the parked mutator's handle (the slot is type-erased; the
+/// chain would cast the new pointee back to its original `T` — type
+/// confusion, Miri-verified). On main the guard's target is the node
+/// type itself, so a write swaps same-typed values and is sound;
+/// here the erasure makes the guard read-only. Dropping the guard
+/// resumes the world.
 pub struct CheckpointGuard<'a, K> {
     slot: *mut K,
     /// Some: the world is stopped under our request — the drop
@@ -370,15 +375,6 @@ impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
         // every mutator parked (or gone); the reborrow is tied to the
         // guard, so the world cannot resume underneath it.
         unsafe { &*self.slot }
-    }
-}
-
-impl<K> std::ops::DerefMut for CheckpointGuard<'_, K> {
-    fn deref_mut(&mut self) -> &mut K {
-        // SAFETY: as Deref, but exclusive — the world is stopped for
-        // the guard's whole life, so no mutator can coexist with this
-        // borrow.
-        unsafe { &mut *self.slot }
     }
 }
 
