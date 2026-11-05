@@ -1,0 +1,15 @@
+[package]
+name = "attack"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+hslib = { path = "../lib" }
+
+[[bin]]
+name = "attack-uaf"
+path = "src/uaf.rs"
+
+[[bin]]
+name = "attack-hang"
+path = "src/hang.rs"

@@ -3,6 +3,13 @@
 version = 4
 
 [[package]]
+name = "attack"
+version = "0.1.0"
+dependencies = [
+ "hslib",
+]
+
+[[package]]
 name = "hsbin"
 version = "0.1.0"
 dependencies = [
