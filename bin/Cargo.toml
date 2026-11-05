@@ -9,3 +9,7 @@ hslib = { path = "../lib" }
 [[bin]]
 name = "hsbin-saveable"
 path = "src/saveable.rs"
+
+[[bin]]
+name = "hsbin-saveable-direct"
+path = "src/saveable_direct.rs"
