@@ -22,3 +22,12 @@ required-features = ["never"]
 name = "attack-hang"
 path = "src/hang.rs"
 required-features = ["never"]
+
+[[bin]]
+name = "attack-typeconfusion"
+path = "src/typeconfusion.rs"
+
+[[bin]]
+name = "attack-selfrequest"
+path = "src/selfrequest.rs"
+required-features = ["never"]
