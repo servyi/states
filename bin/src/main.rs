@@ -1,7 +1,7 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{HandleAble, InstallHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self);
@@ -19,7 +19,7 @@ struct YourStruct {
     val: i32,
 }
 
-impl Trait for InnerHandle<MyStruct, dyn Trait> {
+impl Trait for InstallHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) {
         println!("MyStruct");
         self.fanout(
@@ -27,14 +27,17 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
             // erased coercion internally. iter_mut().collect() just
             // works now (no unsized coercion needed at the call site).
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
-            |mut o: hslib::OuterHandle<Slot, dyn Trait>| o.bark(),
+            // the child outers arrive branded with this fanout's 'o —
+            // unnameable here, so they cannot be stored anywhere that
+            // outlives the call
+            |mut o| o.bark(),
         );
         // the SAFETY POINT: park here while a checkpoint runs
         self.safepoint();
     }
 }
 
-impl Trait for InnerHandle<YourStruct, dyn Trait> {
+impl Trait for InstallHandle<YourStruct, dyn Trait> {
     fn bark(&mut self) {
         println!("{}", self.val) // through DerefMut onto YourStruct
     }
@@ -52,23 +55,27 @@ fn main() {
     // the ROOT task: the slot is inaccessible inside (borrowed by the
     // call); the outer handle and its Checkpointer travel together
     independent_task_root(&mut m, |mut outer, checkpointer| {
-        // a CHECKER: mid-run, from its own thread, stop the world —
-        // the guard holds the root slot while every mutator parks
+        // a CHECKER: mid-run, from a SCOPED thread — the 'o brand
+        // keeps the checkpointer inside the task, so a detached
+        // thread cannot carry it — stop the world: the guard holds
+        // the root slot while every mutator parks
         let ck = checkpointer.clone();
-        let checker = std::thread::spawn(move || {
-            let guard = ck.request();
-            let _root: &Slot = &guard;
-            println!("checkpoint: world stopped, root held");
-            drop(guard);
-            println!("checkpoint: world resumed");
+        std::thread::scope(|scope| {
+            let checker = scope.spawn(move || {
+                let guard = ck.request();
+                let _root: &Slot = &guard;
+                println!("checkpoint: world stopped, root held");
+                drop(guard);
+                println!("checkpoint: world resumed");
+            });
+            outer.bark();
+            // THE INSTALL: the OuterHandle walks to the slot through the
+            // current install handle, swaps it, re-mints, keeps the fresh one
+            let successor: Slot = Box::new(YourStruct { val: 42 });
+            outer.replace(successor);
+            outer.bark();
+            checker.join().expect("checker panicked");
         });
-        outer.bark();
-        // THE INSTALL: the OuterHandle walks to the slot through the
-        // current inner handle, swaps it, re-mints, keeps the fresh one
-        let successor: Slot = Box::new(YourStruct { val: 42 });
-        outer.replace(successor);
-        outer.bark();
-        checker.join().expect("checker panicked");
     });
 
     let mut y: Slot = Box::new(YourStruct { val: 5 });
