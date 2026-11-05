@@ -13,3 +13,7 @@ path = "src/saveable.rs"
 [[bin]]
 name = "hsbin-saveable-direct"
 path = "src/saveable_direct.rs"
+
+[[bin]]
+name = "hsbin-custombox"
+path = "src/custombox.rs"
