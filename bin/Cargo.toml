@@ -5,3 +5,7 @@ edition = "2021"
 
 [dependencies]
 hslib = { path = "../lib" }
+
+[[bin]]
+name = "hsbin-saveable"
+path = "src/saveable.rs"

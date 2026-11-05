@@ -226,7 +226,7 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
 /// pointing at a `K`-shaped slot) — it owns NO slot. `replace` is
 /// the successor install: walk to the slot through the current
 /// inner handle's own pointer, swap the slot via
-/// `K: ReplaceAble<V>`, re-mint, and keep the fresh handle in the box.
+/// the K-cell assignment, and keep the fresh handle in the box.
 ///
 /// The `'o` brand is unforgeable: it only arises inside
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
@@ -397,7 +397,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
+    K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -450,7 +450,7 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: ReplaceAble<V> + DerefMut<Target = dyn HandleAble<V>> + Send + 'static,
+    K: DerefMut<Target = dyn HandleAble<V>> + Send + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -497,10 +497,11 @@ where
     }
 
     /// The successor install, per the sketch: walk to the slot through
-    /// the CURRENT inner handle's own pointer, swap the slot via
-    /// `K: ReplaceAble<V>`, then re-mint through the replacement's
-    /// `HandleAble` and keep the fresh inner handle in the box.
-    pub fn replace(&mut self, val: Box<dyn HandleAble<V> + 'static>) {
+    /// the CURRENT inner handle's own pointer, swap the slot (plain
+    /// assignment — the slot IS a `K` cell), then re-mint through the
+    /// replacement's `HandleAble` and keep the fresh inner handle in
+    /// the box.
+    pub fn replace(&mut self, val: K) {
         // 1) the current inner handle: the box IS one (the OuterHandle's
         //    invariant); view it as &mut InnerHandle<(), V> to load the
         //    pointer without naming the state type
@@ -518,10 +519,10 @@ where
         // this chain (the mint's discipline; the old inner handle is
         // about to be dropped with the box swap).
         let slot: *mut K = current.ptr as *mut K;
-        // 3) swap the slot through ReplaceAble — the slot now HOLDS val
+        // 3) swap the slot — plain assignment: the slot IS a K cell
         // SAFETY: as above — the write lands in the K-shaped slot the
         // current chain exclusively owns.
-        unsafe { *slot = K::new(val) };
+        unsafe { *slot = val };
         // 4) re-mint: use the HandleAble OF val — reachable through the
         // slot it now lives in (K's own DerefMut) — to create a new
         // InnerHandle pointing at that same slot, and assign it into
@@ -602,27 +603,6 @@ where
     }
 }
 
-/// A holder that can REPLACE itself with a fresh value (the successor
-/// install). Anyone may implement this — the supertrait fixes the
-/// holder's shape, and the contract is ordinary `DerefMut` honesty.
-///
-/// # Safety
-///
-/// For implementors: as long as only deref operations and `&self`
-/// operations are called on the returned value, all deref operations
-/// on it must point to the pointee of the replacement argument.
-pub unsafe trait ReplaceAble<V: ?Sized>: DerefMut<Target = dyn HandleAble<V>> {
-    fn new(replacement: Box<dyn HandleAble<V> + 'static>) -> Self
-    where
-        Self: Sized;
-}
-
-unsafe impl<V: ?Sized + 'static> ReplaceAble<V> for Box<dyn HandleAble<V> + 'static> {
-    fn new(replacement: Box<dyn HandleAble<V> + 'static>) -> Self {
-        replacement
-    }
-}
-
 impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// Park while a checkpoint has been requested, then return.
     /// Requires `&mut self`: no deref borrow can be live across it.
@@ -662,7 +642,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     where
         T: Send,
         V: Send + 'static,
-        K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
+        K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
