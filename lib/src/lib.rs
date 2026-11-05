@@ -246,7 +246,7 @@ pub struct InnerHandle<T: ?Sized, V: ?Sized> {
     /// of the pointer's own type (coercing a `*mut K` into it
     /// requires `K: Send`), so the Send impl below needs no proof
     /// about a K it cannot name.
-    ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send),
+    ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
@@ -459,17 +459,20 @@ where
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
     ///
-    /// The K-not-Sync concern is static, not a safety item: the
-    /// slot's content type is `dyn HandleAble<V>`, which is `!Sync`
-    /// by construction (the trait has `Send` and nothing else), so
-    /// no shared dereference into it crosses threads. `K: Send` (the
-    /// bound on this impl block) is what the holder-pointer coercion
-    /// demands — the pointee carries `+ Send` in its own type.
-    ///
     /// # Safety
     ///
-    /// - `slot` must point to a valid `K` and stay live, at that
-    ///   address, for the handle's whole life.
+    /// The `&mut` resolves validity and mint-time exclusivity by
+    /// construction; what remains:
+    ///
+    /// - The `K` must stay valid and live, at that address, for the
+    ///   handle's whole life (the raw stored in the minted chain
+    ///   derives from this `&mut`).
+    /// - The `K` must not be reachable by shared reference from other
+    ///   threads while the handle lives: its `Deref` would alias the
+    ///   pointee the chain owns exclusively. (The Target type
+    ///   `dyn HandleAble<V>` is `!Sync`, but that alone does not stop
+    ///   a `Sync` wrapper K or a `dyn (HandleAble<V> + Sync)`-shaped
+    ///   holder — so it is a requirement, not a static fact.)
     /// - Every `&mut` into the slot that is active during the
     ///   handle's lifetime must be derived from this pointer.
     /// - Such a `&mut` must either come from `DerefMut` (the chain's
@@ -478,23 +481,25 @@ where
     ///
     /// The constructor establishes the `OuterHandle` invariant: the
     /// box is a valid `InnerHandle<T, V>` produced by
-    /// `box_innerhandle` on the pointee of the `K`, and its `ptr` is
-    /// exactly the holder pointer that call received — i.e. `slot`
-    /// itself.
+    /// `box_innerhandle` on the pointee of the `K`, and its `ptr`
+    /// derives from exactly the holder `&mut` passed on.
     unsafe fn over_slot(slot: *mut K) -> Self
     where
         K: Sized,
     {
-        let erased_slot: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send) = slot;
+        // the receiver comes off the slot raw; the holder `&mut` is
+        // derived at the call — its TYPE carries the validity and
+        // mint-time exclusivity guarantees, the remaining contract
+        // stays in the safety docs
         // SAFETY: the caller's contract above.
-        let erased: &mut dyn HandleAble<V> = unsafe { &mut **erased_slot };
+        let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the holder is the K-shaped slot the receiver came
         // from (the contract above); the pointee of the K is the
         // receiver (`self`); exclusive for this chain.
         let current =
-            unsafe { erased.box_innerhandle(erased_slot, SharedRef(shared), private::Marker) };
+            unsafe { erased.box_innerhandle(&mut *slot, SharedRef(shared)) };
         OuterHandle { current, _slot: PhantomData, _brand: PhantomData }
     }
 
@@ -529,26 +534,14 @@ where
         // InnerHandle pointing at that same slot, and assign it into
         // the own box
         // SAFETY: the mint's discipline over the fresh slot content;
-        // the receiver and the holder pointer derive from the same
-        // raw — one borrow stack.
+        // the receiver comes off the slot raw, the holder `&mut` is
+        // derived at the call.
         let fresh: Box<V> = unsafe {
             let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
-            erased.box_innerhandle(
-                slot as *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send),
-                SharedRef(shared),
-                private::Marker,
-            )
+            erased.box_innerhandle(&mut *slot, SharedRef(shared))
         };
         self.current = fresh;
     }
-}
-
-/// The unforgeable token proving a call comes from this crate: the
-/// module is private, so clients can neither name the type nor
-/// construct a value — every trait method taking it is uncallable
-/// from the outside.
-mod private {
-    pub struct Marker;
 }
 
 /// The erasure vocabulary: a state type `T` whose
@@ -572,23 +565,26 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     ///
     /// For callers:
     ///
-    /// - The passed K container must be valid, and the pointer must
-    ///   come from that valid `K` — it is stored verbatim in the
-    ///   returned handle, exactly as `box_innerhandle` received it
-    ///   from the pointee of the `K`. Its type carries `+ Send`, so
-    ///   the K it came from was `Send` (the coercion checked it).
+    /// - The `&mut` resolves validity and mint-time exclusivity by
+    ///   construction; what remains: the K container must stay valid
+    ///   and live at that address for the returned handle's whole
+    ///   life (the raw stored in it derives from this `&mut`).
     /// - The K container's pointee must be `self`.
-    /// - Other threads must not independently derive a reference to
-    ///   `self` while a thread holding the returned `Box` is running.
+    /// - The `K` must not be reachable by shared reference from other
+    ///   threads while the handle lives: its `Deref` would alias the
+    ///   pointee this handle owns exclusively (the Target type is
+    ///   `!Sync`, but the K object is only a proxy — a `Sync` wrapper
+    ///   K would defeat that, so it is a requirement, not a static
+    ///   fact).
     ///
-    /// The `SharedRef` argument is an opaque shell: `Shared` itself
-    /// stays private to the crate (only the shell crosses the public
-    /// signature, constructible nowhere outside).
+    /// The `SharedRef` argument is the seal as well as the payload:
+    /// it is an opaque shell (`Shared` private, the field private),
+    /// so no client can construct one — the method is uncallable
+    /// from outside the crate.
     unsafe fn box_innerhandle(
         &mut self,
-        holder: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send),
+        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
         shared: SharedRef,
-        _marker: private::Marker,
     ) -> Box<V>;
 }
 
@@ -598,14 +594,17 @@ where
 {
     unsafe fn box_innerhandle(
         &mut self,
-        holder: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send),
+        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
         shared: SharedRef,
-        _marker: private::Marker,
     ) -> Box<V> {
+        // the raw that outlives this call — derived from the `&mut`,
+        // whose type proved validity and exclusivity at mint time
+        let ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static) =
+            std::ptr::from_mut(holder);
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
-            ptr: holder,
+            ptr,
             status: shared.0,
             _marker: PhantomData,
         });
@@ -619,9 +618,9 @@ where
 ///
 /// # Safety
 ///
-/// For implementors: as long as only deref operations are called on
-/// the returned value, all deref operations on it must point to the
-/// pointee of the replacement argument.
+/// For implementors: as long as only deref operations and `&self`
+/// operations are called on the returned value, all deref operations
+/// on it must point to the pointee of the replacement argument.
 pub unsafe trait ReplaceAble<V: ?Sized>: DerefMut<Target = dyn HandleAble<V>> {
     fn new(replacement: Box<dyn HandleAble<V> + 'static>) -> Self
     where
@@ -654,7 +653,10 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// the demo — any DerefMut-to-dyn holder works). Each element
     /// becomes a `Box<V>` via `box_innerhandle`, and `f` runs on one
     /// scoped thread per box, whose results collect into the returned
-    /// `Vec<R>` (join order). The child `OuterHandle`s carry the `'o`
+    /// `Vec<R>` in DISPATCH order — `joins[i]` is child `i` (the
+    /// spawn loop pushes in split order) and the joins only drain
+    /// after every child finished, so no completion-order dependence.
+    /// The child `OuterHandle`s carry the `'o`
     /// of this call — the brand fanout got as its own parameter, so
     /// the minted handles stay inside the root task's closure too.
     pub fn fanout<'o, K, F, R>(
@@ -685,13 +687,11 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         let boxes: Vec<Box<V>> = child_raws
             .into_iter()
             .map(|raw| {
-                // the erased SLOT pointer first (raw, no borrow):
+                // the receiver comes off the split's raw; the holder
+                // `&mut` is derived at the call — its type carries the
+                // validity and mint-time exclusivity guarantees
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
-                let slot_ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send) = raw;
-                // the erased receiver: through the slot's own
-                // DerefMut — derived from the raw, one borrow stack
-                // SAFETY: as above.
                 let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
@@ -701,7 +701,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // SAFETY: the holder is the child's K-shaped slot the
                 // receiver derived from; the pointee of that K is the
                 // receiver; yielded exactly once, disjointly, exclusive.
-                unsafe { erased.box_innerhandle(slot_ptr, SharedRef(child_shared), private::Marker) }
+                unsafe { erased.box_innerhandle(&mut *raw, SharedRef(child_shared)) }
             })
             .collect();
         // wrap each box in the OUTER handle (marker + current) so the
