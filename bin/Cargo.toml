@@ -13,7 +13,11 @@ path = "src/saveable.rs"
 [[bin]]
 name = "hsbin-saveable-direct"
 path = "src/saveable_direct.rs"
+required-features = ["never"]
 
 [[bin]]
 name = "hsbin-custombox"
 path = "src/custombox.rs"
+
+[features]
+never = []

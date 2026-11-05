@@ -246,7 +246,7 @@ pub struct InnerHandle<T: ?Sized, V: ?Sized> {
     /// of the pointer's own type (coercing a `*mut K` into it
     /// requires `K: Send`), so the Send impl below needs no proof
     /// about a K it cannot name.
-    ptr: *mut (dyn AsErased<V> + Send + 'static),
+    ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
@@ -397,7 +397,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: AsErased<V> + Sized + Send + 'static,
+    K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -450,7 +450,7 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: AsErased<V> + Send + 'static,
+    K: DerefMut<Target = dyn HandleAble<V>> + Send + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -485,7 +485,7 @@ where
         // mint-time exclusivity guarantees, the remaining contract
         // stays in the safety docs
         // SAFETY: the caller's contract above.
-        let erased: &mut dyn HandleAble<V> = unsafe { (*slot).as_erased() };
+        let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the holder is the K-shaped slot the receiver came
@@ -531,52 +531,10 @@ where
         // the receiver comes off the slot raw, the holder `&mut` is
         // derived at the call.
         let fresh: Box<V> = unsafe {
-            let erased: &mut dyn HandleAble<V> = (*slot).as_erased();
+            let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
             erased.box_innerhandle(&mut *slot, SharedRef(shared))
         };
         self.current = fresh;
-    }
-}
-
-/// A slot's named upcast to the erased receiver: `as_erased` hands
-/// out the `&mut dyn HandleAble<V>` the chain is minted over.
-///
-/// Why a named method and not `DerefMut<Target = dyn HandleAble<V>>`:
-/// associated-type equality. `Box<dyn SaveAble>` (a client subtrait,
-/// `SaveAble: HandleAble<V>`) derefs to `dyn SaveAble` — and while
-/// every `&mut dyn SaveAble` IS a `&mut dyn HandleAble<V>` by stable
-/// upcasting, `dyn DerefMut<Target = dyn SaveAble>` does NOT upcast
-/// to `dyn DerefMut<Target = dyn HandleAble<V>>` (trait objects are
-/// invariant in their parameters). The coercion only exists at
-/// concrete sites — so it lives inside implementations of this hook.
-///
-/// The crate blanket-impls the hook for every exact-Target `DerefMut`
-/// (plain `Box<dyn HandleAble<V>>` and safe client wrappers whose
-/// Derefs upcast); subtrait boxes (`Box<dyn SaveAble>`) implement it
-/// directly with the upcast at their concrete site.
-///
-/// # Safety
-///
-/// For implementors — deref honesty: the returned reference must
-/// point to the object currently stored in the slot (what a plain
-/// `DerefMut` through the slot would yield). A dishonest impl (a
-/// foreign object) is type confusion: the chain casts the result to
-/// the `T` it was minted for.
-pub unsafe trait AsErased<V: ?Sized>: Send {
-    fn as_erased(&mut self) -> &mut dyn HandleAble<V>;
-    fn as_erased_shared(&self) -> &dyn HandleAble<V>;
-}
-
-// the blanket: exact-Target DerefMut IS the honest upcast (identity)
-unsafe impl<K, V: ?Sized> AsErased<V> for K
-where
-    K: DerefMut<Target = dyn HandleAble<V>> + Send + ?Sized,
-{
-    fn as_erased(&mut self) -> &mut dyn HandleAble<V> {
-        self.deref_mut()
-    }
-    fn as_erased_shared(&self) -> &dyn HandleAble<V> {
-        &**self
     }
 }
 
@@ -616,7 +574,7 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// from outside the crate.
     unsafe fn box_innerhandle(
         &mut self,
-        holder: &mut (dyn AsErased<V> + Send + 'static),
+        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
         shared: SharedRef,
     ) -> Box<V>;
 }
@@ -627,12 +585,12 @@ where
 {
     unsafe fn box_innerhandle(
         &mut self,
-        holder: &mut (dyn AsErased<V> + Send + 'static),
+        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
         shared: SharedRef,
     ) -> Box<V> {
         // the raw that outlives this call — derived from the `&mut`,
         // whose type proved validity and exclusivity at mint time
-        let ptr: *mut (dyn AsErased<V> + Send + 'static) =
+        let ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static) =
             std::ptr::from_mut(holder);
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
@@ -684,7 +642,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     where
         T: Send,
         V: Send + 'static,
-    K: AsErased<V> + Sized + Send + 'static,
+    K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -709,7 +667,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // validity and mint-time exclusivity guarantees
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
-                let erased: &mut dyn HandleAble<V> = unsafe { (*raw).as_erased() };
+                let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)
@@ -763,9 +721,9 @@ impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     fn deref(&self) -> &T {
         // 1) cast into the holder (shared read path)
         // SAFETY: exclusively-live per the HandleAble contract.
-        let holder: &dyn AsErased<V> = unsafe { &*self.ptr };
-        // 2) its named upcast into the erased view
-        let erased: &dyn HandleAble<V> = holder.as_erased_shared();
+        let holder: &dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &*self.ptr };
+        // 2) deref that into the erased view
+        let erased: &dyn HandleAble<V> = &**holder;
         // 3) cast that into &T
         // SAFETY: the HandleAble contract — the holder holds the `T`
         // this handle was minted for, exclusively-live.
@@ -777,9 +735,9 @@ impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
         // 1) cast into the holder
         // SAFETY: as Deref, exclusive.
-        let holder: &mut (dyn AsErased<V> + Send + 'static) = unsafe { &mut *self.ptr };
-        // 2) its named upcast into the erased view
-        let erased: &mut dyn HandleAble<V> = holder.as_erased();
+        let holder: &mut dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &mut *self.ptr };
+        // 2) derefmut that into the erased view
+        let erased: &mut dyn HandleAble<V> = holder.deref_mut();
         // 3) cast that into &mut T
         // SAFETY: as Deref — exclusive, the minted-for T.
         unsafe { &mut *(erased as *mut dyn HandleAble<V> as *mut T) }
