@@ -278,17 +278,11 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
     /// Concurrent `request`s serialize on the gate: a second request
     /// blocks until the first guard is dropped and the world resumed.
     pub fn request(&self) -> CheckpointGuard<'_, K> {
-        // held for the whole guard life — the serialization
+        // held for the whole guard life — the serialization. A
+        // pending seen here would be another's in-flight stop, never
+        // ours to release: entry always sees a clean flag, because
+        // the previous cycle's release ran under this same gate.
         let request_lock = self.gate.lock().unwrap_or_else(|e| e.into_inner());
-        // a stale pending from a requester that died mid-handshake:
-        // reset the world before asking again (the mutator, parked
-        // under that dead request, re-checks the flag and resumes)
-        if let Some(shared) = self.weak.upgrade() {
-            if shared.is_pending() {
-                release_request(&shared);
-            }
-            drop(shared);
-        }
         match request_until_parked(&self.weak) {
             Handshake::Parked => CheckpointGuard {
                 slot: self.slot,
