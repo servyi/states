@@ -241,20 +241,20 @@ pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
 }
 
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
-    /// The K-shaped holder slot, as a fat pointer whose POINTee type
-    /// carries `+ Send` — the holder's sendability is a static part
-    /// of the pointer's own type (coercing a `*mut K` into it
-    /// requires `K: Send`), so the Send impl below needs no proof
-    /// about a K it cannot name.
-    ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
+    /// the K-side dispatch as data (see `erased_pair`): calling it
+    /// reaches the erased state through the slot's own vtable — the
+    /// handle never sees `K` or its target type
+    state: StateFn<V>,
+    /// the K cell, thin-erased — `replace`'s write target
+    slot: *mut (),
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
 
-// Sound now: the pointee's type is `dyn DerefMut<..> + Send` (Send by
-// the auto trait IN the type), the status Arc is Send+Sync, and
-// T: Send crosses with it. The K itself is unreachable as a type
-// here — its sendability rode along in the pointer's type at mint.
+// Sound: the state closure is Send by construction (built from a
+// Send slot raw), the status Arc is Send+Sync, and T: Send crosses
+// with it. The K itself is unreachable as a type here — its
+// sendability rode along in the closure's own Send bound.
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 
 // The box is the payload (an InnerHandle: its ptr's pointee is
@@ -397,7 +397,8 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
+    K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -450,7 +451,8 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: DerefMut<Target = dyn HandleAble<V>> + Send + 'static,
+    K: DerefMut + Send + 'static,
+    K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -480,19 +482,16 @@ where
     where
         K: Sized,
     {
-        // the receiver comes off the slot raw; the holder `&mut` is
-        // derived at the call — its TYPE carries the validity and
-        // mint-time exclusivity guarantees, the remaining contract
-        // stays in the safety docs
+        // the erased pair off the live slot raw; the receiver comes
+        // through the K-side dispatch (the upcast lives inside it)
         // SAFETY: the caller's contract above.
+        let (state, thin) = unsafe { erased_pair::<K, V>(slot) };
         let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
-        // SAFETY: the holder is the K-shaped slot the receiver came
-        // from (the contract above); the pointee of the K is the
-        // receiver (`self`); exclusive for this chain.
-        let current =
-            unsafe { erased.box_innerhandle(&mut *slot, SharedRef(shared)) };
+        // SAFETY: the pair came from the slot raw under the mint's
+        // discipline; the receiver is the slot's pointee.
+        let current = unsafe { erased.box_innerhandle(state, thin, SharedRef(shared)) };
         OuterHandle { current, _slot: PhantomData, _brand: PhantomData }
     }
 
@@ -518,7 +517,7 @@ where
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
         // about to be dropped with the box swap).
-        let slot: *mut K = current.ptr as *mut K;
+        let slot: *mut K = current.slot as *mut K;
         // 3) swap the slot — plain assignment: the slot IS a K cell
         // SAFETY: as above — the write lands in the K-shaped slot the
         // current chain exclusively owns.
@@ -531,11 +530,68 @@ where
         // the receiver comes off the slot raw, the holder `&mut` is
         // derived at the call.
         let fresh: Box<V> = unsafe {
+            let (state, thin) = erased_pair::<K, V>(slot);
             let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
-            erased.box_innerhandle(&mut *slot, SharedRef(shared))
+            erased.box_innerhandle(state, thin, SharedRef(shared))
         };
         self.current = fresh;
     }
+}
+
+/// The K-side dispatch, packed as data: calling it reaches the
+/// erased state through the slot's own `DerefMut` (K's vtable) and
+/// upcasts `&mut H` into `&mut dyn HandleAble<V>` — the generic
+/// coercion, carried by `H: Unsize<dyn HandleAble<V>>` (trait-object
+/// upcasting, so `H` may be a client subtrait object like
+/// `dyn SaveAble`). Built at the mint, where `K` and its target are
+/// nameable; the handle stores it and never sees `K` or `H` again.
+type ErasedState<V> = *mut dyn HandleAble<V>;
+type StateFn<V> = Box<dyn Fn() -> ErasedState<V> + Send>;
+
+/// The raw slot, thin-erased: `replace`'s write target, cast back to
+/// `*mut K` where `K` is nameable (the `OuterHandle` side).
+struct SlotRaw<K: ?Sized> {
+    ptr: *mut K,
+}
+
+impl<K: ?Sized> SlotRaw<K> {
+    fn get(&self) -> *mut K {
+        self.ptr
+    }
+}
+
+// SAFETY: the raw moves with the handle exactly as the handle's own
+// exclusivity does; K's sendability is the payload's.
+unsafe impl<K: ?Sized + Send> Send for SlotRaw<K> {}
+
+/// Build the erased pair off a live slot raw — the crate-side mint
+/// half that must see `K`.
+///
+/// # Safety
+///
+/// `raw` must point at a valid `K` that stays live, at that address,
+/// exclusively reachable through this chain for the minted handle's
+/// whole life (the mint's discipline).
+unsafe fn erased_pair<K, V>(raw: *mut K) -> (StateFn<V>, *mut ())
+where
+    K: DerefMut + Send + 'static,
+    K::Target: Unsize<dyn HandleAble<V>> + 'static,
+    V: ?Sized,
+{
+    let packed = SlotRaw { ptr: raw };
+    // SAFETY: the caller's contract above; each call reborrows the
+    // state from the raw (the SharedReadWrite discipline every
+    // deref in this crate uses).
+    let state: StateFn<V> = Box::new(move || {
+        // the method forces the capture of the WRAPPER (edition-2021
+        // disjoint capture would otherwise grab the !Send raw field)
+        let raw: *mut K = packed.get();
+        // SAFETY: the mint's discipline; the reborrow dies within
+        // this call (the raw outlives it, SharedReadWrite)
+        let h: &mut K::Target = unsafe { (*raw).deref_mut() };
+        h as ErasedState<V>
+    });
+    (state, raw as *mut ())
 }
 
 /// The erasure vocabulary: a state type `T` whose
@@ -574,7 +630,8 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// from outside the crate.
     unsafe fn box_innerhandle(
         &mut self,
-        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
+        state: StateFn<V>,
+        slot: *mut (),
         shared: SharedRef,
     ) -> Box<V>;
 }
@@ -585,17 +642,15 @@ where
 {
     unsafe fn box_innerhandle(
         &mut self,
-        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
+        state: StateFn<V>,
+        slot: *mut (),
         shared: SharedRef,
     ) -> Box<V> {
-        // the raw that outlives this call — derived from the `&mut`,
-        // whose type proved validity and exclusivity at mint time
-        let ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static) =
-            std::ptr::from_mut(holder);
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
-            ptr,
+            state,
+            slot,
             status: shared.0,
             _marker: PhantomData,
         });
@@ -642,7 +697,8 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     where
         T: Send,
         V: Send + 'static,
-    K: DerefMut<Target = dyn HandleAble<V>> + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
+    K::Target: Unsize<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -662,11 +718,11 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         let boxes: Vec<Box<V>> = child_raws
             .into_iter()
             .map(|raw| {
-                // the receiver comes off the split's raw; the holder
-                // `&mut` is derived at the call — its type carries the
-                // validity and mint-time exclusivity guarantees
+                // the erased pair off the split's raw; the receiver
+                // comes through the K-side dispatch
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
+                let (state, thin) = unsafe { erased_pair::<K, V>(raw) };
                 let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
@@ -676,7 +732,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // SAFETY: the holder is the child's K-shaped slot the
                 // receiver derived from; the pointee of that K is the
                 // receiver; yielded exactly once, disjointly, exclusive.
-                unsafe { erased.box_innerhandle(&mut *raw, SharedRef(child_shared)) }
+                unsafe { erased.box_innerhandle(state, thin, SharedRef(child_shared)) }
             })
             .collect();
         // wrap each box in the OUTER handle (marker + current) so the
@@ -719,28 +775,22 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
 impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     type Target = T;
     fn deref(&self) -> &T {
-        // 1) cast into the holder (shared read path)
-        // SAFETY: exclusively-live per the HandleAble contract.
-        let holder: &dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &*self.ptr };
-        // 2) deref that into the erased view
-        let erased: &dyn HandleAble<V> = &**holder;
-        // 3) cast that into &T
-        // SAFETY: the HandleAble contract — the holder holds the `T`
+        // reach the erased state through the K-side dispatch, then
+        // cast into &T
+        // SAFETY: the HandleAble contract — the slot holds the `T`
         // this handle was minted for, exclusively-live.
-        unsafe { &*(erased as *const dyn HandleAble<V> as *const T) }
+        let erased: ErasedState<V> = (self.state)();
+        unsafe { &*(erased as *const T) }
     }
 }
 
 impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
-        // 1) cast into the holder
-        // SAFETY: as Deref, exclusive.
-        let holder: &mut dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &mut *self.ptr };
-        // 2) derefmut that into the erased view
-        let erased: &mut dyn HandleAble<V> = holder.deref_mut();
-        // 3) cast that into &mut T
+        // as Deref, but exclusive — the fresh raw comes from the
+        // dispatch, the reborrow is tied to `&mut self`
         // SAFETY: as Deref — exclusive, the minted-for T.
-        unsafe { &mut *(erased as *mut dyn HandleAble<V> as *mut T) }
+        let erased: ErasedState<V> = (self.state)();
+        unsafe { &mut *(erased as *mut T) }
     }
 }
 

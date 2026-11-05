@@ -1,18 +1,15 @@
-//! The DIRECT SaveAble shape: K = Box<dyn SaveAble> — literally.
+//! The DIRECT SaveAble shape: K = Box<dyn SaveAble> — literally,
+//! with ZERO client unsafe.
 //!
-//! `SaveAble: HandleAble<dyn Trait>`, so every `&mut dyn SaveAble`
-//! IS a `&mut dyn HandleAble<dyn Trait>` (stable upcasting) — the
-//! upcast just had to be NAMED (`AsErased`) because trait objects
-//! are invariant in their parameters: `dyn DerefMut<Target =
-//! dyn SaveAble>` does not coerce to `dyn DerefMut<Target = dyn
-//! HandleAble<V>>`. The crate blanket covers exact-Target Derefs
-//! (plain boxes and safe wrappers); a subtrait box implements the
-//! hook itself — ONE small impl, and it must be honest:
+//! The K bound is Target-generic: `K::Target: Unsize<dyn
+//! HandleAble<V>>` — trait-object upcasting expressed generically,
+//! so `dyn SaveAble`'s target qualifies. The upcast lives inside the
+//! mint-time dispatch closure, where K is still nameable; the handle
+//! stores the dispatch as data and never sees K or its target.
 //!
 //! The guard then speaks the vocabulary directly: `guard.save()`.
 
-use std::ops::DerefMut;
-use hslib::{AsErased, HandleAble, InnerHandle, independent_task_root};
+use hslib::{HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -25,18 +22,6 @@ trait SaveAble: HandleAble<dyn Trait> {
 
 /// K, LITERALLY the subtrait box
 type SaveSlot = Box<dyn SaveAble>;
-
-// SAFETY: deref honesty — both methods return exactly what a plain
-// DerefMut/Deref through the box yields, upcast at this concrete
-// site; nothing foreign is ever produced.
-unsafe impl AsErased<dyn Trait> for Box<dyn SaveAble> {
-    fn as_erased(&mut self) -> &mut dyn HandleAble<dyn Trait> {
-        self.deref_mut() // &mut dyn SaveAble -> &mut dyn HandleAble
-    }
-    fn as_erased_shared(&self) -> &dyn HandleAble<dyn Trait> {
-        &**self // &dyn SaveAble -> &dyn HandleAble
-    }
-}
 
 struct MyStruct {
     children: Vec<SaveSlot>,
