@@ -650,10 +650,15 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// `Vec<R>` in DISPATCH order — `joins[i]` is child `i` (the
     /// spawn loop pushes in split order) and the joins only drain
     /// after every child finished, so no completion-order dependence.
-    /// The child `OuterHandle`s carry the `'o`
-    /// of this call — the brand fanout got as its own parameter, so
-    /// the minted handles stay inside the root task's closure too.
-    pub fn fanout<'o, K, F, R>(
+    ///
+    /// The callback is HIGHER-RANKED over the child brand: `f` must
+    /// work for ANY `'n`, so the child `OuterHandle<'n>` can never
+    /// appear in `R` (nor be stashed anywhere whose type mentions a
+    /// fixed lifetime — the brand is invariant). The handle cannot
+    /// leave the callback at all — strictly stronger than branding
+    /// it with the root task's `'o`, which is why fanout no longer
+    /// carries an `'o` of its own.
+    pub fn fanout<K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync),
         f: F,
@@ -662,7 +667,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         T: Send,
         V: Send + 'static,
         K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
-        F: Fn(OuterHandle<'o, K, V>) -> R + Send + Sync,
+        F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
         // Collect offsite under the &mut node borrow (the root's
@@ -699,8 +704,11 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
             })
             .collect();
         // wrap each box in the OUTER handle (marker + current) so the
-        // callback can drive AND replace its subtree; then threads
-        let outers: Vec<OuterHandle<'o, K, V>> = boxes
+        // callback can drive AND replace its subtree; then threads.
+        // The brand lifetime is free here — `f`'s higher-ranked bound
+        // instantiates it at the call, and its universality is what
+        // keeps the handle inside the callback.
+        let outers: Vec<OuterHandle<'_, K, V>> = boxes
             .into_iter()
             .map(|current| OuterHandle { current, _slot: PhantomData, _brand: PhantomData })
             .collect();
