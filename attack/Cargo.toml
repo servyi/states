@@ -6,10 +6,19 @@ edition = "2021"
 [dependencies]
 hslib = { path = "../lib" }
 
+# The attacks broke the pre-for<'n> API (see fe2417e); after the
+# for<'n> fix they no longer COMPILE — the escape closure is a
+# lifetime error. The sources stay as the record; build them with
+# `cargo build -p attack --features never` to see it refused.
+[features]
+never = []
+
 [[bin]]
 name = "attack-uaf"
 path = "src/uaf.rs"
+required-features = ["never"]
 
 [[bin]]
 name = "attack-hang"
 path = "src/hang.rs"
+required-features = ["never"]
