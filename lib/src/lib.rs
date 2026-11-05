@@ -198,6 +198,23 @@ fn release_request(shared: &Shared) {
     drop(parked);
 }
 
+/// The poison recovery for the requester gate: the previous gate
+/// holder panicked somewhere between acquiring the gate and dropping
+/// its guard. If that happened mid-handshake, `pending_request` is
+/// stuck true with no owner — the mutators parked beneath it would
+/// wait forever. The gate being FREE here means no live guard can
+/// exist, so a pending seen at this point is ownerless by
+/// construction; releasing it resumes the world. (A panic that
+/// happened mid-guard-life instead unwound the guard's own drop,
+/// which released cleanly — the pending is already false, a no-op.)
+fn recover_poisoned_gate(weak: &Weak<Shared>) {
+    if let Some(shared) = weak.upgrade() {
+        if shared.is_pending() {
+            release_request(&shared);
+        }
+    }
+}
+
 /// Deref/DerefMut land on `T` through the holder chain: the fat
 /// pointer -> &mut dyn DerefMut<..> -> derefmut -> &mut dyn
 /// HandleAble<V> -> cast -> &mut T.
@@ -279,10 +296,15 @@ impl<K: Send, V: ?Sized> Checkpointer<K, V> {
     /// blocks until the first guard is dropped and the world resumed.
     pub fn request(&self) -> CheckpointGuard<'_, K> {
         // held for the whole guard life — the serialization. A
-        // pending seen here would be another's in-flight stop, never
-        // ours to release: entry always sees a clean flag, because
+        // POISONED gate means a requester panicked mid-protocol under
+        // it: the recovery runs exactly there, where the poison is
+        // the evidence — a clean gate promises a clean flag, because
         // the previous cycle's release ran under this same gate.
-        let request_lock = self.gate.lock().unwrap_or_else(|e| e.into_inner());
+        let request_lock = self.gate.lock().unwrap_or_else(|e| {
+            let guard = e.into_inner();
+            recover_poisoned_gate(&self.weak);
+            guard
+        });
         match request_until_parked(&self.weak) {
             Handshake::Parked => CheckpointGuard {
                 slot: self.slot,
@@ -745,5 +767,28 @@ mod tests {
             Handshake::Closed => {}
             Handshake::Parked => panic!("a dropped child cannot park"),
         }
+    }
+
+    /// A requester that panics mid-protocol (gate held, pending stuck
+    /// true, no guard) poisons the gate — the recovery on the next
+    /// lock releases the ownerless pending so parked mutators resume.
+    #[test]
+    fn poisoned_gate_recovers_stale_pending() {
+        let shared = Arc::new(Shared::new());
+        let weak = Arc::downgrade(&shared);
+        let gate = Arc::new(Mutex::new(()));
+        let gate2 = gate.clone();
+        // the mid-protocol death: pending set, then the panic unwinds
+        // through the held gate (poisoning it), never releasing
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _gate_guard = gate2.lock().unwrap();
+            shared.pending_request.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("requester died mid-protocol");
+        }));
+        assert!(result.is_err());
+        assert!(shared.is_pending());
+        // the next requester: the poisoned closure recovers the world
+        recover_poisoned_gate(&weak);
+        assert!(!shared.is_pending());
     }
 }
