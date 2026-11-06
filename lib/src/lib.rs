@@ -221,30 +221,35 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
     }
 }
 
-/// The OUTER handle: purely a type marker over the current install
-/// handle (`Box<V>`, which it knows is an `InnerHandle<T, V>`
-/// pointing at a `K`-shaped slot) — it owns NO slot. `replace` is
-/// the successor install: walk to the slot through the current
-/// inner handle's own pointer, swap the slot via
-/// the K-cell assignment, and keep the fresh handle in the box.
+/// The OUTER handle: owns the TYPED slot pointer (`*mut K` —
+/// `replace`'s write target, no casting anywhere), the chain's
+/// `Shared` (identity that survives installs), and the current
+/// inner handle (`Box<V>`, which it knows is an `InnerHandle<T, V>`
+/// minted over this slot) — the dispatch surface for `Deref` to
+/// the vocabulary. `replace` is the successor install: write the K
+/// cell this handle owns, then re-mint through the replacement's
+/// `HandleAble` and keep the fresh handle in the box.
 ///
 /// The `'o` brand is unforgeable: it only arises inside
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
-/// (and everything minted under it, via `fanout`'s own `'o`)
+/// (and everything minted under it, via `fanout`'s own `'n`)
 /// structurally cannot leave that call.
 pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
     current: Box<V>,
-    _slot: PhantomData<fn(*mut K, *mut V)>,
+    /// the K cell this chain owns — `replace`'s write target, typed
+    slot: *mut K,
+    /// the chain's parking identity — passed on across installs
+    shared: Arc<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign
     /// lifetime — the handle stays inside the root task.
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-/// The two-pointer handle: `state` (deref's target — captured at the
-/// mint from the receiver itself, so its `T` is the pointed object's
-/// own type, fixed by the dyn dispatch that minted it) and `slot`
-/// (the K cell, thin-erased — `replace`'s write target, cast back to
-/// `*mut K` where K is nameable, on the `OuterHandle` side).
+/// The mutator-side handle: `state` (deref's target — captured at
+/// the mint from the receiver itself, so its `T` is the pointed
+/// object's own type, fixed by the dyn dispatch that minted it) and
+/// the parking `status`. It knows nothing of the slot — that is the
+/// `OuterHandle`'s business (the mutator drives, the outer installs).
 ///
 /// No dispatch happens at deref time — K's `DerefMut` is consulted
 /// ONCE, at the mint. A lying custom `DerefMut` can therefore only
@@ -256,13 +261,11 @@ pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
 /// K's own obligation shrinks to: not get rid of the returned
 /// pointer while the handle lives — and it cannot do so safely: the
 /// `&'x mut T` was taken out of the library's own `&'x mut K`, and
-/// the only writer of the slot while a handle lives is `replace`,
-/// which re-mints the pair.
+/// the only writer of the slot while a handle lives is `replace`
+/// (on the outer), which re-mints the pair.
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
     /// deref's target — the minted-for state
     state: *mut T,
-    /// the K cell, thin-erased — `replace`'s write target
-    slot: *mut (),
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
@@ -272,10 +275,10 @@ pub struct InnerHandle<T: ?Sized, V: ?Sized> {
 // crosses with it.
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 
-// The box is the payload (an InnerHandle: its ptr's pointee is
-// `+ Send` by type, its T: Send by the HandleAble blanket); K: Send
-// mirrors the pointer's own mint requirement — the fn-pointer marker
-// would not need it, the pointee does.
+// The payload crosses threads: the box (an InnerHandle: its T: Send
+// by the HandleAble blanket), and the K cell it exclusively owns —
+// moving the outer moves the exclusive access to both, so K must be
+// Send for the pointee's sake.
 unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
@@ -437,11 +440,7 @@ where
 
 impl<'o, K: ?Sized, V: ?Sized> OuterHandle<'o, K, V> {
     fn shared(&self) -> &Arc<Shared> {
-        // SAFETY: the box is an InnerHandle<_, V> (the invariant) —
-        // reading its status field through the erased view.
-        unsafe {
-            &(*(self.current.as_ref() as *const V as *const InnerHandle<(), V>)).status
-        }
+        &self.shared
     }
 }
 
@@ -491,8 +490,9 @@ where
     ///
     /// The constructor establishes the `OuterHandle` invariant: the
     /// box is a valid `InnerHandle<T, V>` produced by
-    /// `box_innerhandle` on the pointee of the `K`, and its `ptr`
-    /// derives from exactly the holder `&mut` passed on.
+    /// `box_innerhandle` on the pointee of the `K` (its `state` is
+    /// that receiver's own address), and the typed `slot` stored
+    /// here is exactly the `K` cell the receiver was taken from.
     unsafe fn over_slot(slot: *mut K) -> Self
     where
         K: Sized,
@@ -503,50 +503,32 @@ where
         let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
-        // SAFETY: the receiver and the thin slot come from the same
-        // live slot raw (the contract above).
-        let current =
-            unsafe { erased.box_innerhandle(slot as *mut (), SharedRef(shared)) };
-        OuterHandle { current, _slot: PhantomData, _brand: PhantomData }
+        // SAFETY: the receiver came from this slot (the contract).
+        let current = unsafe { erased.box_innerhandle(SharedRef(shared.clone())) };
+        OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
-    /// The successor install, per the sketch: walk to the slot through
-    /// the CURRENT inner handle's own pointer, swap the slot (plain
-    /// assignment — the slot IS a `K` cell), then re-mint through the
-    /// replacement's `HandleAble` and keep the fresh inner handle in
-    /// the box.
+    /// The successor install: write the K cell THIS handle owns
+    /// (typed — no casting), then re-mint through the replacement's
+    /// `HandleAble` and keep the fresh handle in the box. The chain
+    /// survives: the outer's `Shared` passes on to the successor,
+    /// so parking identity is untouched.
     pub fn replace(&mut self, val: K) {
-        // 1) the current inner handle: the box IS one (the OuterHandle's
-        //    invariant); view it as &mut InnerHandle<(), V> to load the
-        //    pointer without naming the state type
-        // SAFETY: OuterHandle's invariant — current is always an
-        // InnerHandle<_, V> minted over a K-shaped slot; viewing it as
-        // InnerHandle<(), V> only reads the ptr field (the () never
-        // derefs — the handle is replaced, not driven, in this method).
-        let current: &mut InnerHandle<(), V> =
-            unsafe { &mut *(self.current.as_mut() as *mut V as *mut InnerHandle<(), V>) };
-        // the old handle's shared is PASSED ON to the successor — the
-        // chain's membership survives the install
-        let shared = current.status.clone();
-        // 2) load the thin slot, cast it to the K
+        // 1) the swap — plain assignment through the typed slot
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
-        // about to be dropped with the box swap).
-        let slot: *mut K = current.slot as *mut K;
-        // 3) swap the slot — plain assignment: the slot IS a K cell
-        // SAFETY: as above — the write lands in the K-shaped slot the
-        // current chain exclusively owns.
-        unsafe { *slot = val };
-        // 4) re-mint: use the HandleAble OF val — reachable through the
-        // slot it now lives in (K's own DerefMut) — to create a new
-        // InnerHandle pointing at that same slot, and assign it into
-        // the own box
+        // replaced by the re-mint below, so no stale pointer
+        // survives the write).
+        unsafe { *self.slot = val };
+        // 2) re-mint: use the HandleAble OF the replacement —
+        // reachable through the slot it now lives in (K's own
+        // DerefMut, consulted once) — to mint a fresh InnerHandle
+        // over that same slot, and assign it into the own box
         // SAFETY: the mint's discipline over the fresh slot content;
-        // the receiver comes off the slot raw, the holder `&mut` is
-        // derived at the call.
+        // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = unsafe {
-            let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
-            erased.box_innerhandle(current.slot, SharedRef(shared))
+            let erased: &mut dyn HandleAble<V> = (*self.slot).deref_mut();
+            erased.box_innerhandle(SharedRef(self.shared.clone()))
         };
         self.current = fresh;
     }
@@ -564,20 +546,19 @@ where
 /// - `T` may implement this trait only if `InnerHandle<T, V>` can
 ///   be unsized to `V` (`InnerHandle<T, V>: Unsize<V>`).
 /// - The `Box` returned by [`HandleAble::box_innerhandle`] must be
-///   the `InnerHandle<T, V>` minted over the passed K container
-///   (its `ptr` is exactly the passed holder pointer).
+///   the `InnerHandle<T, V>` minted over `self` (its `state` is the
+///   receiver's own address — the blanket impl's `from_mut`).
 pub unsafe trait HandleAble<V: ?Sized>: Send {
-    /// Mint the handle over `holder`.
+    /// Mint the handle over `self`.
     ///
     /// # Safety
     ///
     /// For callers:
     ///
-    /// - The `&mut` resolves validity and mint-time exclusivity by
-    ///   construction; what remains: the K container must stay valid
-    ///   and live at that address for the returned handle's whole
-    ///   life (the raw stored in it derives from this `&mut`).
-    /// - The K container's pointee must be `self`.
+    /// - The `&mut self` receiver resolves validity and mint-time
+    ///   exclusivity by construction; what remains: the K container
+    ///   the receiver was taken from must stay valid and live at
+    ///   that address for the returned handle's whole life.
     /// - The `K` must not be reachable by shared reference from other
     ///   threads while the handle lives: its `Deref` would alias the
     ///   pointee this handle owns exclusively.
@@ -586,22 +567,14 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// it is an opaque shell (`Shared` private, the field private),
     /// so no client can construct one — the method is uncallable
     /// from outside the crate.
-    unsafe fn box_innerhandle(
-        &mut self,
-        slot: *mut (),
-        shared: SharedRef,
-    ) -> Box<V>;
+    unsafe fn box_innerhandle(&mut self, shared: SharedRef) -> Box<V>;
 }
 
 unsafe impl<T: Send, V: ?Sized> HandleAble<V> for T
 where
     InnerHandle<T, V>: Unsize<V>,
 {
-    unsafe fn box_innerhandle(
-        &mut self,
-        slot: *mut (),
-        shared: SharedRef,
-    ) -> Box<V> {
+    unsafe fn box_innerhandle(&mut self, shared: SharedRef) -> Box<V> {
         // T's pointer comes from the receiver itself — the dyn
         // dispatch that landed here fixed T to THIS object's type
         let state: *mut T = std::ptr::from_mut(self);
@@ -609,7 +582,6 @@ where
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
             state,
-            slot,
             status: shared.0,
             _marker: PhantomData,
         });
@@ -673,8 +645,9 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         };
         // MINT THE BOXES: each slot becomes a Box<V> via the blanket
         // impl — the receiver derives from the raw (one borrow
-        // stack), the holder pointer is the raw itself.
-        let boxes: Vec<Box<V>> = child_raws
+        // stack). The typed raw and the child's Shared ride along
+        // for the outer that owns them.
+        let mints: Vec<(Box<V>, *mut K, Arc<Shared>)> = child_raws
             .into_iter()
             .map(|raw| {
                 // the receiver: K's DerefMut consulted once, upcast
@@ -687,20 +660,27 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // — insert under the lock, release (the convention)
                 let child_shared = Arc::new(Shared::new());
                 self.status.register_child(&child_shared);
-                // SAFETY: the holder is the child's K-shaped slot the
-                // receiver derived from; the pointee of that K is the
-                // receiver; yielded exactly once, disjointly, exclusive.
-                unsafe { erased.box_innerhandle(raw as *mut (), SharedRef(child_shared)) }
+                // SAFETY: the receiver came from this child's slot;
+                // yielded exactly once, disjointly, exclusive.
+                let current =
+                    unsafe { erased.box_innerhandle(SharedRef(child_shared.clone())) };
+                (current, raw, child_shared)
             })
             .collect();
-        // wrap each box in the OUTER handle (marker + current) so the
-        // callback can drive AND replace its subtree; then threads.
-        // The brand lifetime is free here — `f`'s higher-ranked bound
-        // instantiates it at the call, and its universality is what
-        // keeps the handle inside the callback.
-        let outers: Vec<OuterHandle<'_, K, V>> = boxes
+        // wrap each box in the OUTER handle — the child's typed slot
+        // plus its Shared — so the callback can drive AND replace its
+        // subtree; then threads. The brand lifetime is free here —
+        // `f`'s higher-ranked bound instantiates it at the call, and
+        // its universality is what keeps the handle inside the
+        // callback.
+        let outers: Vec<OuterHandle<'_, K, V>> = mints
             .into_iter()
-            .map(|current| OuterHandle { current, _slot: PhantomData, _brand: PhantomData })
+            .map(|(current, slot, shared)| OuterHandle {
+                current,
+                slot,
+                shared,
+                _brand: PhantomData,
+            })
             .collect();
         // THEN THREADS: one dedicated scoped thread per outer (std, per
         // the 23:55 step — rayon left only noise in Miri). The parent
