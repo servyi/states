@@ -20,3 +20,7 @@ path = "src/custombox.rs"
 
 [features]
 never = []
+
+[[bin]]
+name = "hsbin-refactor-check"
+path = "src/refactor_check.rs"
