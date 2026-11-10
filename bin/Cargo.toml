@@ -24,3 +24,7 @@ never = []
 [[bin]]
 name = "hsbin-refactor-check"
 path = "src/refactor_check.rs"
+
+[[bin]]
+name = "hsbin-arena"
+path = "src/arena.rs"
