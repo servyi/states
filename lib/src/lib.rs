@@ -8,7 +8,6 @@
 
 #![feature(unsize)]
 
-use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -265,19 +264,17 @@ pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
 /// the only writer of the slot while a handle lives is `replace`
 /// (on the outer), which re-mints the pair.
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
-    /// the state behind a SHARED `UnsafeCell` line — the Cell
-    /// permission (under TB it survives every local/foreign
-    /// read/write, which is what makes safe `&Cell` mutation legal;
-    /// under SB the shared-IM retag grants SharedReadWrite). Both
-    /// sides of a checkpoint reach the state through this one line:
-    /// the mutator's per-deref references are minted FRESH off it,
-    /// so no persistent mutable line ever exists to demote.
-    cell: *const UnsafeCell<T>,
+    /// the state raw — carrying the box's STORED provenance (minted
+    /// by a raw borrow of the K's deref place, not from any materialized
+    /// `&mut`), so the persistent line's path to the allocation root
+    /// crosses no plain mutable node. Every deref mints a FRESH
+    /// reference off it; nothing persistent is ever a mutable line.
+    state: *mut T,
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
 
-// Sound: the cell line is exclusively reachable through this handle
+// Sound: the state raw is exclusively reachable through this handle
 // for its life (the mint's discipline), the status Arc is Send+Sync,
 // and T: Send crosses with it.
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
@@ -587,19 +584,16 @@ where
     InnerHandle<T, V>: Unsize<V>,
 {
     unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V> {
-        // T is fixed by the dispatch that landed here; but the Cell
-        // line is minted off the PASSED state raw — the box's stored
-        // provenance, whose path to the allocation root carries no
-        // plain mutable line. (Off the receiver it would sit above a
-        // plain `&mut` line that child writes turn Unique and the
-        // saves then Freeze — measured, see the thread.)
-        // SAFETY: the state raw is valid — the mint's contract;
-        // `UnsafeCell<T>` is layout-identical to `T`.
-        let cell: &UnsafeCell<T> = unsafe { &*(state as *const UnsafeCell<T>) };
+        // T is fixed by the dispatch that landed here; the persisted
+        // raw is the PASSED one — the box's stored provenance. (Off
+        // the receiver it would sit above a plain `&mut` line that
+        // child writes turn Unique and the saves then Freeze —
+        // measured, see the thread.)
+        let raw: *mut T = state as *mut T;
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
-            cell: std::ptr::from_ref(cell),
+            state: raw,
             status: shared.0,
             _marker: PhantomData,
         });
@@ -738,7 +732,7 @@ impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
         // SAFETY: the Cell line is live per the mint's discipline;
         // T is the pointed object's own type (the dispatch that
         // minted this handle fixed them together).
-        unsafe { &*UnsafeCell::raw_get(self.cell) }
+        unsafe { &*self.state }
     }
 }
 
@@ -746,7 +740,7 @@ impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as Deref — the exclusivity is the handle's own
         // (&mut self), the line tolerates it (Cell).
-        unsafe { &mut *UnsafeCell::raw_get(self.cell) }
+        unsafe { &mut *self.state }
     }
 }
 
