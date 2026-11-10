@@ -501,12 +501,13 @@ where
     where
         K: Sized,
     {
-        // the state raw: a raw borrow of the K's target PLACE — the
-        // loaded provenance, no kept reference; the receiver below is
-        // transient and dies at return
+        // the state raw: deref_mut EXPLICITLY at the raw-mut side —
+        // the returned reference is cast to the raw on the spot; the
+        // dispatch receiver below is transient and dies at return
         // SAFETY: the caller's contract above.
         let k: &mut K = unsafe { &mut *slot };
-        let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+        let target: &mut K::Target = DerefMut::deref_mut(k);
+        let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
         let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
@@ -535,7 +536,8 @@ where
         // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = unsafe {
             let k: &mut K = &mut *self.slot;
-            let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+            let target: &mut K::Target = DerefMut::deref_mut(k);
+            let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
             let erased: &mut dyn HandleAble<V> = &mut *state_raw;
             erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone()))
         };
@@ -664,7 +666,8 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
                 let k: &mut K = unsafe { &mut *raw };
-                let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+                let target: &mut K::Target = DerefMut::deref_mut(k);
+                let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
                 let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
