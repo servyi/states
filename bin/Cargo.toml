@@ -24,7 +24,3 @@ never = []
 [[bin]]
 name = "hsbin-refactor-check"
 path = "src/refactor_check.rs"
-
-[[bin]]
-name = "hsbin-rc-min"
-path = "src/rc_min.rs"

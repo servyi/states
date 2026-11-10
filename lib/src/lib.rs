@@ -8,6 +8,7 @@
 
 #![feature(unsize)]
 
+use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -264,15 +265,21 @@ pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
 /// the only writer of the slot while a handle lives is `replace`
 /// (on the outer), which re-mints the pair.
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
-    /// deref's target — the minted-for state
-    state: *mut T,
+    /// the state behind a SHARED `UnsafeCell` line — the Cell
+    /// permission (under TB it survives every local/foreign
+    /// read/write, which is what makes safe `&Cell` mutation legal;
+    /// under SB the shared-IM retag grants SharedReadWrite). Both
+    /// sides of a checkpoint reach the state through this one line:
+    /// the mutator's per-deref references are minted FRESH off it,
+    /// so no persistent mutable line ever exists to demote.
+    cell: *const UnsafeCell<T>,
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
 
-// Sound: the state raw is exclusively owned for the handle's life
-// (the mint's discipline), the status Arc is Send+Sync, and T: Send
-// crosses with it.
+// Sound: the cell line is exclusively reachable through this handle
+// for its life (the mint's discipline), the status Arc is Send+Sync,
+// and T: Send crosses with it.
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 
 // The payload crosses threads: the box (an InnerHandle: its T: Send
@@ -497,14 +504,17 @@ where
     where
         K: Sized,
     {
-        // the receiver: K's DerefMut consulted ONCE, upcast via the
-        // judgement — whatever object it is, THAT is the minted-for T
+        // the state raw: a raw borrow of the K's target PLACE — the
+        // loaded provenance, no kept reference; the receiver below is
+        // transient and dies at return
         // SAFETY: the caller's contract above.
-        let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
+        let k: &mut K = unsafe { &mut *slot };
+        let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+        let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the receiver came from this slot (the contract).
-        let current = unsafe { erased.box_innerhandle(SharedRef(shared.clone())) };
+        let current = unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(shared.clone())) };
         OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
@@ -527,8 +537,10 @@ where
         // SAFETY: the mint's discipline over the fresh slot content;
         // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = unsafe {
-            let erased: &mut dyn HandleAble<V> = (*self.slot).deref_mut();
-            erased.box_innerhandle(SharedRef(self.shared.clone()))
+            let k: &mut K = &mut *self.slot;
+            let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+            let erased: &mut dyn HandleAble<V> = &mut *state_raw;
+            erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone()))
         };
         self.current = fresh;
     }
@@ -567,21 +579,27 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// it is an opaque shell (`Shared` private, the field private),
     /// so no client can construct one — the method is uncallable
     /// from outside the crate.
-    unsafe fn box_innerhandle(&mut self, shared: SharedRef) -> Box<V>;
+    unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V>;
 }
 
 unsafe impl<T: Send, V: ?Sized> HandleAble<V> for T
 where
     InnerHandle<T, V>: Unsize<V>,
 {
-    unsafe fn box_innerhandle(&mut self, shared: SharedRef) -> Box<V> {
-        // T's pointer comes from the receiver itself — the dyn
-        // dispatch that landed here fixed T to THIS object's type
-        let state: *mut T = std::ptr::from_mut(self);
+    unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V> {
+        // T is fixed by the dispatch that landed here; but the Cell
+        // line is minted off the PASSED state raw — the box's stored
+        // provenance, whose path to the allocation root carries no
+        // plain mutable line. (Off the receiver it would sit above a
+        // plain `&mut` line that child writes turn Unique and the
+        // saves then Freeze — measured, see the thread.)
+        // SAFETY: the state raw is valid — the mint's contract;
+        // `UnsafeCell<T>` is layout-identical to `T`.
+        let cell: &UnsafeCell<T> = unsafe { &*(state as *const UnsafeCell<T>) };
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
         let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
-            state,
+            cell: std::ptr::from_ref(cell),
             status: shared.0,
             _marker: PhantomData,
         });
@@ -654,7 +672,9 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // via the judgement
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
-                let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
+                let k: &mut K = unsafe { &mut *raw };
+                let state_raw: *mut dyn HandleAble<V> = &raw mut **k;
+                let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)
@@ -663,7 +683,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // SAFETY: the receiver came from this child's slot;
                 // yielded exactly once, disjointly, exclusive.
                 let current =
-                    unsafe { erased.box_innerhandle(SharedRef(child_shared.clone())) };
+                    unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone())) };
                 (current, raw, child_shared)
             })
             .collect();
@@ -713,18 +733,20 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
 impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     type Target = T;
     fn deref(&self) -> &T {
-        // the state raw, directly — no dispatch at deref time
-        // SAFETY: exclusively-live per the mint's discipline; T is
-        // the pointed object's own type (the dispatch that minted
-        // this handle fixed them together).
-        unsafe { &*self.state }
+        // a FRESH reference off the Cell line (raw_get is the safe
+        // field projection; the reborrow's tag rides the Cell line)
+        // SAFETY: the Cell line is live per the mint's discipline;
+        // T is the pointed object's own type (the dispatch that
+        // minted this handle fixed them together).
+        unsafe { &*UnsafeCell::raw_get(self.cell) }
     }
 }
 
 impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as Deref — exclusive, tied to `&mut self`.
-        unsafe { &mut *self.state }
+        // SAFETY: as Deref — the exclusivity is the handle's own
+        // (&mut self), the line tolerates it (Cell).
+        unsafe { &mut *UnsafeCell::raw_get(self.cell) }
     }
 }
 
