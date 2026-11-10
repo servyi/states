@@ -6,6 +6,7 @@
 
 use std::alloc::{Layout, alloc};
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use hslib::{Checkpointer, HandleAble, InnerHandle, OuterHandle, independent_task_root};
@@ -32,6 +33,10 @@ struct Erased {
 unsafe impl Send for Erased {}
 
 static ARENA: Mutex<Vec<Erased>> = Mutex::new(Vec::new());
+
+/// proof the container's DerefMut/Deref are actually exercised
+static DEREF_MUT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static DEREF_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// the container: an index into the arena. Sized, Copy, Send.
 #[derive(Clone, Copy)]
@@ -69,6 +74,7 @@ impl ArenaSlot {
 impl Deref for ArenaSlot {
     type Target = dyn SaveAble;
     fn deref(&self) -> &Self::Target {
+        DEREF_CALLS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the registered entry is live for the program's life
         unsafe { &*self.fat() }
     }
@@ -76,6 +82,7 @@ impl Deref for ArenaSlot {
 
 impl DerefMut for ArenaSlot {
     fn deref_mut(&mut self) -> &mut Self::Target {
+        DEREF_MUT_CALLS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: as Deref; the exclusivity is the slot's own
         // (the driver owns the only handle chain over this index)
         unsafe { &mut *self.fat() }
@@ -93,11 +100,12 @@ struct Counter {
 impl Trait for InnerHandle<Machine, dyn Trait> {
     fn step(&mut self) {
         self.steps += 1; // the historical TB failure site
-        let sums: Vec<String> = self.fanout(
+        // the children WRITE too — every arena line takes the
+        // write-save-write ride, not just the root's
+        self.fanout(
             &|m: &mut Machine| m.children.iter_mut().collect(),
-            |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.observe(),
+            |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.step(),
         );
-        let _ = sums;
         self.safepoint();
     }
     fn observe(&mut self) -> String {
@@ -163,12 +171,26 @@ fn main() {
         steps: 0,
     });
     independent_task_root(&mut { m }, |mut outer, ck| {
-        let snap1 = park_save(&mut outer, &ck); // save #1
-        outer.step();                           // WRITE #1 (the steps field)
-        let snap2 = park_save(&mut outer, &ck); // save #2 — the demoting read, historically
-        outer.step();                           // WRITE #2
-        let snap3 = park_save(&mut outer, &ck);
-        println!("snaps: {} | {} | {}", snap1, snap2, snap3);
+        let mut snaps = Vec::new();
+        for _ in 0..3 {
+            snaps.push(park_save(&mut outer, &ck)); // the save
+            outer.step(); // every node writes (root + children)
+        }
+        snaps.push(park_save(&mut outer, &ck));
+        for s in &snaps {
+            println!("snap: {}", s);
+        }
+        // progress: every round's snapshot is distinct (writes visible)
+        let mut distinct = snaps.clone();
+        distinct.sort();
+        distinct.dedup();
+        assert_eq!(distinct.len(), snaps.len(), "snapshots must show progress");
+        // the container's derefs were actually exercised
+        let dm = DEREF_MUT_CALLS.load(Ordering::Relaxed);
+        let d = DEREF_CALLS.load(Ordering::Relaxed);
+        assert!(dm > 0, "DerefMut was never called");
+        assert!(d > 0, "Deref was never called");
+        println!("DerefMut calls: {}, Deref calls: {}", dm, d);
         println!("final: {}", outer.observe());
     });
 }
