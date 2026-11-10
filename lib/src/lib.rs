@@ -493,10 +493,10 @@ where
     ///   parked (a guard's world-stopped access).
     ///
     /// The constructor establishes the `OuterHandle` invariant: the
-    /// box is a valid `InnerHandle<T, V>` produced by
-    /// `box_innerhandle` on the pointee of the `K` (its `state` is
-    /// that receiver's own address), and the typed `slot` stored
-    /// here is exactly the `K` cell the receiver was taken from.
+    /// box is a valid `InnerHandle<T, V>` whose `state` is the raw
+    /// of the pointee of the `K` as stored by the box (the loaded
+    /// provenance), and the typed `slot` stored here is exactly the
+    /// `K` cell the raw was taken from.
     unsafe fn over_slot(slot: *mut K) -> Self
     where
         K: Sized,
@@ -555,8 +555,8 @@ where
 /// - `T` may implement this trait only if `InnerHandle<T, V>` can
 ///   be unsized to `V` (`InnerHandle<T, V>: Unsize<V>`).
 /// - The `Box` returned by [`HandleAble::box_innerhandle`] must be
-///   the `InnerHandle<T, V>` minted over `self` (its `state` is the
-///   receiver's own address — the blanket impl's `from_mut`).
+///   the `InnerHandle<T, V>` over the PASSED state raw (the blanket
+///   impl stores it verbatim).
 pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// Mint the handle over `self`.
     ///
@@ -645,12 +645,9 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
-        // Collect offsite under the &mut node borrow (the root's
-        // conversion, the earliest point — the ROOT's pattern, which
-        // also solves the tag problem: once only raws exist, both
-        // the receiver (`&mut **raw`, a Unique DERIVED from the raw)
-        // and the holder pointer (`raw` itself) live in the same
-        // borrow stack — no sibling retag ever invalidates the other.
+        // Collect offsite under the &mut node borrow (the ROOT's
+        // pattern): the split's references die at the raw conversion,
+        // the earliest point; everything after touches only raws.
         let child_raws: Vec<*mut K> = {
             let node: &mut T = self;
             split(node).into_iter().map(std::ptr::from_mut).collect()
@@ -727,19 +724,18 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
 impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     type Target = T;
     fn deref(&self) -> &T {
-        // a FRESH reference off the Cell line (raw_get is the safe
-        // field projection; the reborrow's tag rides the Cell line)
-        // SAFETY: the Cell line is live per the mint's discipline;
-        // T is the pointed object's own type (the dispatch that
-        // minted this handle fixed them together).
+        // a FRESH reference off the stored-provenance raw — nothing
+        // persistent is ever a mutable line
+        // SAFETY: the raw is live per the mint's discipline; T is
+        // the pointed object's own type (the dispatch that minted
+        // this handle fixed them together).
         unsafe { &*self.state }
     }
 }
 
 impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as Deref — the exclusivity is the handle's own
-        // (&mut self), the line tolerates it (Cell).
+        // SAFETY: as Deref — exclusive, tied to `&mut self`.
         unsafe { &mut *self.state }
     }
 }
