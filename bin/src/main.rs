@@ -27,7 +27,7 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
             // erased coercion internally. iter_mut().collect() just
             // works now (no unsized coercion needed at the call site).
             &|m: &mut MyStruct| m.children.iter_mut().collect(),
-            // the child outers arrive branded with this fanout's 'o —
+            // the child outers arrive branded with this fanout's 'n —
             // unnameable here, so they cannot be stored anywhere that
             // outlives the call; each child's bark result rides the
             // Vec<R> back
@@ -47,7 +47,7 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
 }
 
 /// Wrap a LIVE driver-owned slot in the OuterHandle (the library's
-/// over_slot does the mint).
+/// independent_task_root does the mint).
 fn main() {
     let mut m: Slot = Box::new(MyStruct {
         children: vec![
@@ -73,8 +73,8 @@ fn main() {
             });
             let first = outer.bark();
             println!("sum: {}", first);
-            // THE INSTALL: the OuterHandle walks to the slot through the
-            // current inner handle, swaps it, re-mints, keeps the fresh one
+            // THE INSTALL: the OuterHandle writes its own typed slot,
+            // re-mints, keeps the fresh one
             let successor: Slot = Box::new(YourStruct { val: 42 });
             outer.replace(successor);
             let second = outer.bark();

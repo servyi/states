@@ -34,7 +34,9 @@ unsafe impl Send for Erased {}
 
 static ARENA: Mutex<Vec<Erased>> = Mutex::new(Vec::new());
 
-/// proof the container's DerefMut/Deref are actually exercised
+/// incremented by the container's `deref_mut` for manual
+/// inspection (the library's mints no longer call it — they call
+/// `as_ptr`; only the AsPtr/Deref counters are asserted)
 static DEREF_MUT_CALLS: AtomicUsize = AtomicUsize::new(0);
 static AS_PTR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEREF_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -47,11 +49,14 @@ struct ArenaSlot {
 
 impl ArenaSlot {
     /// allocate the state's storage with std::alloc (no Box), write
-    /// it, register the fat pointer. Entries are never removed — the
-    /// "do not get rid of the returned pointer" obligation.
+    /// it, register the fat pointer. Entries are never removed —
+    /// `AsPtr`'s requirement 2, strictly stronger than asked (the
+    /// store outlives every handle, not just until the next `&mut`).
     fn new<T: SaveAble + 'static>(val: T) -> ArenaSlot {
         let layout = Layout::for_value(&val);
-        // SAFETY: the layout of a real T is nonzero
+        // SAFETY: the states used here are non-ZST, so the layout
+        // has nonzero size as `alloc` requires (a ZST state would
+        // need a branch)
         let mem: *mut u8 = unsafe { alloc(layout) };
         assert!(!mem.is_null(), "arena allocation failed");
         // SAFETY: fresh valid allocation of T's layout

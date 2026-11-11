@@ -22,8 +22,8 @@ impl Drop for CustomBox {
     }
 }
 
-// plain Deref/DerefMut to the erased target — the crate's AsErased
-// blanket covers this K with zero unsafe
+// plain Deref/DerefMut to the erased target; the container's one
+// piece of unsafe is the AsPtr impl below (the stored-line dig)
 impl Deref for CustomBox {
     type Target = dyn HandleAble<dyn Trait>;
     fn deref(&self) -> &Self::Target {

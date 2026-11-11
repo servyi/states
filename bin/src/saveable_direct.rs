@@ -3,9 +3,9 @@
 //!
 //! The K bound is Target-generic: `K::Target: Unsize<dyn
 //! HandleAble<V>>` — trait-object upcasting expressed generically,
-//! so `dyn SaveAble`'s target qualifies. The upcast lives inside the
-//! mint-time dispatch closure, where K is still nameable; the handle
-//! stores the dispatch as data and never sees K or its target.
+//! so `dyn SaveAble`'s target qualifies. The library's mints upcast
+//! `as_ptr`'s raw to `dyn HandleAble<V>` through that judgement; the
+//! builtin `Box` provides `AsPtr`.
 //!
 //! The guard then speaks the vocabulary directly: `guard.save()`.
 

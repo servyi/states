@@ -7,7 +7,7 @@
 //! 2. the saves THROUGH the SaveAble interface, read via the guard
 //! 3. a structural invariant check on every snapshot
 //! 4. observed progress (distinct states across the saves)
-//! 5. a mid-run ROLLBACK: install the checker's first snapshot
+//! 5. a mid-run ROLLBACK: install the PRE-RUN BASELINE snapshot
 //!    through `replace`, then behavior must equal the reference's
 //!    first step
 //! 6. dynamic tree growth: a split that pushes a fresh child

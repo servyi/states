@@ -1,12 +1,12 @@
-//! The SaveAble shape: the client's own subtrait vocabulary on the
-//! slot, read through the checkpoint guard.
+//! The SaveAble shape, wrapper variant: the client's own subtrait
+//! vocabulary on the slot, read through the checkpoint guard.
 //!
-//! Directly `K = Box<dyn SaveAble>` fails the library's
-//! `DerefMut<Target = dyn HandleAble<V>>` (Target equality — no
-//! generic dyn-upcast on stable). The working shape: a thin wrapper
-//! whose SAFE Deref/DerefMut impls upcast at a concrete coercion
-//! site, plus `replace(val: K)` (plain K-cell assignment — the
-//! identity pass-through that made ReplaceAble deletable).
+//! `K` here is a thin SAFE container (a newtype over the box) whose
+//! Deref/DerefMut upcast at a concrete coercion site — one of the
+//! container shapes the library accepts (`K::Target: Unsize<dyn
+//! HandleAble<V>>` is Target-generic; see saveable_direct.rs for the
+//! literal `Box<dyn SaveAble>`). The container also carries the
+//! `AsPtr` impl that digs to the inner box's stored line.
 
 use std::ops::{Deref, DerefMut};
 use hslib::{HandleAble, InnerHandle, independent_task_root};
