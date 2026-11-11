@@ -36,6 +36,7 @@ static ARENA: Mutex<Vec<Erased>> = Mutex::new(Vec::new());
 
 /// proof the container's DerefMut/Deref are actually exercised
 static DEREF_MUT_CALLS: AtomicUsize = AtomicUsize::new(0);
+static AS_PTR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEREF_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// the container: an index into the arena. Sized, Copy, Send.
@@ -86,6 +87,17 @@ impl DerefMut for ArenaSlot {
         // SAFETY: as Deref; the exclusivity is the slot's own
         // (the driver owns the only handle chain over this index)
         unsafe { &mut *self.fat() }
+    }
+}
+
+// SAFETY: the registered fat pointer IS the stored line the Derefs
+// spring from (its data component carries the allocation's
+// provenance — no freshly minted reference); and entries are never
+// removed, so the backing store outlives every handle.
+unsafe impl hslib::AsPtr for ArenaSlot {
+    fn as_ptr(&mut self) -> *mut Self::Target {
+        AS_PTR_CALLS.fetch_add(1, Ordering::Relaxed);
+        self.fat()
     }
 }
 
@@ -186,11 +198,11 @@ fn main() {
         distinct.dedup();
         assert_eq!(distinct.len(), snaps.len(), "snapshots must show progress");
         // the container's derefs were actually exercised
-        let dm = DEREF_MUT_CALLS.load(Ordering::Relaxed);
+        let ap = AS_PTR_CALLS.load(Ordering::Relaxed);
         let d = DEREF_CALLS.load(Ordering::Relaxed);
-        assert!(dm > 0, "DerefMut was never called");
+        assert!(ap > 0, "as_ptr was never called (the mints bypass it?)");
         assert!(d > 0, "Deref was never called");
-        println!("DerefMut calls: {}, Deref calls: {}", dm, d);
+        println!("AsPtr calls: {}, Deref calls: {}", ap, d);
         println!("final: {}", outer.observe());
     });
 }

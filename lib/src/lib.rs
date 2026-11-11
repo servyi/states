@@ -419,7 +419,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut + Sized + Send + 'static,
+    K: DerefMut + AsPtr + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
@@ -469,7 +469,7 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: DerefMut + Send + 'static,
+    K: DerefMut + AsPtr + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
@@ -506,9 +506,8 @@ where
         // dispatch receiver below is transient and dies at return
         // SAFETY: the caller's contract above.
         let k: &mut K = unsafe { &mut *slot };
-        let target: &mut K::Target = DerefMut::deref_mut(k);
-        let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
-        let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+        let state_raw: *mut K::Target = K::as_ptr(k);
+        let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the receiver came from this slot (the contract).
@@ -534,14 +533,55 @@ where
         // over that same slot, and assign it into the own box
         // SAFETY: the mint's discipline over the fresh slot content;
         // the receiver comes off the slot raw this handle owns.
-        let fresh: Box<V> = unsafe {
-            let k: &mut K = &mut *self.slot;
-            let target: &mut K::Target = DerefMut::deref_mut(k);
-            let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
-            let erased: &mut dyn HandleAble<V> = &mut *state_raw;
-            erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone()))
+        let fresh: Box<V> = {
+            // SAFETY: the slot is live and exclusively owned by this
+            // chain (the mint's discipline).
+            let k: &mut K = unsafe { &mut *self.slot };
+            let state_raw: *mut K::Target = K::as_ptr(k);
+            // SAFETY: the upcast raw derives from the slot's own
+            // as_ptr line; transient receiver, dies at return.
+            let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+            // SAFETY: the mint's discipline over the fresh content.
+            unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
         self.current = fresh;
+    }
+}
+
+/// A container that can hand out the pointer its `Deref`s spring
+/// from — the provenance vehicle the mint needs.
+///
+/// # Safety
+///
+/// For implementors:
+///
+/// 1. The returned pointer must NOT be a freshly minted reference:
+///    it must originate from the same raw line the container's
+///    `Deref`/`DerefMut` also spring from (the underlying stored
+///    pointer). Under Tree Borrows a freshly minted reference is a
+///    fresh tag — a sibling of the readers' tags — and every
+///    checkpoint read would then permanently freeze the writer's
+///    line (the 450 pattern, demonstrated on custom containers and
+///    sized builtin targets).
+/// 2. The backing store must not be deleted until the next `&mut`
+///    method call on the container: disposal may only happen when
+///    the container regains exclusive control, and by then every
+///    handle minted over the old content must already be dropped
+///    (the mint's existing contract).
+pub unsafe trait AsPtr: DerefMut {
+    /// The pointer to the container's current pointee, on the
+    /// stored line (see the trait's safety requirements).
+    fn as_ptr(&mut self) -> *mut Self::Target;
+}
+
+// SAFETY: `&raw mut **self` borrows the BUILTIN box-deref place —
+// the loaded stored pointer itself, no reference is materialized,
+// so the raw carries the stored line; and a `Box` cannot delete or
+// move its backing store except by dropping/moving the box, which
+// requires exclusive access (a `&mut` method call or the owner).
+unsafe impl<T: ?Sized> AsPtr for Box<T> {
+    fn as_ptr(&mut self) -> *mut Self::Target {
+        &raw mut **self
     }
 }
 
@@ -642,7 +682,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     where
         T: Send,
         V: Send + 'static,
-    K: DerefMut + Sized + Send + 'static,
+    K: DerefMut + AsPtr + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
@@ -666,9 +706,8 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // SAFETY: the split yielded each child exactly
                 // once, disjointly; exclusive for this mint.
                 let k: &mut K = unsafe { &mut *raw };
-                let target: &mut K::Target = DerefMut::deref_mut(k);
-                let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
-                let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+                let state_raw: *mut K::Target = K::as_ptr(k);
+                let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)

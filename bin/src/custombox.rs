@@ -36,6 +36,15 @@ impl DerefMut for CustomBox {
     }
 }
 
+// SAFETY: the pointer is the inner builtin box's stored line (the
+// raw borrow of the builtin deref place); the store can only be
+// deleted by dropping the box, which needs exclusive access.
+unsafe impl hslib::AsPtr for CustomBox {
+    fn as_ptr(&mut self) -> *mut Self::Target {
+        &raw mut *self.0
+    }
+}
+
 struct MyStruct {
     children: Vec<CustomBox>,
 }

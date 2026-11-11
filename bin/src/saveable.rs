@@ -36,6 +36,16 @@ impl DerefMut for SaveSlot {
     }
 }
 
+// SAFETY: the pointer is the inner builtin box's stored line (the
+// raw borrow of the builtin deref place — no reference materialized,
+// not the wrapper's Deref return); the wrapper cannot delete or move
+// the store except through &mut (dropping/moving the box).
+unsafe impl hslib::AsPtr for SaveSlot {
+    fn as_ptr(&mut self) -> *mut Self::Target {
+        &raw mut *self.0
+    }
+}
+
 struct MyStruct {
     children: Vec<SaveSlot>,
 }
