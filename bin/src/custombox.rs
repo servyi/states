@@ -36,9 +36,15 @@ impl DerefMut for CustomBox {
     }
 }
 
-// SAFETY: the pointer is the inner builtin box's stored line (the
-// raw borrow of the builtin deref place); the store can only be
-// deleted by dropping the box, which needs exclusive access.
+// SAFETY (preconditions of the construct, from the trait):
+// requirement 1 — the stored line, not a fresh reference;
+// requirement 2 — the store survives until the next `&mut` call.
+// Why they hold: (1) `&raw mut *self.0` borrows the inner builtin
+// box's deref place — no reference materialized, the same stored
+// line the container's `Deref` (`&*self.0`) springs from. (2) the
+// counted-Drop wrapper can only dispose by dropping `self.0`, which
+// needs `&mut` access; the mint's discipline bounds every prior
+// raw before that (I1/I2).
 unsafe impl hslib::AsPtr for CustomBox {
     fn as_ptr(&mut self) -> *mut Self::Target {
         &raw mut *self.0

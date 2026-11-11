@@ -36,10 +36,18 @@ impl DerefMut for SaveSlot {
     }
 }
 
-// SAFETY: the pointer is the inner builtin box's stored line (the
-// raw borrow of the builtin deref place — no reference materialized,
-// not the wrapper's Deref return); the wrapper cannot delete or move
-// the store except through &mut (dropping/moving the box).
+// SAFETY (preconditions of the construct, from the trait):
+// requirement 1 — the raw must spring from the line the Derefs
+// spring from; requirement 2 — the store must survive until the
+// next `&mut` call on the container.
+// Why they hold: (1) `&raw mut *self.0` borrows the INNER builtin
+// box's deref place directly — NOT this wrapper's `Deref` return
+// (which is a freshly minted reference and would be a demotable
+// sibling under Tree Borrows) — so the raw carries the same stored
+// line `&*self.0` hands references out of. (2) the store can only
+// disappear by dropping/moving `self.0`, which requires exclusive
+// access to the wrapper; the mint's discipline (I1/I2) ends every
+// minted raw before that.
 unsafe impl hslib::AsPtr for SaveSlot {
     fn as_ptr(&mut self) -> *mut Self::Target {
         &raw mut *self.0

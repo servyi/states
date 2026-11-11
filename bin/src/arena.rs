@@ -90,10 +90,17 @@ impl DerefMut for ArenaSlot {
     }
 }
 
-// SAFETY: the registered fat pointer IS the stored line the Derefs
-// spring from (its data component carries the allocation's
-// provenance — no freshly minted reference); and entries are never
-// removed, so the backing store outlives every handle.
+// SAFETY (preconditions of the construct, from the trait):
+// requirement 1 — the stored line; requirement 2 — the store
+// survives until the next `&mut` call.
+// Why they hold: (1) `self.fat()` returns the REGISTERED fat
+// pointer — the same raw both Derefs reassemble and deref — its
+// data component carries the allocation's own provenance, so no
+// freshly minted reference is involved (the Derefs' `&*fat()` /
+// `&mut *fat()` mint their references OFF this line). (2) the
+// registry never removes entries ("entries are never removed"), so
+// the backing store outlives every handle — strictly stronger than
+// the required "until the next `&mut` call".
 unsafe impl hslib::AsPtr for ArenaSlot {
     fn as_ptr(&mut self) -> *mut Self::Target {
         AS_PTR_CALLS.fetch_add(1, Ordering::Relaxed);
