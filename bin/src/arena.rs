@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use hslib::{Checkpointer, HandleAble, InnerHandle, OuterHandle, independent_task_root};
+use hslib::{Checkpointer, ChildNode, HandleAble, InnerHandle, OuterHandle, independent_task_root};
 
 trait Trait: Send {
     fn step(&mut self);
@@ -34,11 +34,9 @@ unsafe impl Send for Erased {}
 
 static ARENA: Mutex<Vec<Erased>> = Mutex::new(Vec::new());
 
-/// incremented by the container's `deref_mut` for manual
-/// inspection (the library's mints no longer call it — they call
-/// `as_ptr`; only the AsPtr/Deref counters are asserted)
+/// proof the container's derefs are actually exercised (the mint
+/// path goes through deref_mut again in the no-as_ptr shape)
 static DEREF_MUT_CALLS: AtomicUsize = AtomicUsize::new(0);
-static AS_PTR_CALLS: AtomicUsize = AtomicUsize::new(0);
 static DEREF_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 /// the container: an index into the arena. Sized, Copy, Send.
@@ -49,14 +47,11 @@ struct ArenaSlot {
 
 impl ArenaSlot {
     /// allocate the state's storage with std::alloc (no Box), write
-    /// it, register the fat pointer. Entries are never removed —
-    /// `AsPtr`'s requirement 2, strictly stronger than asked (the
-    /// store outlives every handle, not just until the next `&mut`).
+    /// it, register the fat pointer. Entries are never removed — the
+    /// "do not get rid of the returned pointer" obligation.
     fn new<T: SaveAble + 'static>(val: T) -> ArenaSlot {
         let layout = Layout::for_value(&val);
-        // SAFETY: the states used here are non-ZST, so the layout
-        // has nonzero size as `alloc` requires (a ZST state would
-        // need a branch)
+        // SAFETY: the layout of a real T is nonzero
         let mem: *mut u8 = unsafe { alloc(layout) };
         assert!(!mem.is_null(), "arena allocation failed");
         // SAFETY: fresh valid allocation of T's layout
@@ -95,26 +90,15 @@ impl DerefMut for ArenaSlot {
     }
 }
 
-// SAFETY (preconditions of the construct, from the trait):
-// requirement 1 — the stored line; requirement 2 — the store
-// survives until the next `&mut` call.
-// Why they hold: (1) `self.fat()` returns the REGISTERED fat
-// pointer — the same raw both Derefs reassemble and deref — its
-// data component carries the allocation's own provenance, so no
-// freshly minted reference is involved (the Derefs' `&*fat()` /
-// `&mut *fat()` mint their references OFF this line). (2) the
-// registry never removes entries ("entries are never removed"), so
-// the backing store outlives every handle — strictly stronger than
-// the required "until the next `&mut` call".
-unsafe impl hslib::AsPtr for ArenaSlot {
-    fn as_ptr(&mut self) -> *mut Self::Target {
-        AS_PTR_CALLS.fetch_add(1, Ordering::Relaxed);
-        self.fat()
-    }
-}
+// SAFETY: the registered fat pointer IS the stored line the Derefs
+// spring from (its data component carries the allocation's
+// provenance — no freshly minted reference); and entries are never
+// removed, so the backing store outlives every handle.
+// (the AsPtr impl is retired — the lib's K bound dropped it in the
+// no-as_ptr shape; the mint rides deref_mut, counted below)
 
 struct Machine {
-    children: Vec<ArenaSlot>,
+    children: Vec<ChildNode<ArenaSlot>>,
     steps: i32,
 }
 struct Counter {
@@ -127,7 +111,7 @@ impl Trait for InnerHandle<Machine, dyn Trait> {
         // the children WRITE too — every arena line takes the
         // write-save-write ride, not just the root's
         self.fanout(
-            &|m: &mut Machine| m.children.iter_mut().collect(),
+            &|m: &Machine| m.children.iter().collect(),
             |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.step(),
         );
         self.safepoint();
@@ -136,7 +120,7 @@ impl Trait for InnerHandle<Machine, dyn Trait> {
         self.safepoint(); // the parking window
         let kids: Vec<String> = self
             .fanout(
-                &|m: &mut Machine| m.children.iter_mut().collect(),
+                &|m: &Machine| m.children.iter().collect(),
                 |mut o| o.observe(),
             )
             .into_iter()
@@ -187,13 +171,13 @@ fn park_save(
 }
 
 fn main() {
-    let m = ArenaSlot::new(Machine {
+    let m = ChildNode::new(ArenaSlot::new(Machine {
         children: vec![
-            ArenaSlot::new(Counter { val: 1 }),
-            ArenaSlot::new(Counter { val: 1 }),
+            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
+            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
         ],
         steps: 0,
-    });
+    }));
     independent_task_root(&mut { m }, |mut outer, ck| {
         let mut snaps = Vec::new();
         for _ in 0..3 {
@@ -210,11 +194,11 @@ fn main() {
         distinct.dedup();
         assert_eq!(distinct.len(), snaps.len(), "snapshots must show progress");
         // the container's derefs were actually exercised
-        let ap = AS_PTR_CALLS.load(Ordering::Relaxed);
+        let dm = DEREF_MUT_CALLS.load(Ordering::Relaxed);
         let d = DEREF_CALLS.load(Ordering::Relaxed);
-        assert!(ap > 0, "as_ptr was never called (the mints bypass it?)");
+        assert!(dm > 0, "DerefMut was never called (the mints bypass it?)");
         assert!(d > 0, "Deref was never called");
-        println!("AsPtr calls: {}, Deref calls: {}", ap, d);
+        println!("DerefMut calls: {}, Deref calls: {}", dm, d);
         println!("final: {}", outer.observe());
     });
 }

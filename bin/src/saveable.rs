@@ -1,15 +1,15 @@
-//! The SaveAble shape, wrapper variant: the client's own subtrait
-//! vocabulary on the slot, read through the checkpoint guard.
+//! The SaveAble shape: the client's own subtrait vocabulary on the
+//! slot, read through the checkpoint guard.
 //!
-//! `K` here is a thin SAFE container (a newtype over the box) whose
-//! Deref/DerefMut upcast at a concrete coercion site — one of the
-//! container shapes the library accepts (`K::Target: Unsize<dyn
-//! HandleAble<V>>` is Target-generic; see saveable_direct.rs for the
-//! literal `Box<dyn SaveAble>`). The container also carries the
-//! `AsPtr` impl that digs to the inner box's stored line.
+//! Directly `K = Box<dyn SaveAble>` fails the library's
+//! `DerefMut<Target = dyn HandleAble<V>>` (Target equality — no
+//! generic dyn-upcast on stable). The working shape: a thin wrapper
+//! whose SAFE Deref/DerefMut impls upcast at a concrete coercion
+//! site, plus `replace(val: K)` (plain K-cell assignment — the
+//! identity pass-through that made ReplaceAble deletable).
 
 use std::ops::{Deref, DerefMut};
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
 
 /// the drive vocabulary (as in the main demo)
 trait Trait: Send {
@@ -36,18 +36,10 @@ impl DerefMut for SaveSlot {
     }
 }
 
-// SAFETY (preconditions of the construct, from the trait):
-// requirement 1 — the raw must spring from the line the Derefs
-// spring from; requirement 2 — the store must survive until the
-// next `&mut` call on the container.
-// Why they hold: (1) `&raw mut *self.0` borrows the INNER builtin
-// box's deref place directly — NOT this wrapper's `Deref` return
-// (which is a freshly minted reference and would be a demotable
-// sibling under Tree Borrows) — so the raw carries the same stored
-// line `&*self.0` hands references out of. (2) the store can only
-// disappear by dropping/moving `self.0`, which requires exclusive
-// access to the wrapper; the mint's discipline (I1/I2) ends every
-// minted raw before that.
+// SAFETY: the pointer is the inner builtin box's stored line (the
+// raw borrow of the builtin deref place — no reference materialized,
+// not the wrapper's Deref return); the wrapper cannot delete or move
+// the store except through &mut (dropping/moving the box).
 unsafe impl hslib::AsPtr for SaveSlot {
     fn as_ptr(&mut self) -> *mut Self::Target {
         &raw mut *self.0
@@ -55,7 +47,7 @@ unsafe impl hslib::AsPtr for SaveSlot {
 }
 
 struct MyStruct {
-    children: Vec<SaveSlot>,
+    children: Vec<ChildNode<SaveSlot>>,
 }
 struct YourStruct {
     val: i32,
@@ -64,7 +56,7 @@ struct YourStruct {
 impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
-            &|m: &mut MyStruct| m.children.iter_mut().collect(),
+            &|m: &MyStruct| m.children.iter().collect(),
             |mut o| o.bark(),
         );
         self.safepoint();
@@ -91,12 +83,12 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m = SaveSlot(Box::new(MyStruct {
+    let mut m = ChildNode::new(SaveSlot(Box::new(MyStruct {
         children: vec![
-            SaveSlot(Box::new(YourStruct { val: 5 })),
-            SaveSlot(Box::new(YourStruct { val: 7 })),
+            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 5 }))),
+            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 7 }))),
         ],
-    }));
+    })));
     independent_task_root(&mut m, |mut outer, checkpointer| {
         // THE SNAPSHOT READS CLIENT VOCABULARY through the guard's &K
         let ck = checkpointer.clone();

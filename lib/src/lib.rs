@@ -1,44 +1,14 @@
-//! The two-piece handle library: erased state trees under
-//! stop-the-world checkpointing, with in-place successor installs.
+//! The library half of the runnable sketch (issue #18, 16:38):
+//! the typing discipline — erased outer `Box<K>` reassignment through
+//! `Unsize`-witnessed handles — with no vocabulary in it.
 //!
-//! # The safety architecture
-//!
-//! All `unsafe` below is justified against five invariants. I1-I3
-//! are established at the mints and carried by ownership; I4 is
-//! maintained entirely by safe code (the handshake protocol); I5 is
-//! a type-level consequence of the mint's dispatch.
-//!
-//! - **I1 (one chain per slot):** every slot (`K` cell) and every
-//!   state inside it is reachable through exactly ONE handle chain.
-//!   Established: `independent_task_root` takes `&mut K` (borrowck
-//!   forbids a second path), `fanout`'s split yields each child
-//!   exactly once and disjointly (the `&mut` yields are disjoint by
-//!   construction, and the HRTB closure cannot stash them), and
-//!   `replace` writes the cell while holding `&mut self` (the only
-//!   chain). Maintained by safe code: handles are `!Clone`, states'
-//!   methods can only reach their own subtree, and the `'o`/`'n`
-//!   brands keep handles inside their task/callback.
-//! - **I2 (slot stability):** a slot cell stays live at a fixed
-//!   address for its whole task: the root task borrows `&mut K` for
-//!   the call; children cells live inside their parent's state,
-//!   which the parent exclusively owns.
-//! - **I3 (the stored line):** minted state raws carry the pointer
-//!   line the container's `Deref`s spring from (the `AsPtr`
-//!   contract), never a freshly minted reference — so the checker's
-//!   reads (which spring from the same line) are ancestors in the
-//!   borrow tree, not demoting siblings. This is what keeps
-//!   mutate-after-checkpoint defined under Tree Borrows.
-//! - **I4 (the world stops):** `Checkpointer::request` returns a
-//!   guard only after every registered mutator parked; a parked
-//!   mutator provably holds no deref borrow (safepoint takes
-//!   `&mut self`, so borrowck forbids a live borrow across it).
-//! - **I5 (T-matching):** a handle's `T` equals the type of the
-//!   object its raw points at: the raw is minted through a dyn
-//!   dispatch ON that object, and `box_innerhandle`'s receiver IS
-//!   that object (so `from_mut`-of-receiver cannot disagree).
+//! Shortcut kept from the sketch (still, per the 00:09 step): the
+//! InnerHandle points at the HOLDER (the erased box slot), derefs
+//! through the holder chain onto T.
 
 #![feature(unsize)]
 
+use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -265,10 +235,11 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
 /// (and everything minted under it, via `fanout`'s own `'n`)
 /// structurally cannot leave that call.
-pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
+pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
     current: Box<V>,
-    /// the K cell this chain owns — `replace`'s write target, typed
-    slot: *mut K,
+    /// the ChildNode cell this chain owns — `replace`'s write
+    /// target, typed at the wrapper (the container K lives inside)
+    slot: *mut ChildNode<K>,
     /// the chain's parking identity — passed on across installs
     shared: Arc<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign
@@ -276,56 +247,45 @@ pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-/// The mutator-side handle: `state` (the stored-line raw handed out
-/// by `K::as_ptr` at the mint; its `T` is the pointed object's own
-/// type, fixed by the dyn dispatch that minted it — I5) and the
-/// parking `status`. It knows nothing of the slot — that is the
+/// The mutator-side handle: `state` (deref's target — captured at
+/// the mint from the receiver itself, so its `T` is the pointed
+/// object's own type, fixed by the dyn dispatch that minted it) and
+/// the parking `status`. It knows nothing of the slot — that is the
 /// `OuterHandle`'s business (the mutator drives, the outer installs).
 ///
-/// No dispatch happens at deref time — the container is consulted
-/// only at the mint, through `as_ptr`. A lying `as_ptr` can
-/// therefore only choose WHICH honest handle is minted (whatever
-/// object it points to is dispatched on, and its type must satisfy
-/// the `Unsize` judgement to be reachable at all — so `T` always
-/// matches the object); it can never produce a `T`/object mismatch.
+/// No dispatch happens at deref time — K's `DerefMut` is consulted
+/// ONCE, at the mint. A lying custom `DerefMut` can therefore only
+/// choose WHICH honest handle is minted (whatever object it returns
+/// is dispatched on, and its type must satisfy the `Unsize<V>`
+/// judgement to be returnable at all — so `T` always matches the
+/// object); it can never produce a `T`/object mismatch.
 ///
-/// K's own obligation is `AsPtr`'s requirement 2: the backing store
-/// is not deleted until the container's next `&mut` method call —
-/// and the only writer of the slot while a handle lives is
-/// `replace` (on the outer), which re-mints the pair.
+/// K's own obligation shrinks to: not get rid of the returned
+/// pointer while the handle lives — and it cannot do so safely: the
+/// `&'x mut T` was taken out of the library's own `&'x mut K`, and
+/// the only writer of the slot while a handle lives is `replace`
+/// (on the outer), which re-mints the pair.
 pub struct InnerHandle<T: ?Sized, V: ?Sized> {
-    /// the state raw — carrying the STORED LINE per the `AsPtr`
-    /// contract (`K::as_ptr`'s return, the same line the container's
-    /// `Deref`s spring from), never a freshly minted reference. Every
-    /// deref mints a FRESH reference off it; nothing persistent is
-    /// ever a mutable line (I3).
+    /// the state raw — carrying the box's STORED provenance (minted
+    /// by a raw borrow of the K's deref place, not from any materialized
+    /// `&mut`), so the persistent line's path to the allocation root
+    /// crosses no plain mutable node. Every deref mints a FRESH
+    /// reference off it; nothing persistent is ever a mutable line.
     state: *mut T,
     status: Arc<Shared>,
     _marker: PhantomData<fn(*mut T, *mut V)>,
 }
 
-// SAFETY (preconditions of the construct): a raw `*mut T` may be
-// moved to another thread only if (a) no access to the pointee
-// remains on the sending thread, and (b) the pointee's data may
-// cross threads (`T: Send`).
-// Why they hold: (a) is I1 — the handle is the one chain to this
-// state, it is `!Clone`, and moving it moves the exclusivity with
-// it; the sending thread keeps no other path (the mint consumed the
-// only `&mut` chain, and safe code cannot copy a raw out of a
-// private field). (b) is supplied by the `T: Send` bound. The other
-// fields (`Arc<Shared>`, fn-marker) are `Send` by construction.
+// Sound: the state raw is exclusively reachable through this handle
+// for its life (the mint's discipline), the status Arc is Send+Sync,
+// and T: Send crosses with it.
 unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 
-// SAFETY (preconditions of the construct): the payload — `Box<V>`
-// (an `InnerHandle`: its `T: Send` via the `HandleAble` blanket),
-// the slot raw `*mut K` (crossing moves the cell's exclusivity, so
-// the cell's pointee must be `Send`: `K: Send`), and `Arc<Shared>`
-// — may cross threads only with no residual access on the sender
-// and all crossed data `Send`.
-// Why they hold: I1 (the outer is the one chain over both the cell
-// and the inner handle; `!Clone`; safe code cannot extract the
-// fields), and every field is `Send` under the stated bounds.
-unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
+// The payload crosses threads: the box (an InnerHandle: its T: Send
+// by the HandleAble blanket), and the K cell it exclusively owns —
+// moving the outer moves the exclusive access to both, so K must be
+// Send for the pointee's sake.
+unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
 /// through a **Weak** (the mutator side owns the last strong `Arc` —
@@ -345,26 +305,17 @@ unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, 
 /// `OuterHandle` — it cannot leave the call either. It has no `V`:
 /// nothing V-typed crosses it, the guard derefs straight to `K`.
 pub struct Checkpointer<'o, K> {
-    slot: *mut K,
+    slot: *mut ChildNode<K>,
     weak: Weak<Shared>,
     gate: Arc<Mutex<()>>,
     _brand: PhantomData<fn(&'o ()) -> &'o K>,
 }
 
-// SAFETY (preconditions of the construct): `Send` — the raw slot
-// pointer crosses threads; sound only if it is never dereferenced
-// outside a guard and the pointee data may cross (`K: Send`).
-// Why they hold: the field is private; the ONLY dereference site is
-// `CheckpointGuard::deref`, and a guard exists only after the
-// handshake parked every mutator (I4, maintained by the safe
-// protocol code); `K: Send` is the bound. `Sync` — sharing `&K` of
-// the CHECKPOINTER exposes only the gate (`Arc<Mutex>`: `Sync`) and
-// the `Weak` (`Sync`); the slot raw is only read under the gate, so
-// concurrent `request`s serialize and still never coexist with a
-// running mutator.
+// SAFETY: the slot pointer is only dereferenced through a guard,
+// which exists exclusively while every mutator is parked (see
+// `request`); the data crosses threads, so K must be Send.
 unsafe impl<'o, K: Send> Send for Checkpointer<'o, K> {}
-// SAFETY: as the `Send` justification above — no slot data is
-// shared by sharing the checkpointer; the gate serializes guards.
+// SAFETY: as Send — sharing the checkpointer shares no slot data.
 unsafe impl<'o, K: Send> Sync for Checkpointer<'o, K> {}
 
 impl<'o, K> Clone for Checkpointer<'o, K> {
@@ -428,7 +379,7 @@ impl<'o, K: Send> Checkpointer<'o, K> {
 /// here the erasure makes the guard read-only. Dropping the guard
 /// resumes the world.
 pub struct CheckpointGuard<'a, K> {
-    slot: *mut K,
+    slot: *mut ChildNode<K>,
     /// Some: the world is stopped under our request — the drop
     /// releases it. None: the mutator side was already gone — access
     /// is free and the drop has nothing to resume.
@@ -442,19 +393,11 @@ pub struct CheckpointGuard<'a, K> {
 }
 
 impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
-    type Target = K;
-    fn deref(&self) -> &K {
-        // SAFETY (preconditions of the construct): `&*self.slot`
-        // requires the slot to be live and no conflicting access to
-        // its content while the shared read is outstanding.
-        // Why they hold: liveness is I2 (the root task's `&mut K`
-        // outlives every guard — the checkpointer cannot leave the
-        // task, so neither can the guard); no conflicting access is
-        // I4: the handshake returned `Parked` (or `Closed`), every
-        // mutator is parked holding no deref borrow, and the world
-        // cannot resume until this guard drops (the guard holds the
-        // gate, and only `Drop` releases the request) — all of it
-        // maintained by the safe protocol code.
+    type Target = ChildNode<K>;
+    fn deref(&self) -> &ChildNode<K> {
+        // SAFETY: the guard exists only while the handshake proved
+        // every mutator parked (or gone); the reborrow is tied to the
+        // guard, so the world cannot resume underneath it.
         unsafe { &*self.slot }
     }
 }
@@ -468,34 +411,26 @@ impl<K> Drop for CheckpointGuard<'_, K> {
     }
 }
 
-/// The root task: mint the `OuterHandle` over `slot` and hand the
-/// callback BOTH the outer handle and its `Checkpointer`, keeping
-/// `slot` borrowed for the whole call. The `'o` brand arises only
-/// inside this higher-ranked closure, so neither handle can leave
-/// the call — the discipline is structural. Safe to call for any
-/// `K` meeting the bounds: all of the callee's obligations are
-/// discharged by this function's own signature and the bounds —
-/// there are no caller-side preconditions beyond the type system.
+/// The root task: mint the `OuterHandle` over `slot`, hand the
+/// callback BOTH the outer handle and its `Checkpointer`, and keep
+/// `slot` inaccessible (borrowed) for the whole call. The `'o` brand
+/// arises only inside this higher-ranked closure, so neither handle
+/// can leave the call — the discipline is structural.
 pub fn independent_task_root<K, V: ?Sized + 'static, R>(
-    slot: &mut K,
+    slot: &mut ChildNode<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut + AsPtr + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
     // invalidate the first raw's tag (the function-entry retag).
-    let slot_ptr: *mut K = std::ptr::from_mut(slot);
-    // SAFETY (preconditions of the construct, from `over_slot`'s
-    // contract): the slot raw must point to a live, exclusively-
-    // reachable `K` for the handle's whole life.
-    // Why they hold: liveness and exclusivity are the present
-    // function's own `&mut K` — borrowck guarantees no other path to
-    // the cell exists for the duration of the call (I1/I2), and the
-    // handles cannot outlive the call (the `'o` brand arises only
-    // inside `f`'s HRTB, so neither handle can escape `f`'s type).
+    // SAFETY: slot is exclusively borrowed for the whole call (the
+    // fn signature itself); the outer and the checkpointer die
+    // before it returns.
+    let slot_ptr: *mut ChildNode<K> = std::ptr::from_mut(slot);
     let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
@@ -509,44 +444,34 @@ where
     f(outer, checkpointer)
 }
 
-impl<'o, K: ?Sized, V: ?Sized> OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> OuterHandle<'o, K, V> {
     fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 }
 
-// The OUTER-VIEW INVARIANT, used by both derefs below: the private
-// field `current` ALWAYS holds a `Box<InnerHandle<T, V>>` (erased
-// to `Box<V>`) minted by `box_innerhandle` over this chain's slot.
-// Maintained by safe code: the only constructors of `OuterHandle`
-// are `over_slot`, `fanout`, and `replace`, and each stores exactly
-// a `box_innerhandle` result (never anything else) into `current`.
-impl<'o, K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     type Target = V;
     fn deref(&self) -> &V {
-        // SAFETY (preconditions of the construct): viewing the box's
-        // contents as `V` requires them to BE an `InnerHandle<_, V>`
-        // (a `Box<V>` could hold any V — the type does not know).
-        // Why they hold: the outer-view invariant above; the Unsize
-        // coercion at the mint made the erasure type-correct, so
-        // `&V` dispatches to the inner handle's `V` impl, and the
-        // reference is tied to `&self` (the box outlives it).
+        // the box is the load-bearing invariant (always an
+        // InnerHandle<_, V> over the K-shaped slot) — deref lands on
+        // the V through it, the box itself is never handed out
+        // SAFETY: the box holds an InnerHandle<_, V> (the invariant);
+        // viewing it as the V it erases is the Unsize correspondence.
         unsafe { &*(self.current.as_ref() as *const V) }
     }
 }
 
-impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
     fn deref_mut(&mut self) -> &mut V {
-        // SAFETY: as `Deref` (the outer-view invariant), plus
-        // exclusivity: `&mut self` is the one chain (I1) and no guard
-        // can coexist with it (I4).
+        // SAFETY: as Deref — exclusive.
         unsafe { &mut *(self.current.as_mut() as *mut V) }
     }
 }
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: DerefMut + AsPtr + Send + 'static,
+    K: DerefMut + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
@@ -554,57 +479,41 @@ where
     ///
     /// # Safety
     ///
-    /// `slot` must point to a live `K` that stays live, at that
-    /// address, exclusively reachable through the minted handle's
-    /// chain for the handle's whole life (I1/I2), and must not be
-    /// reachable by shared reference from other threads meanwhile
-    /// (a shared `Deref` would alias the exclusive pointee).
+    /// The `&mut` resolves validity and mint-time exclusivity by
+    /// construction; what remains:
+    ///
+    /// - The `K` must stay valid and live, at that address, for the
+    ///   handle's whole life (the raw stored in the minted chain
+    ///   derives from this `&mut`).
+    /// - The `K` must not be reachable by shared reference from other
+    ///   threads while the handle lives: its `Deref` would alias the
+    ///   pointee the chain owns exclusively.
+    /// - Every `&mut` into the slot that is active during the
+    ///   handle's lifetime must be derived from this pointer.
+    /// - Such a `&mut` must either come from `DerefMut` (the chain's
+    ///   own derefs), or exist only while the handle's `Shared` is
+    ///   parked (a guard's world-stopped access).
     ///
     /// The constructor establishes the `OuterHandle` invariant: the
-    /// box is a valid `InnerHandle<T, V>` minted over this slot's
-    /// `as_ptr` line, and the typed `slot` stored here is exactly
-    /// the `K` cell the raw was taken from.
-    ///
-    /// Crate-internal; the only caller is `independent_task_root`,
-    /// which discharges all of it via its `&mut K` signature.
-    unsafe fn over_slot(slot: *mut K) -> Self
+    /// box is a valid `InnerHandle<T, V>` whose `state` is the raw
+    /// of the pointee of the `K` as stored by the box (the loaded
+    /// provenance), and the typed `slot` stored here is exactly the
+    /// `K` cell the raw was taken from.
+    unsafe fn over_slot(slot: *mut ChildNode<K>) -> Self
     where
         K: Sized,
     {
-        // SAFETY (preconditions of the construct): `&mut *slot`
-        // requires a live, unaliased pointee.
-        // Why they hold: this function's own contract above (I1/I2,
-        // discharged by the one caller's `&mut K`).
-        let k: &mut K = unsafe { &mut *slot };
-        // `as_ptr` is a safe call carrying an unsafe CONTRACT; its
-        // two requirements hold per K's own `AsPtr` impl, and the
-        // caller-side discipline (exclusive ownership for the
-        // handle's life) is this function's contract above.
-        let state_raw: *mut K::Target = K::as_ptr(k);
-        // SAFETY (preconditions of the construct): dereferencing
-        // `state_raw` as `&mut dyn HandleAble<V>` requires the fat
-        // raw to be live, to point at an object whose type both
-        // implements `HandleAble<V>` and coerces to it, and to be
-        // exclusive for the borrow.
-        // Why they hold: liveness and same-object-as-Deref are
-        // `AsPtr`'s requirements 1-2 (K's impl); the type judgement
-        // is the where-clause `K::Target: Unsize<dyn HandleAble<V>>`
-        // (the upcast is type-correct by the bound); exclusivity is
-        // I1 (this chain is the only one). The receiver `erased` is
-        // transient: it dies at the end of this statement.
-        let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+        // the state raw: deref_mut EXPLICITLY at the raw-mut side —
+        // the returned reference is cast to the raw on the spot; the
+        // dispatch receiver below is transient and dies at return
+        // SAFETY: the caller's contract above.
+        let k: &mut K = unsafe { (*slot).as_mut_k() };
+        let target: &mut K::Target = DerefMut::deref_mut(k);
+        let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+        let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
-        // SAFETY (preconditions of the construct, from
-        // `box_innerhandle`'s contract): the receiver must BE the
-        // object at `state`; the raw must be kept live and exclusive
-        // for the returned handle's whole life; the `SharedRef` must
-        // be one of ours.
-        // Why they hold: the receiver was DERIVED from `state_raw`
-        // one statement up (same object — I5 fixes `T` to it);
-        // liveness/exclusivity are `AsPtr`'s requirement 2 plus I1
-        // (the handle is stored in `self.current` and dies with the
-        // chain); the `SharedRef` wraps the `shared` minted here.
+        // SAFETY: the receiver came from this slot (the contract).
         let current = unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(shared.clone())) };
         OuterHandle { current, slot, shared, _brand: PhantomData }
     }
@@ -616,47 +525,95 @@ where
     /// so parking identity is untouched.
     pub fn replace(&mut self, val: K) {
         // 1) the swap — plain assignment through the typed slot
-        // SAFETY (preconditions of the construct): writing through
-        // `*mut K` requires the cell to be live and no outstanding
-        // access to the OLD content when its `Drop` runs.
-        // Why they hold: liveness is I2 (the cell outlives the
-        // task); no outstanding access is I1 — this method holds
-        // `&mut self`, i.e. the only chain, so every state method
-        // has returned (borrowck on the driver side: `replace`
-        // cannot be called while a deref borrow is live), no guard
-        // exists (a guard would require this very chain to be
-        // parked, which it is not — it is executing here), and the
-        // old inner handle's raw dies with `self.current` below.
-        unsafe { *self.slot = val };
+        // SAFETY: the slot is live and exclusively reachable through
+        // this chain (the mint's discipline; the old inner handle is
+        // replaced by the re-mint below, so no stale pointer
+        // survives the write).
+        unsafe { *self.slot = ChildNode::new(val) };
         // 2) re-mint: use the HandleAble OF the replacement —
-        // reached through the slot it now lives in (K's own
-        // `as_ptr`) — to mint a fresh InnerHandle over that same
-        // slot, and assign it into the own box
+        // reachable through the slot it now lives in (K's own
+        // DerefMut, consulted once) — to mint a fresh InnerHandle
+        // over that same slot, and assign it into the own box
+        // SAFETY: the mint's discipline over the fresh slot content;
+        // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = {
-            // SAFETY (preconditions of the construct): `&mut
-            // *self.slot` requires a live, unaliased cell.
-            // Why they hold: I2 for liveness; I1 for aliasing (the
-            // `&mut self` receiver is the one chain; the write above
-            // installed `val` as the sole content one statement ago).
-            let k: &mut K = unsafe { &mut *self.slot };
-            // contract-bearing safe call, as at every mint (see
-            // `over_slot` for the full justification)
-            let state_raw: *mut K::Target = K::as_ptr(k);
-            // SAFETY: as the upcast deref in `over_slot`: live fat
-            // raw (AsPtr 1-2), type-correct upcast (the `Unsize`
-            // bound), exclusive (I1), transient receiver.
-            let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
-            // SAFETY: as the `box_innerhandle` call in `over_slot`:
-            // the receiver is the object at `state_raw` (derived one
-            // statement up; I5), the raw stays live/exclusive for
-            // the new handle's life (stored into `self.current`,
-            // replacing the old — the old raw is dead by I1), and
-            // the `SharedRef` wraps this chain's own `shared`.
+            // SAFETY: the slot is live and exclusively owned by this
+            // chain (the mint's discipline).
+            let k: &mut K = unsafe { (*self.slot).as_mut_k() };
+            let target: &mut K::Target = DerefMut::deref_mut(k);
+            let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+            // SAFETY: the upcast raw derives from the slot's own
+            // as_ptr line; transient receiver, dies at return.
+            let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+            // SAFETY: the mint's discipline over the fresh content.
             unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
         self.current = fresh;
     }
 }
+
+/// A child node in the tree: the container `K` behind the library's
+/// own `UnsafeCell`, so **both sides of a checkpoint reach it through
+/// shared references**. The mutator's fanout only needs `&self` (the
+/// split collects `&ChildNode<K>`), and the reader's guard sees the
+/// same wrapper — so references to the node may still exist whenever
+/// the client looks, and a client deleting or moving the container
+/// through its own interior mutability would do so while shared
+/// references to this wrapper are live: excluded, because taking the
+/// `K` out requires `&mut self` here, and no sound client code can
+/// produce that while our shared refs exist.
+///
+/// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
+/// `&mut self` — exclusive on the wrapper, the ordinary interior-
+/// mutability pattern). The fanout's mint path uses the crate-private
+/// [`ChildNode::as_mut_k`] — sound only under the chain's exclusivity
+/// discipline, which the library maintains.
+pub struct ChildNode<K> {
+    cell: UnsafeCell<K>,
+}
+
+impl<K: Sized> ChildNode<K> {
+    pub fn new(k: K) -> Self {
+        ChildNode { cell: UnsafeCell::new(k) }
+    }
+
+    /// The mint's escape hatch: `&self` to `&mut K`, sound only
+    /// under the chain's exclusivity discipline (one handle chain,
+    /// the split yielded this child exactly once, and the mutator is
+    /// the only writer between checkpoints).
+    ///
+    /// # Safety
+    ///
+    /// No other reference into the `K` may be live, and none may be
+    /// created, until the returned reference's borrow of the chain
+    /// ends (the mint's discipline).
+    #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is ChildNode's whole point; soundness rides the chain's exclusivity (the safety contract above)
+    pub(crate) unsafe fn as_mut_k(&self) -> &mut K {
+        // SAFETY: the caller's contract above — this is the wrapper's
+        // own UnsafeCell, accessed under the library's exclusivity.
+        unsafe { &mut *self.cell.get() }
+    }
+}
+
+impl<K> Deref for ChildNode<K> {
+    type Target = K;
+    fn deref(&self) -> &K {
+        // SAFETY: shared access to the cell's content — the wrapper's
+        // own UnsafeCell grants exactly this.
+        unsafe { &*self.cell.get() }
+    }
+}
+
+impl<K> DerefMut for ChildNode<K> {
+    fn deref_mut(&mut self) -> &mut K {
+        // SAFETY: `&mut self` is exclusive on the wrapper — no other
+        // access can exist.
+        unsafe { &mut *self.cell.get() }
+    }
+}
+
+// The wrapper crosses threads exactly when its content does.
+unsafe impl<K: Send> Send for ChildNode<K> {}
 
 /// A container that can hand out the pointer its `Deref`s spring
 /// from — the provenance vehicle the mint needs.
@@ -681,31 +638,14 @@ where
 pub unsafe trait AsPtr: DerefMut {
     /// The pointer to the container's current pointee, on the
     /// stored line (see the trait's safety requirements).
-    ///
-    /// For callers (the library's mints): the returned raw is kept
-    /// for the minted handle's whole life; the caller must
-    /// exclusively own the container for that period, and must
-    /// re-mint (drop the old handle) before the container's next
-    /// `&mut` method call — both are the mint's existing discipline
-    /// (I1/I2), which is why the mints may call this safely.
     fn as_ptr(&mut self) -> *mut Self::Target;
 }
 
-// SAFETY (preconditions of the construct, from the trait):
-// requirement 1 — the raw must originate from the line the Derefs
-// spring from, not a freshly minted reference; requirement 2 — the
-// backing store must not be deleted until the next `&mut` method
-// call on the container.
-// Why they hold: (1) `&raw mut **self` borrows the BUILTIN box-deref
-// PLACE — the loaded stored pointer itself; no reference is
-// materialized (a raw borrow does not retag), so the raw carries
-// exactly the stored line that `Box::deref`/`deref_mut` hand out
-// references to. (2) a `Box` cannot delete or move its allocation
-// except by dropping or moving the box itself, which requires
-// exclusive access — the `&mut self` receiver here IS that access,
-// and the mint's discipline (I1/I2: the caller exclusively owns the
-// container and re-mints before the next `&mut` call) bounds every
-// previously returned raw's lifetime to end before any disposal.
+// SAFETY: `&raw mut **self` borrows the BUILTIN box-deref place —
+// the loaded stored pointer itself, no reference is materialized,
+// so the raw carries the stored line; and a `Box` cannot delete or
+// move its backing store except by dropping/moving the box, which
+// requires exclusive access (a `&mut` method call or the owner).
 unsafe impl<T: ?Sized> AsPtr for Box<T> {
     fn as_ptr(&mut self) -> *mut Self::Target {
         &raw mut **self
@@ -731,21 +671,15 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     ///
     /// # Safety
     ///
-    /// Caller preconditions:
+    /// For callers:
     ///
-    /// 1. The receiver must be the object living at `state` (the
-    ///    returned handle stores that raw and derefs through it).
-    /// 2. The pointee of `state` must stay valid, live, and
-    ///    exclusively reachable through the returned handle's chain
-    ///    for that handle's whole life.
-    /// 3. No other thread may hold shared access to the container
-    ///    while the handle lives (its `Deref` would alias the
-    ///    exclusive pointee).
-    ///
-    /// The library's three mint sites discharge 1 by deriving the
-    /// receiver from the same `as_ptr` raw (I5: the dispatch fixes
-    /// `T` to that object), 2 by `AsPtr`'s requirement 2 plus I1/I2,
-    /// and 3 by I1 (the container is exclusively owned by the chain).
+    /// - The `&mut self` receiver resolves validity and mint-time
+    ///   exclusivity by construction; what remains: the K container
+    ///   the receiver was taken from must stay valid and live at
+    ///   that address for the returned handle's whole life.
+    /// - The `K` must not be reachable by shared reference from other
+    ///   threads while the handle lives: its `Deref` would alias the
+    ///   pointee this handle owns exclusively.
     ///
     /// The `SharedRef` argument is the seal as well as the payload:
     /// it is an opaque shell (`Shared` private, the field private),
@@ -754,25 +688,15 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V>;
 }
 
-// SAFETY (preconditions of the construct, from the trait): the
-// impl is only allowed in-crate (upheld: it is written here); `T`
-// must unsized-coerce (`InnerHandle<T, V>: Unsize<V>` — the
-// where-clause); the returned `Box` must be the `InnerHandle<T, V>`
-// over the PASSED raw.
-// Why they hold: the body stores the passed raw VERBATIM (never a
-// receiver-derived one — the receiver is only the dispatch vehicle;
-// I5 already fixed `T` to the object it points at, so raw and
-// receiver agree by construction), and the returned box coerces by
-// the where-clause. `T: Send` upholds the trait's supertrait.
 unsafe impl<T: Send, V: ?Sized> HandleAble<V> for T
 where
     InnerHandle<T, V>: Unsize<V>,
 {
     unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V> {
         // T is fixed by the dispatch that landed here; the persisted
-        // raw is the PASSED one — the stored line (`as_ptr`'s). (A
-        // receiver-derived raw would sit above a plain `&mut` line
-        // that child writes turn Unique and the saves then Freeze —
+        // raw is the PASSED one — the box's stored provenance. (Off
+        // the receiver it would sit above a plain `&mut` line that
+        // child writes turn Unique and the saves then Freeze —
         // measured, see the thread.)
         let raw: *mut T = state as *mut T;
         // bind at the sized type, then let the return coerce
@@ -819,60 +743,53 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// carries an `'o` of its own.
     pub fn fanout<K, F, R>(
         &mut self,
-        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync),
+        split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x ChildNode<K>> + Send + Sync),
         f: F,
     ) -> Vec<R>
     where
         T: Send,
         V: Send + 'static,
-    K: DerefMut + AsPtr + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
-        // Collect offsite under the &mut node borrow (the ROOT's
-        // pattern): the split's references die at the raw conversion,
-        // the earliest point; everything after touches only raws.
-        let child_raws: Vec<*mut K> = {
-            let node: &mut T = self;
-            split(node).into_iter().map(std::ptr::from_mut).collect()
+        // Collect offsite through a SHARED node borrow: the split
+        // hands out `&ChildNode<K>` — the references may still be
+        // alive from the reader's perspective, which is exactly what
+        // excludes the client deleting the containers through sound
+        // interior mutability. The library then unsafely turns them
+        // into the mint's raws (the chain's exclusivity discipline).
+        let child_nodes: Vec<&ChildNode<K>> = {
+            let node: &T = self;
+            split(node)
         };
-        // MINT THE BOXES: each slot becomes a Box<V> via the blanket
-        // impl — the transient receiver derives from the `as_ptr`
-        // raw (the stored line). The typed raw and the child's
-        // Shared ride along for the outer that owns them.
-        let mints: Vec<(Box<V>, *mut K, Arc<Shared>)> = child_raws
+        // MINT THE BOXES: each ChildNode's container becomes a Box<V>
+        // via the blanket impl. The K-side access goes through the
+        // wrapper's escape hatch (`&self -> &mut K`, the chain's
+        // exclusivity); the stored line is taken by the AsPtr
+        // contract; the typed slot raw of the WRAPPER rides along for
+        // the outer that owns it.
+        let mints: Vec<(Box<V>, *mut ChildNode<K>, Arc<Shared>)> = child_nodes
             .into_iter()
-            .map(|raw| {
-                // SAFETY (preconditions of the construct): `&mut
-                // *raw` requires a live, unaliased child cell.
-                // Why they hold: the split (safe code, HRTB) yielded
-                // each child exactly once and disjointly — an
-                // `iter_mut`-style collector cannot alias — and the
-                // children live inside the parent's state, which
-                // this chain exclusively owns (I1/I2).
-                let k: &mut K = unsafe { &mut *raw };
-                // contract-bearing safe call, as at every mint
-                let state_raw: *mut K::Target = K::as_ptr(k);
-                // SAFETY: as the upcast deref in `over_slot`: live
-                // fat raw (AsPtr 1-2), type-correct upcast (the
-                // `Unsize` bound), exclusive (I1), transient.
-                let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+            .map(|child| {
+                // SAFETY: the split yielded each child exactly once,
+                // disjointly; the chain is the exclusive writer
+                // between checkpoints — the mint's discipline.
+                let k: &mut K = unsafe { child.as_mut_k() };
+                let target: &mut K::Target = DerefMut::deref_mut(k);
+                let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+                let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)
                 let child_shared = Arc::new(Shared::new());
                 self.status.register_child(&child_shared);
-                // SAFETY: as the `box_innerhandle` call in
-                // `over_slot`: the receiver is the object at
-                // `state_raw` (I5), the raw stays live/exclusive for
-                // the child handle's life (the handle moves into the
-                // child outer, whose brand confines it to the
-                // callback), and the `SharedRef` wraps the child's
-                // own freshly minted `shared`.
+                // SAFETY: the receiver came from this child's
+                // stored line; yielded exactly once, exclusive.
                 let current =
                     unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone())) };
-                (current, raw, child_shared)
+                (current, child as *const ChildNode<K> as *mut ChildNode<K>, child_shared)
             })
             .collect();
         // wrap each box in the OUTER handle — the child's typed slot
@@ -921,30 +838,18 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
 impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY (preconditions of the construct): `&*self.state`
-        // requires the raw to be live and `T` to be the pointee's
-        // type; a shared read must not race another access.
-        // Why they hold: liveness is the mint's contract (the raw is
-        // kept live for the handle's life — `AsPtr` requirement 2
-        // plus I2); type agreement is I5; and the only possible
-        // cross-chain reader is a checkpoint guard, which cannot
-        // exist while this handle's chain is executing (I4: a guard
-        // exists only while every mutator — including this one — is
-        // parked, and a parked chain holds no deref borrow because
-        // `safepoint` takes `&mut self`).
+        // a FRESH reference off the stored-provenance raw — nothing
+        // persistent is ever a mutable line
+        // SAFETY: the raw is live per the mint's discipline; T is
+        // the pointed object's own type (the dispatch that minted
+        // this handle fixed them together).
         unsafe { &*self.state }
     }
 }
 
 impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY (preconditions of the construct): `&mut
-        // *self.state` requires live, type-matching, UNALIASED
-        // pointee for the borrow.
-        // Why they hold: as `Deref` (mint contract, I5), plus
-        // exclusivity: `&mut self` is the one chain (I1), and no
-        // guard can coexist with a running chain (I4) — so no other
-        // access exists anywhere for the borrow's duration.
+        // SAFETY: as Deref — exclusive, tied to `&mut self`.
         unsafe { &mut *self.state }
     }
 }

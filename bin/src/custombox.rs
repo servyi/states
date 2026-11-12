@@ -4,7 +4,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -22,8 +22,8 @@ impl Drop for CustomBox {
     }
 }
 
-// plain Deref/DerefMut to the erased target; the container's one
-// piece of unsafe is the AsPtr impl below (the stored-line dig)
+// plain Deref/DerefMut to the erased target — the crate's AsErased
+// blanket covers this K with zero unsafe
 impl Deref for CustomBox {
     type Target = dyn HandleAble<dyn Trait>;
     fn deref(&self) -> &Self::Target {
@@ -36,15 +36,9 @@ impl DerefMut for CustomBox {
     }
 }
 
-// SAFETY (preconditions of the construct, from the trait):
-// requirement 1 — the stored line, not a fresh reference;
-// requirement 2 — the store survives until the next `&mut` call.
-// Why they hold: (1) `&raw mut *self.0` borrows the inner builtin
-// box's deref place — no reference materialized, the same stored
-// line the container's `Deref` (`&*self.0`) springs from. (2) the
-// counted-Drop wrapper can only dispose by dropping `self.0`, which
-// needs `&mut` access; the mint's discipline bounds every prior
-// raw before that (I1/I2).
+// SAFETY: the pointer is the inner builtin box's stored line (the
+// raw borrow of the builtin deref place); the store can only be
+// deleted by dropping the box, which needs exclusive access.
 unsafe impl hslib::AsPtr for CustomBox {
     fn as_ptr(&mut self) -> *mut Self::Target {
         &raw mut *self.0
@@ -52,7 +46,7 @@ unsafe impl hslib::AsPtr for CustomBox {
 }
 
 struct MyStruct {
-    children: Vec<CustomBox>,
+    children: Vec<ChildNode<CustomBox>>,
 }
 struct YourStruct {
     val: i32,
@@ -61,7 +55,7 @@ struct YourStruct {
 impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
-            &|m: &mut MyStruct| m.children.iter_mut().collect(),
+            &|m: &MyStruct| m.children.iter().collect(),
             |mut o| {
                 // the child installs a successor built with the
                 // CLIENT'S constructor — the library never constructs
@@ -82,12 +76,12 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
 }
 
 fn main() {
-    let mut m = CustomBox(Box::new(MyStruct {
+    let mut m = ChildNode::new(CustomBox(Box::new(MyStruct {
         children: vec![
-            CustomBox(Box::new(YourStruct { val: 5 })),
-            CustomBox(Box::new(YourStruct { val: 7 })),
+            ChildNode::new(CustomBox(Box::new(YourStruct { val: 5 }))),
+            ChildNode::new(CustomBox(Box::new(YourStruct { val: 7 }))),
         ],
-    }));
+    })));
     independent_task_root(&mut m, |mut outer, _ck| {
         let first = outer.bark();
         println!("sum: {} (children replaced themselves)", first);

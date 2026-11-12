@@ -9,7 +9,7 @@
 //!
 //! The guard then speaks the vocabulary directly: `guard.save()`.
 
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -24,7 +24,7 @@ trait SaveAble: HandleAble<dyn Trait> {
 type SaveSlot = Box<dyn SaveAble>;
 
 struct MyStruct {
-    children: Vec<SaveSlot>,
+    children: Vec<ChildNode<SaveSlot>>,
 }
 struct YourStruct {
     val: i32,
@@ -33,7 +33,7 @@ struct YourStruct {
 impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
-            &|m: &mut MyStruct| m.children.iter_mut().collect(),
+            &|m: &MyStruct| m.children.iter().collect(),
             |mut o| {
                 // THE CHILD-CALLBACK INSTALL: the callback owns its
                 // outer, constructs the successor K at the call site,
@@ -67,12 +67,12 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m: SaveSlot = Box::new(MyStruct {
+    let mut m: ChildNode<SaveSlot> = ChildNode::new(Box::new(MyStruct {
         children: vec![
-            Box::new(YourStruct { val: 5 }),
-            Box::new(YourStruct { val: 7 }),
+            ChildNode::new(Box::new(YourStruct { val: 5 })),
+            ChildNode::new(Box::new(YourStruct { val: 7 })),
         ],
-    });
+    }));
     independent_task_root(&mut m, |mut outer, checkpointer| {
         let ck = checkpointer.clone();
         std::thread::scope(|scope| {
