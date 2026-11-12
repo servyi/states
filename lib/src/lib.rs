@@ -8,6 +8,7 @@
 
 #![feature(unsize)]
 
+use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -234,10 +235,11 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
 /// (and everything minted under it, via `fanout`'s own `'n`)
 /// structurally cannot leave that call.
-pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
+pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
     current: Box<V>,
-    /// the K cell this chain owns — `replace`'s write target, typed
-    slot: *mut K,
+    /// the ChildNode cell this chain owns — `replace`'s write
+    /// target, typed at the wrapper (the container K lives inside)
+    slot: *mut ChildNode<K>,
     /// the chain's parking identity — passed on across installs
     shared: Arc<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign
@@ -283,7 +285,7 @@ unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
 // by the HandleAble blanket), and the K cell it exclusively owns —
 // moving the outer moves the exclusive access to both, so K must be
 // Send for the pointee's sake.
-unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
+unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
 /// through a **Weak** (the mutator side owns the last strong `Arc` —
@@ -303,7 +305,7 @@ unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, 
 /// `OuterHandle` — it cannot leave the call either. It has no `V`:
 /// nothing V-typed crosses it, the guard derefs straight to `K`.
 pub struct Checkpointer<'o, K> {
-    slot: *mut K,
+    slot: *mut ChildNode<K>,
     weak: Weak<Shared>,
     gate: Arc<Mutex<()>>,
     _brand: PhantomData<fn(&'o ()) -> &'o K>,
@@ -377,7 +379,7 @@ impl<'o, K: Send> Checkpointer<'o, K> {
 /// here the erasure makes the guard read-only. Dropping the guard
 /// resumes the world.
 pub struct CheckpointGuard<'a, K> {
-    slot: *mut K,
+    slot: *mut ChildNode<K>,
     /// Some: the world is stopped under our request — the drop
     /// releases it. None: the mutator side was already gone — access
     /// is free and the drop has nothing to resume.
@@ -391,8 +393,8 @@ pub struct CheckpointGuard<'a, K> {
 }
 
 impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
-    type Target = K;
-    fn deref(&self) -> &K {
+    type Target = ChildNode<K>;
+    fn deref(&self) -> &ChildNode<K> {
         // SAFETY: the guard exists only while the handshake proved
         // every mutator parked (or gone); the reborrow is tied to the
         // guard, so the world cannot resume underneath it.
@@ -415,7 +417,7 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
 pub fn independent_task_root<K, V: ?Sized + 'static, R>(
-    slot: &mut K,
+    slot: &mut ChildNode<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
@@ -428,7 +430,7 @@ where
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let slot_ptr: *mut K = std::ptr::from_mut(slot);
+    let slot_ptr: *mut ChildNode<K> = std::ptr::from_mut(slot);
     let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
@@ -442,13 +444,13 @@ where
     f(outer, checkpointer)
 }
 
-impl<'o, K: ?Sized, V: ?Sized> OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> OuterHandle<'o, K, V> {
     fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 }
 
-impl<'o, K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     type Target = V;
     fn deref(&self) -> &V {
         // the box is the load-bearing invariant (always an
@@ -460,7 +462,7 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     }
 }
 
-impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
     fn deref_mut(&mut self) -> &mut V {
         // SAFETY: as Deref — exclusive.
         unsafe { &mut *(self.current.as_mut() as *mut V) }
@@ -497,7 +499,7 @@ where
     /// of the pointee of the `K` as stored by the box (the loaded
     /// provenance), and the typed `slot` stored here is exactly the
     /// `K` cell the raw was taken from.
-    unsafe fn over_slot(slot: *mut K) -> Self
+    unsafe fn over_slot(slot: *mut ChildNode<K>) -> Self
     where
         K: Sized,
     {
@@ -505,7 +507,7 @@ where
         // the returned reference is cast to the raw on the spot; the
         // dispatch receiver below is transient and dies at return
         // SAFETY: the caller's contract above.
-        let k: &mut K = unsafe { &mut *slot };
+        let k: &mut K = unsafe { (*slot).as_mut_k() };
         let state_raw: *mut K::Target = K::as_ptr(k);
         let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
         // the chain's ORIGIN: a fresh root Shared moves in
@@ -526,7 +528,7 @@ where
         // this chain (the mint's discipline; the old inner handle is
         // replaced by the re-mint below, so no stale pointer
         // survives the write).
-        unsafe { *self.slot = val };
+        unsafe { *self.slot = ChildNode::new(val) };
         // 2) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (K's own
         // DerefMut, consulted once) — to mint a fresh InnerHandle
@@ -536,7 +538,7 @@ where
         let fresh: Box<V> = {
             // SAFETY: the slot is live and exclusively owned by this
             // chain (the mint's discipline).
-            let k: &mut K = unsafe { &mut *self.slot };
+            let k: &mut K = unsafe { (*self.slot).as_mut_k() };
             let state_raw: *mut K::Target = K::as_ptr(k);
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
@@ -547,6 +549,69 @@ where
         self.current = fresh;
     }
 }
+
+/// A child node in the tree: the container `K` behind the library's
+/// own `UnsafeCell`, so **both sides of a checkpoint reach it through
+/// shared references**. The mutator's fanout only needs `&self` (the
+/// split collects `&ChildNode<K>`), and the reader's guard sees the
+/// same wrapper — so references to the node may still exist whenever
+/// the client looks, and a client deleting or moving the container
+/// through its own interior mutability would do so while shared
+/// references to this wrapper are live: excluded, because taking the
+/// `K` out requires `&mut self` here, and no sound client code can
+/// produce that while our shared refs exist.
+///
+/// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
+/// `&mut self` — exclusive on the wrapper, the ordinary interior-
+/// mutability pattern). The fanout's mint path uses the crate-private
+/// [`ChildNode::as_mut_k`] — sound only under the chain's exclusivity
+/// discipline, which the library maintains.
+pub struct ChildNode<K> {
+    cell: UnsafeCell<K>,
+}
+
+impl<K: Sized> ChildNode<K> {
+    pub fn new(k: K) -> Self {
+        ChildNode { cell: UnsafeCell::new(k) }
+    }
+
+    /// The mint's escape hatch: `&self` to `&mut K`, sound only
+    /// under the chain's exclusivity discipline (one handle chain,
+    /// the split yielded this child exactly once, and the mutator is
+    /// the only writer between checkpoints).
+    ///
+    /// # Safety
+    ///
+    /// No other reference into the `K` may be live, and none may be
+    /// created, until the returned reference's borrow of the chain
+    /// ends (the mint's discipline).
+    #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is ChildNode's whole point; soundness rides the chain's exclusivity (the safety contract above)
+    pub(crate) unsafe fn as_mut_k(&self) -> &mut K {
+        // SAFETY: the caller's contract above — this is the wrapper's
+        // own UnsafeCell, accessed under the library's exclusivity.
+        unsafe { &mut *self.cell.get() }
+    }
+}
+
+impl<K> Deref for ChildNode<K> {
+    type Target = K;
+    fn deref(&self) -> &K {
+        // SAFETY: shared access to the cell's content — the wrapper's
+        // own UnsafeCell grants exactly this.
+        unsafe { &*self.cell.get() }
+    }
+}
+
+impl<K> DerefMut for ChildNode<K> {
+    fn deref_mut(&mut self) -> &mut K {
+        // SAFETY: `&mut self` is exclusive on the wrapper — no other
+        // access can exist.
+        unsafe { &mut *self.cell.get() }
+    }
+}
+
+// The wrapper crosses threads exactly when its content does.
+unsafe impl<K: Send> Send for ChildNode<K> {}
 
 /// A container that can hand out the pointer its `Deref`s spring
 /// from — the provenance vehicle the mint needs.
@@ -676,7 +741,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// carries an `'o` of its own.
     pub fn fanout<K, F, R>(
         &mut self,
-        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync),
+        split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x ChildNode<K>> + Send + Sync),
         f: F,
     ) -> Vec<R>
     where
@@ -687,25 +752,29 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
-        // Collect offsite under the &mut node borrow (the ROOT's
-        // pattern): the split's references die at the raw conversion,
-        // the earliest point; everything after touches only raws.
-        let child_raws: Vec<*mut K> = {
-            let node: &mut T = self;
-            split(node).into_iter().map(std::ptr::from_mut).collect()
+        // Collect offsite through a SHARED node borrow: the split
+        // hands out `&ChildNode<K>` — the references may still be
+        // alive from the reader's perspective, which is exactly what
+        // excludes the client deleting the containers through sound
+        // interior mutability. The library then unsafely turns them
+        // into the mint's raws (the chain's exclusivity discipline).
+        let child_nodes: Vec<&ChildNode<K>> = {
+            let node: &T = self;
+            split(node)
         };
-        // MINT THE BOXES: each slot becomes a Box<V> via the blanket
-        // impl — the receiver derives from the raw (one borrow
-        // stack). The typed raw and the child's Shared ride along
-        // for the outer that owns them.
-        let mints: Vec<(Box<V>, *mut K, Arc<Shared>)> = child_raws
+        // MINT THE BOXES: each ChildNode's container becomes a Box<V>
+        // via the blanket impl. The K-side access goes through the
+        // wrapper's escape hatch (`&self -> &mut K`, the chain's
+        // exclusivity); the stored line is taken by the AsPtr
+        // contract; the typed slot raw of the WRAPPER rides along for
+        // the outer that owns it.
+        let mints: Vec<(Box<V>, *mut ChildNode<K>, Arc<Shared>)> = child_nodes
             .into_iter()
-            .map(|raw| {
-                // the receiver: K's DerefMut consulted once, upcast
-                // via the judgement
-                // SAFETY: the split yielded each child exactly
-                // once, disjointly; exclusive for this mint.
-                let k: &mut K = unsafe { &mut *raw };
+            .map(|child| {
+                // SAFETY: the split yielded each child exactly once,
+                // disjointly; the chain is the exclusive writer
+                // between checkpoints — the mint's discipline.
+                let k: &mut K = unsafe { child.as_mut_k() };
                 let state_raw: *mut K::Target = K::as_ptr(k);
                 let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
                 // each child gets its OWN Shared (its parking
@@ -713,11 +782,11 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // — insert under the lock, release (the convention)
                 let child_shared = Arc::new(Shared::new());
                 self.status.register_child(&child_shared);
-                // SAFETY: the receiver came from this child's slot;
-                // yielded exactly once, disjointly, exclusive.
+                // SAFETY: the receiver came from this child's
+                // stored line; yielded exactly once, exclusive.
                 let current =
                     unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone())) };
-                (current, raw, child_shared)
+                (current, child as *const ChildNode<K> as *mut ChildNode<K>, child_shared)
             })
             .collect();
         // wrap each box in the OUTER handle — the child's typed slot

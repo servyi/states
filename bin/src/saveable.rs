@@ -9,7 +9,7 @@
 //! identity pass-through that made ReplaceAble deletable).
 
 use std::ops::{Deref, DerefMut};
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
 
 /// the drive vocabulary (as in the main demo)
 trait Trait: Send {
@@ -47,7 +47,7 @@ unsafe impl hslib::AsPtr for SaveSlot {
 }
 
 struct MyStruct {
-    children: Vec<SaveSlot>,
+    children: Vec<ChildNode<SaveSlot>>,
 }
 struct YourStruct {
     val: i32,
@@ -56,7 +56,7 @@ struct YourStruct {
 impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
-            &|m: &mut MyStruct| m.children.iter_mut().collect(),
+            &|m: &MyStruct| m.children.iter().collect(),
             |mut o| o.bark(),
         );
         self.safepoint();
@@ -83,12 +83,12 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m = SaveSlot(Box::new(MyStruct {
+    let mut m = ChildNode::new(SaveSlot(Box::new(MyStruct {
         children: vec![
-            SaveSlot(Box::new(YourStruct { val: 5 })),
-            SaveSlot(Box::new(YourStruct { val: 7 })),
+            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 5 }))),
+            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 7 }))),
         ],
-    }));
+    })));
     independent_task_root(&mut m, |mut outer, checkpointer| {
         // THE SNAPSHOT READS CLIENT VOCABULARY through the guard's &K
         let ck = checkpointer.clone();

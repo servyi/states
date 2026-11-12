@@ -4,7 +4,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use hslib::{HandleAble, InnerHandle, independent_task_root};
+use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -46,7 +46,7 @@ unsafe impl hslib::AsPtr for CustomBox {
 }
 
 struct MyStruct {
-    children: Vec<CustomBox>,
+    children: Vec<ChildNode<CustomBox>>,
 }
 struct YourStruct {
     val: i32,
@@ -55,7 +55,7 @@ struct YourStruct {
 impl Trait for InnerHandle<MyStruct, dyn Trait> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
-            &|m: &mut MyStruct| m.children.iter_mut().collect(),
+            &|m: &MyStruct| m.children.iter().collect(),
             |mut o| {
                 // the child installs a successor built with the
                 // CLIENT'S constructor — the library never constructs
@@ -76,12 +76,12 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
 }
 
 fn main() {
-    let mut m = CustomBox(Box::new(MyStruct {
+    let mut m = ChildNode::new(CustomBox(Box::new(MyStruct {
         children: vec![
-            CustomBox(Box::new(YourStruct { val: 5 })),
-            CustomBox(Box::new(YourStruct { val: 7 })),
+            ChildNode::new(CustomBox(Box::new(YourStruct { val: 5 }))),
+            ChildNode::new(CustomBox(Box::new(YourStruct { val: 7 }))),
         ],
-    }));
+    })));
     independent_task_root(&mut m, |mut outer, _ck| {
         let first = outer.bark();
         println!("sum: {} (children replaced themselves)", first);

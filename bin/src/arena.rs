@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use hslib::{Checkpointer, HandleAble, InnerHandle, OuterHandle, independent_task_root};
+use hslib::{Checkpointer, ChildNode, HandleAble, InnerHandle, OuterHandle, independent_task_root};
 
 trait Trait: Send {
     fn step(&mut self);
@@ -102,7 +102,7 @@ unsafe impl hslib::AsPtr for ArenaSlot {
 }
 
 struct Machine {
-    children: Vec<ArenaSlot>,
+    children: Vec<ChildNode<ArenaSlot>>,
     steps: i32,
 }
 struct Counter {
@@ -115,7 +115,7 @@ impl Trait for InnerHandle<Machine, dyn Trait> {
         // the children WRITE too — every arena line takes the
         // write-save-write ride, not just the root's
         self.fanout(
-            &|m: &mut Machine| m.children.iter_mut().collect(),
+            &|m: &Machine| m.children.iter().collect(),
             |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.step(),
         );
         self.safepoint();
@@ -124,7 +124,7 @@ impl Trait for InnerHandle<Machine, dyn Trait> {
         self.safepoint(); // the parking window
         let kids: Vec<String> = self
             .fanout(
-                &|m: &mut Machine| m.children.iter_mut().collect(),
+                &|m: &Machine| m.children.iter().collect(),
                 |mut o| o.observe(),
             )
             .into_iter()
@@ -175,13 +175,13 @@ fn park_save(
 }
 
 fn main() {
-    let m = ArenaSlot::new(Machine {
+    let m = ChildNode::new(ArenaSlot::new(Machine {
         children: vec![
-            ArenaSlot::new(Counter { val: 1 }),
-            ArenaSlot::new(Counter { val: 1 }),
+            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
+            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
         ],
         steps: 0,
-    });
+    }));
     independent_task_root(&mut { m }, |mut outer, ck| {
         let mut snaps = Vec::new();
         for _ in 0..3 {
