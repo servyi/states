@@ -46,8 +46,10 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
             &|m: &MyStruct| vec![&m.children[0], &m.children[0]],
             |mut o| o.bark(),
         );
-        assert_eq!(results.len(), 1, "duplicates are dropped");
-        println!("duplicate split: {} result", results.len());
+        // duplicates now SERIALIZE on the global claims registry:
+        // both subtasks run, one after the other
+        assert_eq!(results.len(), 2, "duplicates serialize, both run");
+        println!("duplicate split: {} results (serialized)", results.len());
     }
 }
 

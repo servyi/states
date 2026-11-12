@@ -10,6 +10,7 @@
 
 use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
+use dashmap::DashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -47,6 +48,12 @@ use std::time::Duration;
 /// lookup fails, and the requester learns it is gone.
 struct Shared {
     children: Mutex<Vec<Weak<Shared>>>,
+    /// the tree-wide uniqueness registry (created at the root,
+    /// Arc-referenced from every Shared): addresses of slots
+    /// currently being driven by some subtask. Same-slot subtasks
+    /// anywhere in the tree serialize on it instead of minting
+    /// overlapping exclusive chains.
+    claims: Arc<DashMap<usize, ()>>,
     /// A checkpoint has been requested: mutators park at the next
     /// safepoint.
     pending_request: std::sync::atomic::AtomicBool,
@@ -56,6 +63,18 @@ struct Shared {
     parked: Mutex<bool>,
     park_cv: Condvar,
     resume_cv: Condvar,
+}
+
+/// Releases a global slot claim on unwind or completion — a panicked
+/// subtask must not leave its slot claimed (the tree would deadlock).
+struct ClaimGuard {
+    claims: Arc<DashMap<usize, ()>>,
+    key: usize,
+}
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        self.claims.remove(&self.key);
+    }
 }
 
 /// The opaque shell for `Arc<Shared>` that crosses the one public
@@ -86,6 +105,7 @@ impl Shared {
     fn new() -> Self {
         Shared {
             children: Mutex::new(Vec::new()),
+            claims: Arc::new(DashMap::new()),
             pending_request: std::sync::atomic::AtomicBool::new(false),
             parked: Mutex::new(false),
             park_cv: Condvar::new(),
@@ -143,6 +163,23 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::downgrade(child));
+    }
+
+    /// A child Shared: the parking identity is its own, the claims
+    /// registry is INHERITED from the parent (tree-wide).
+    fn new_child(&self) -> Shared {
+        Shared::with_claims(Arc::clone(&self.claims))
+    }
+
+    fn with_claims(claims: Arc<DashMap<usize, ()>>) -> Self {
+        Shared {
+            children: Mutex::new(Vec::new()),
+            claims,
+            pending_request: std::sync::atomic::AtomicBool::new(false),
+            parked: Mutex::new(false),
+            park_cv: Condvar::new(),
+            resume_cv: Condvar::new(),
+        }
     }
 
     /// The registered children as Weaks, cloned under the lock and
@@ -615,6 +652,12 @@ impl<K> DerefMut for PersistentCell<K> {
 // The wrapper crosses threads exactly when its content does.
 unsafe impl<K: Send> Send for PersistentCell<K> {}
 
+// SAFETY: the cell's interior mutability is serialized by the
+// library's own discipline — the global claims registry ensures one
+// exclusive driver per slot at a time, and the checkpoints stop the
+// world — so shared references may cross threads to waiting subtasks.
+unsafe impl<K: Send> Sync for PersistentCell<K> {}
+
 /// A container that can hand out the pointer its `Deref`s spring
 /// from — the provenance vehicle the mint needs.
 ///
@@ -765,74 +808,74 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
             split(node)
         };
         // A shared split cannot promise uniqueness — the old `&mut`
-        // split had it from borrowck. The same slot returned twice
-        // would mint two exclusive chains over one container:
-        // unsound. Duplicates are DROPPED (first occurrence wins) —
-        // no runtime error, no shape restriction; a duplicated child
-        // simply does not run twice, which it could not soundly
-        // anyway.
-        let mut seen: Vec<*const PersistentCell<K>> = Vec::with_capacity(child_nodes.len());
-        let mut unique = Vec::with_capacity(child_nodes.len());
-        for child in child_nodes {
-            let addr: *const PersistentCell<K> = child as *const _;
-            if !seen.contains(&addr) {
-                seen.push(addr);
-                unique.push(child);
-            }
-        }
-        let child_nodes = unique;
-        // MINT THE BOXES: each PersistentCell's container becomes a Box<V>
-        // via the blanket impl. The K-side access goes through the
-        // wrapper's escape hatch (`&self -> &mut K`, the chain's
-        // exclusivity); the stored line is taken by the AsPtr
-        // contract; the typed slot raw of the WRAPPER rides along for
-        // the outer that owns it.
-        let mints: Vec<(Box<V>, *mut PersistentCell<K>, Arc<Shared>)> = child_nodes
+        // split had it from borrowck — and a 'static PersistentCell
+        // can be handed out across DIFFERENT levels and concurrent
+        // fanouts, so the check must be GLOBAL. The tree-wide claims
+        // registry (a DashMap created at the root, Arc-referenced
+        // from every Shared) serializes identical subtasks instead of
+        // dropping them: each child thread repeatedly tries to insert
+        // its slot's address with a short backoff; only after the
+        // insert succeeds does it mint and run, and the claim is
+        // released (RAII, also on unwind) when the subtask ends.
+        let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.status.claims);
+        // each child's Shared is prepared in the parent (its parking
+        // identity its own, the registry inherited); registration
+        // under the parent's lock, per the convention
+        let prepared: Vec<(&PersistentCell<K>, Arc<Shared>)> = child_nodes
             .into_iter()
             .map(|child| {
-                // SAFETY: the split yielded each child exactly once,
-                // disjointly; the chain is the exclusive writer
-                // between checkpoints — the mint's discipline.
-                let k: &mut K = unsafe { child.as_mut_k() };
-                let target: &mut K::Target = DerefMut::deref_mut(k);
-                let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
-                let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
-                // each child gets its OWN Shared (its parking
-                // identity), weakly registered into the parent's vec
-                // — insert under the lock, release (the convention)
-                let child_shared = Arc::new(Shared::new());
+                let child_shared = Arc::new(self.status.new_child());
                 self.status.register_child(&child_shared);
-                // SAFETY: the receiver came from this child's
-                // stored line; yielded exactly once, exclusive.
-                let current =
-                    unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone())) };
-                (current, child as *const PersistentCell<K> as *mut PersistentCell<K>, child_shared)
+                (child, child_shared)
             })
             .collect();
-        // wrap each box in the OUTER handle — the child's typed slot
-        // plus its Shared — so the callback can drive AND replace its
-        // subtree; then threads. The brand lifetime is free here —
-        // `f`'s higher-ranked bound instantiates it at the call, and
-        // its universality is what keeps the handle inside the
-        // callback.
-        let outers: Vec<OuterHandle<'_, K, V>> = mints
-            .into_iter()
-            .map(|(current, slot, shared)| OuterHandle {
-                current,
-                slot,
-                shared,
-                _brand: PhantomData,
-            })
-            .collect();
-        // THEN THREADS: one dedicated scoped thread per outer (std, per
-        // the 23:55 step — rayon left only noise in Miri). The parent
-        // runs main's join loop: park (children first) whenever a
-        // checkpoint is requested, poll the joins between sleeps.
+        // THEN THREADS: one dedicated scoped thread per child. The
+        // parent runs main's join loop: park (children first)
+        // whenever a checkpoint is requested, poll the joins between
+        // sleeps.
         let shared = self.status.clone();
+        let f = &f;
         std::thread::scope(|scope| {
-            let mut joins = Vec::with_capacity(outers.len());
-            for o in outers {
-                joins.push(scope.spawn(|| f(o)));
+            let mut joins = Vec::with_capacity(prepared.len());
+            for (child, child_shared) in prepared {
+                let claims = Arc::clone(&claims);
+                joins.push(scope.spawn(move || {
+                    // THE GLOBAL CLAIM: insert-retry with a short backoff
+                    let key: usize = child as *const PersistentCell<K> as usize;
+                    loop {
+                        match claims.entry(key) {
+                            dashmap::Entry::Vacant(v) => {
+                                v.insert(());
+                                break;
+                            }
+                            _ => std::thread::sleep(Duration::from_millis(1)),
+                        }
+                    }
+                    // release on unwind or completion — a panicked
+                    // subtask must not leave its slot claimed
+                    let _claim = ClaimGuard { claims: Arc::clone(&claims), key };
+                    // THE MINT (only after uniqueness is ensured): the
+                    // K-side access through the wrapper's escape hatch
+                    // (the chain's exclusivity), the receiver transient
+                    // SAFETY: the claim makes this thread the sole
+                    // driver of the slot; the mint's discipline holds.
+                    let k: &mut K = unsafe { child.as_mut_k() };
+                    let target: &mut K::Target = DerefMut::deref_mut(k);
+                    let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+                    let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+                    // SAFETY: as above; the child's Shared carries the
+                    // inherited registry and the registration.
+                    let current = unsafe {
+                        erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone()))
+                    };
+                    let outer = OuterHandle {
+                        current,
+                        slot: child as *const PersistentCell<K> as *mut PersistentCell<K>,
+                        shared: child_shared,
+                        _brand: PhantomData,
+                    };
+                    f(outer)
+                }));
             }
             loop {
                 if shared.is_pending() {
