@@ -1,10 +1,11 @@
 //! The binary half: the vocabulary (`Trait`) and the structs —
 //! everything that directly references them — plus the demo.
 
-use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
+use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
+    fn dup_probe(&mut self);
 }
 
 /// The demo's slot shape: the erased box (no Holder needed — with
@@ -13,7 +14,7 @@ trait Trait: Send {
 type Slot = Box<dyn HandleAble<dyn Trait> + 'static>;
 
 struct MyStruct {
-    children: Vec<ChildNode<Slot>>,
+    children: Vec<PersistentCell<Slot>>,
 }
 struct YourStruct {
     val: i32,
@@ -37,6 +38,17 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
         self.safepoint();
         sums.iter().sum()
     }
+
+    fn dup_probe(&mut self) {
+        // the duplicate-split proof: the same child twice -> the
+        // library drops the duplicate -> ONE result, one mint
+        let results: Vec<i32> = self.fanout(
+            &|m: &MyStruct| vec![&m.children[0], &m.children[0]],
+            |mut o| o.bark(),
+        );
+        assert_eq!(results.len(), 1, "duplicates are dropped");
+        println!("duplicate split: {} result", results.len());
+    }
 }
 
 impl Trait for InnerHandle<YourStruct, dyn Trait> {
@@ -44,15 +56,16 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
         println!("{}", self.val); // through DerefMut onto YourStruct
         self.val
     }
+    fn dup_probe(&mut self) {}
 }
 
 /// Wrap a LIVE driver-owned slot in the OuterHandle (the library's
 /// over_slot does the mint).
 fn main() {
-    let mut m: ChildNode<Slot> = ChildNode::new(Box::new(MyStruct {
+    let mut m: PersistentCell<Slot> = PersistentCell::new(Box::new(MyStruct {
         children: vec![
-            ChildNode::new(Box::new(YourStruct { val: 5 })),
-            ChildNode::new(Box::new(YourStruct { val: 7 })),
+            PersistentCell::new(Box::new(YourStruct { val: 5 })),
+            PersistentCell::new(Box::new(YourStruct { val: 7 })),
         ],
     }));
     // the ROOT task: the slot is inaccessible inside (borrowed by the
@@ -83,9 +96,11 @@ fn main() {
         });
     });
 
-    let mut y: ChildNode<Slot> = ChildNode::new(Box::new(YourStruct { val: 5 }));
+    let mut y: PersistentCell<Slot> = PersistentCell::new(Box::new(MyStruct {
+        children: vec![PersistentCell::new(Box::new(YourStruct { val: 5 }))],
+    }));
     independent_task_root(&mut y, |mut outer2, _checkpointer| {
-        outer2.bark();
+        outer2.dup_probe();
     });
 }
 

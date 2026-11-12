@@ -9,7 +9,7 @@
 //! identity pass-through that made ReplaceAble deletable).
 
 use std::ops::{Deref, DerefMut};
-use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
+use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 /// the drive vocabulary (as in the main demo)
 trait Trait: Send {
@@ -47,7 +47,7 @@ unsafe impl hslib::AsPtr for SaveSlot {
 }
 
 struct MyStruct {
-    children: Vec<ChildNode<SaveSlot>>,
+    children: Vec<PersistentCell<SaveSlot>>,
 }
 struct YourStruct {
     val: i32,
@@ -83,10 +83,10 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m = ChildNode::new(SaveSlot(Box::new(MyStruct {
+    let mut m = PersistentCell::new(SaveSlot(Box::new(MyStruct {
         children: vec![
-            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 5 }))),
-            ChildNode::new(SaveSlot(Box::new(YourStruct { val: 7 }))),
+            PersistentCell::new(SaveSlot(Box::new(YourStruct { val: 5 }))),
+            PersistentCell::new(SaveSlot(Box::new(YourStruct { val: 7 }))),
         ],
     })));
     independent_task_root(&mut m, |mut outer, checkpointer| {

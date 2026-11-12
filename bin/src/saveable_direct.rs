@@ -9,7 +9,7 @@
 //!
 //! The guard then speaks the vocabulary directly: `guard.save()`.
 
-use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
+use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -24,7 +24,7 @@ trait SaveAble: HandleAble<dyn Trait> {
 type SaveSlot = Box<dyn SaveAble>;
 
 struct MyStruct {
-    children: Vec<ChildNode<SaveSlot>>,
+    children: Vec<PersistentCell<SaveSlot>>,
 }
 struct YourStruct {
     val: i32,
@@ -67,10 +67,10 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m: ChildNode<SaveSlot> = ChildNode::new(Box::new(MyStruct {
+    let mut m: PersistentCell<SaveSlot> = PersistentCell::new(Box::new(MyStruct {
         children: vec![
-            ChildNode::new(Box::new(YourStruct { val: 5 })),
-            ChildNode::new(Box::new(YourStruct { val: 7 })),
+            PersistentCell::new(Box::new(YourStruct { val: 5 })),
+            PersistentCell::new(Box::new(YourStruct { val: 7 })),
         ],
     }));
     independent_task_root(&mut m, |mut outer, checkpointer| {

@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
+use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 /// the drive vocabulary: step the machine, observe the behavior
 trait Trait: Send {
@@ -44,18 +44,18 @@ enum Snap {
 type SaveSlot = Box<dyn SaveAble>;
 
 struct Machine {
-    children: Vec<ChildNode<SaveSlot>>,
+    children: Vec<PersistentCell<SaveSlot>>,
     steps: i32,
 }
 struct Counter {
     val: i32,
 }
 
-impl Trait for InnerHandle<ChildNode<Machine>, dyn Trait> {
+impl Trait for InnerHandle<PersistentCell<Machine>, dyn Trait> {
     fn step(&mut self) {
         self.steps += 1;
         self.fanout(
-            &|m: &ChildNode<Machine>| m.children.iter().collect(),
+            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
             |mut o| o.step(),
         );
         // the SAFETY POINT: the checker's requests land here
@@ -64,7 +64,7 @@ impl Trait for InnerHandle<ChildNode<Machine>, dyn Trait> {
 
     fn observe(&mut self) -> String {
         let obs: Vec<String> = self.fanout(
-            &|m: &ChildNode<Machine>| m.children.iter().collect(),
+            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
             |mut o| o.observe(),
         );
         obs.join("+")
@@ -74,16 +74,16 @@ impl Trait for InnerHandle<ChildNode<Machine>, dyn Trait> {
         // the push goes through the handle's own deref_mut (the
         // exclusive access the method has), BEFORE the fanout — the
         // shared split then hands out all children, grown one included
-        self.children.push(ChildNode::new(Box::new(ChildNode::new(Counter { val: 100 })) as SaveSlot));
+        self.children.push(PersistentCell::new(Box::new(PersistentCell::new(Counter { val: 100 })) as SaveSlot));
         self.fanout(
-            &|m: &ChildNode<Machine>| m.children.iter().collect(),
+            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
             |mut o| o.observe(),
         );
         self.safepoint();
     }
 }
 
-impl Trait for InnerHandle<ChildNode<Counter>, dyn Trait> {
+impl Trait for InnerHandle<PersistentCell<Counter>, dyn Trait> {
     fn step(&mut self) {
         self.val += 1;
     }
@@ -95,12 +95,12 @@ impl Trait for InnerHandle<ChildNode<Counter>, dyn Trait> {
 
 /// the INNER layer: the states themselves cell-covered before
 /// boxing — orphan-legal (SaveAble is this crate's trait)
-impl SaveAble for ChildNode<Machine> {
+impl SaveAble for PersistentCell<Machine> {
     fn save(&self) -> Snap {
         Snap::Node(self.children.iter().map(|c| c.save()).collect())
     }
 }
-impl SaveAble for ChildNode<Counter> {
+impl SaveAble for PersistentCell<Counter> {
     fn save(&self) -> Snap {
         Snap::Leaf(self.val)
     }
@@ -109,9 +109,9 @@ impl SaveAble for ChildNode<Counter> {
 /// rebuild a live slot from a snapshot — the mirror of the save
 fn restore(s: &Snap) -> SaveSlot {
     match s {
-        Snap::Leaf(v) => Box::new(ChildNode::new(Counter { val: *v })),
-        Snap::Node(kids) => Box::new(ChildNode::new(Machine {
-            children: kids.iter().map(|k| ChildNode::new(restore(k))).collect(),
+        Snap::Leaf(v) => Box::new(PersistentCell::new(Counter { val: *v })),
+        Snap::Node(kids) => Box::new(PersistentCell::new(Machine {
+            children: kids.iter().map(|k| PersistentCell::new(restore(k))).collect(),
             steps: 0,
         })),
     }
@@ -139,12 +139,12 @@ fn check(s: &Snap) {
 }
 
 fn main() {
-    // BOTH layers: outer ChildNode over the slot, inner ChildNode
+    // BOTH layers: outer PersistentCell over the slot, inner PersistentCell
     // over every state before boxing
-    let mut m: ChildNode<SaveSlot> = ChildNode::new(Box::new(ChildNode::new(Machine {
+    let mut m: PersistentCell<SaveSlot> = PersistentCell::new(Box::new(PersistentCell::new(Machine {
         children: vec![
-            ChildNode::new(Box::new(ChildNode::new(Counter { val: 1 }))),
-            ChildNode::new(Box::new(ChildNode::new(Counter { val: 1 }))),
+            PersistentCell::new(Box::new(PersistentCell::new(Counter { val: 1 }))),
+            PersistentCell::new(Box::new(PersistentCell::new(Counter { val: 1 }))),
         ],
         steps: 0,
     })) as SaveSlot);
@@ -236,7 +236,7 @@ fn main() {
 
     // 7: THE REPLAY — a second root task restored from the same
     // snapshot must reproduce the reference trace
-    let mut m2: ChildNode<SaveSlot> = ChildNode::new(restore(&snap0));
+    let mut m2: PersistentCell<SaveSlot> = PersistentCell::new(restore(&snap0));
     let trace2 = independent_task_root(&mut m2, |mut outer2, _ck| {
         (0..3)
             .map(|_| {
