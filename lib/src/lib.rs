@@ -237,9 +237,9 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
 /// structurally cannot leave that call.
 pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
     current: Box<V>,
-    /// the ChildNode cell this chain owns — `replace`'s write
+    /// the PersistentCell cell this chain owns — `replace`'s write
     /// target, typed at the wrapper (the container K lives inside)
-    slot: *mut ChildNode<K>,
+    slot: *mut PersistentCell<K>,
     /// the chain's parking identity — passed on across installs
     shared: Arc<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign
@@ -305,7 +305,7 @@ unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 /// `OuterHandle` — it cannot leave the call either. It has no `V`:
 /// nothing V-typed crosses it, the guard derefs straight to `K`.
 pub struct Checkpointer<'o, K> {
-    slot: *mut ChildNode<K>,
+    slot: *mut PersistentCell<K>,
     weak: Weak<Shared>,
     gate: Arc<Mutex<()>>,
     _brand: PhantomData<fn(&'o ()) -> &'o K>,
@@ -379,7 +379,7 @@ impl<'o, K: Send> Checkpointer<'o, K> {
 /// here the erasure makes the guard read-only. Dropping the guard
 /// resumes the world.
 pub struct CheckpointGuard<'a, K> {
-    slot: *mut ChildNode<K>,
+    slot: *mut PersistentCell<K>,
     /// Some: the world is stopped under our request — the drop
     /// releases it. None: the mutator side was already gone — access
     /// is free and the drop has nothing to resume.
@@ -393,8 +393,8 @@ pub struct CheckpointGuard<'a, K> {
 }
 
 impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
-    type Target = ChildNode<K>;
-    fn deref(&self) -> &ChildNode<K> {
+    type Target = PersistentCell<K>;
+    fn deref(&self) -> &PersistentCell<K> {
         // SAFETY: the guard exists only while the handshake proved
         // every mutator parked (or gone); the reborrow is tied to the
         // guard, so the world cannot resume underneath it.
@@ -417,7 +417,7 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
 pub fn independent_task_root<K, V: ?Sized + 'static, R>(
-    slot: &mut ChildNode<K>,
+    slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
@@ -430,7 +430,7 @@ where
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let slot_ptr: *mut ChildNode<K> = std::ptr::from_mut(slot);
+    let slot_ptr: *mut PersistentCell<K> = std::ptr::from_mut(slot);
     let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
@@ -499,7 +499,7 @@ where
     /// of the pointee of the `K` as stored by the box (the loaded
     /// provenance), and the typed `slot` stored here is exactly the
     /// `K` cell the raw was taken from.
-    unsafe fn over_slot(slot: *mut ChildNode<K>) -> Self
+    unsafe fn over_slot(slot: *mut PersistentCell<K>) -> Self
     where
         K: Sized,
     {
@@ -529,7 +529,7 @@ where
         // this chain (the mint's discipline; the old inner handle is
         // replaced by the re-mint below, so no stale pointer
         // survives the write).
-        unsafe { *self.slot = ChildNode::new(val) };
+        unsafe { *self.slot = PersistentCell::new(val) };
         // 2) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (K's own
         // DerefMut, consulted once) — to mint a fresh InnerHandle
@@ -555,7 +555,7 @@ where
 /// A child node in the tree: the container `K` behind the library's
 /// own `UnsafeCell`, so **both sides of a checkpoint reach it through
 /// shared references**. The mutator's fanout only needs `&self` (the
-/// split collects `&ChildNode<K>`), and the reader's guard sees the
+/// split collects `&PersistentCell<K>`), and the reader's guard sees the
 /// same wrapper — so references to the node may still exist whenever
 /// the client looks, and a client deleting or moving the container
 /// through its own interior mutability would do so while shared
@@ -566,15 +566,15 @@ where
 /// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
 /// `&mut self` — exclusive on the wrapper, the ordinary interior-
 /// mutability pattern). The fanout's mint path uses the crate-private
-/// [`ChildNode::as_mut_k`] — sound only under the chain's exclusivity
+/// [`PersistentCell::as_mut_k`] — sound only under the chain's exclusivity
 /// discipline, which the library maintains.
-pub struct ChildNode<K> {
+pub struct PersistentCell<K> {
     cell: UnsafeCell<K>,
 }
 
-impl<K: Sized> ChildNode<K> {
+impl<K: Sized> PersistentCell<K> {
     pub fn new(k: K) -> Self {
-        ChildNode { cell: UnsafeCell::new(k) }
+        PersistentCell { cell: UnsafeCell::new(k) }
     }
 
     /// The mint's escape hatch: `&self` to `&mut K`, sound only
@@ -587,7 +587,7 @@ impl<K: Sized> ChildNode<K> {
     /// No other reference into the `K` may be live, and none may be
     /// created, until the returned reference's borrow of the chain
     /// ends (the mint's discipline).
-    #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is ChildNode's whole point; soundness rides the chain's exclusivity (the safety contract above)
+    #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is PersistentCell's whole point; soundness rides the chain's exclusivity (the safety contract above)
     pub(crate) unsafe fn as_mut_k(&self) -> &mut K {
         // SAFETY: the caller's contract above — this is the wrapper's
         // own UnsafeCell, accessed under the library's exclusivity.
@@ -595,7 +595,7 @@ impl<K: Sized> ChildNode<K> {
     }
 }
 
-impl<K> Deref for ChildNode<K> {
+impl<K> Deref for PersistentCell<K> {
     type Target = K;
     fn deref(&self) -> &K {
         // SAFETY: shared access to the cell's content — the wrapper's
@@ -604,7 +604,7 @@ impl<K> Deref for ChildNode<K> {
     }
 }
 
-impl<K> DerefMut for ChildNode<K> {
+impl<K> DerefMut for PersistentCell<K> {
     fn deref_mut(&mut self) -> &mut K {
         // SAFETY: `&mut self` is exclusive on the wrapper — no other
         // access can exist.
@@ -613,7 +613,7 @@ impl<K> DerefMut for ChildNode<K> {
 }
 
 // The wrapper crosses threads exactly when its content does.
-unsafe impl<K: Send> Send for ChildNode<K> {}
+unsafe impl<K: Send> Send for PersistentCell<K> {}
 
 /// A container that can hand out the pointer its `Deref`s spring
 /// from — the provenance vehicle the mint needs.
@@ -743,7 +743,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// carries an `'o` of its own.
     pub fn fanout<K, F, R>(
         &mut self,
-        split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x ChildNode<K>> + Send + Sync),
+        split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
     ) -> Vec<R>
     where
@@ -755,22 +755,39 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
         R: Send,
     {
         // Collect offsite through a SHARED node borrow: the split
-        // hands out `&ChildNode<K>` — the references may still be
+        // hands out `&PersistentCell<K>` — the references may still be
         // alive from the reader's perspective, which is exactly what
         // excludes the client deleting the containers through sound
         // interior mutability. The library then unsafely turns them
         // into the mint's raws (the chain's exclusivity discipline).
-        let child_nodes: Vec<&ChildNode<K>> = {
+        let child_nodes: Vec<&PersistentCell<K>> = {
             let node: &T = self;
             split(node)
         };
-        // MINT THE BOXES: each ChildNode's container becomes a Box<V>
+        // A shared split cannot promise uniqueness — the old `&mut`
+        // split had it from borrowck. The same slot returned twice
+        // would mint two exclusive chains over one container:
+        // unsound. Duplicates are DROPPED (first occurrence wins) —
+        // no runtime error, no shape restriction; a duplicated child
+        // simply does not run twice, which it could not soundly
+        // anyway.
+        let mut seen: Vec<*const PersistentCell<K>> = Vec::with_capacity(child_nodes.len());
+        let mut unique = Vec::with_capacity(child_nodes.len());
+        for child in child_nodes {
+            let addr: *const PersistentCell<K> = child as *const _;
+            if !seen.contains(&addr) {
+                seen.push(addr);
+                unique.push(child);
+            }
+        }
+        let child_nodes = unique;
+        // MINT THE BOXES: each PersistentCell's container becomes a Box<V>
         // via the blanket impl. The K-side access goes through the
         // wrapper's escape hatch (`&self -> &mut K`, the chain's
         // exclusivity); the stored line is taken by the AsPtr
         // contract; the typed slot raw of the WRAPPER rides along for
         // the outer that owns it.
-        let mints: Vec<(Box<V>, *mut ChildNode<K>, Arc<Shared>)> = child_nodes
+        let mints: Vec<(Box<V>, *mut PersistentCell<K>, Arc<Shared>)> = child_nodes
             .into_iter()
             .map(|child| {
                 // SAFETY: the split yielded each child exactly once,
@@ -789,7 +806,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // stored line; yielded exactly once, exclusive.
                 let current =
                     unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone())) };
-                (current, child as *const ChildNode<K> as *mut ChildNode<K>, child_shared)
+                (current, child as *const PersistentCell<K> as *mut PersistentCell<K>, child_shared)
             })
             .collect();
         // wrap each box in the OUTER handle — the child's typed slot

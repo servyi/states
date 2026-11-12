@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use hslib::{Checkpointer, ChildNode, HandleAble, InnerHandle, OuterHandle, independent_task_root};
+use hslib::{Checkpointer, PersistentCell, HandleAble, InnerHandle, OuterHandle, independent_task_root};
 
 trait Trait: Send {
     fn step(&mut self);
@@ -98,7 +98,7 @@ impl DerefMut for ArenaSlot {
 // no-as_ptr shape; the mint rides deref_mut, counted below)
 
 struct Machine {
-    children: Vec<ChildNode<ArenaSlot>>,
+    children: Vec<PersistentCell<ArenaSlot>>,
     steps: i32,
 }
 struct Counter {
@@ -171,10 +171,10 @@ fn park_save(
 }
 
 fn main() {
-    let m = ChildNode::new(ArenaSlot::new(Machine {
+    let m = PersistentCell::new(ArenaSlot::new(Machine {
         children: vec![
-            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
-            ChildNode::new(ArenaSlot::new(Counter { val: 1 })),
+            PersistentCell::new(ArenaSlot::new(Counter { val: 1 })),
+            PersistentCell::new(ArenaSlot::new(Counter { val: 1 })),
         ],
         steps: 0,
     }));

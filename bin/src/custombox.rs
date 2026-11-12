@@ -4,7 +4,7 @@
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use hslib::{ChildNode, HandleAble, InnerHandle, independent_task_root};
+use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -46,7 +46,7 @@ unsafe impl hslib::AsPtr for CustomBox {
 }
 
 struct MyStruct {
-    children: Vec<ChildNode<CustomBox>>,
+    children: Vec<PersistentCell<CustomBox>>,
 }
 struct YourStruct {
     val: i32,
@@ -76,10 +76,10 @@ impl Trait for InnerHandle<YourStruct, dyn Trait> {
 }
 
 fn main() {
-    let mut m = ChildNode::new(CustomBox(Box::new(MyStruct {
+    let mut m = PersistentCell::new(CustomBox(Box::new(MyStruct {
         children: vec![
-            ChildNode::new(CustomBox(Box::new(YourStruct { val: 5 }))),
-            ChildNode::new(CustomBox(Box::new(YourStruct { val: 7 }))),
+            PersistentCell::new(CustomBox(Box::new(YourStruct { val: 5 }))),
+            PersistentCell::new(CustomBox(Box::new(YourStruct { val: 7 }))),
         ],
     })));
     independent_task_root(&mut m, |mut outer, _ck| {
