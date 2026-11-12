@@ -544,7 +544,7 @@ where
             let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
-            let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+            let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
             // SAFETY: the mint's discipline over the fresh content.
             unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
