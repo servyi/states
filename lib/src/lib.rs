@@ -421,7 +421,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut + AsPtr + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
@@ -471,7 +471,7 @@ impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: DerefMut + AsPtr + Send + 'static,
+    K: DerefMut + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
@@ -508,8 +508,9 @@ where
         // dispatch receiver below is transient and dies at return
         // SAFETY: the caller's contract above.
         let k: &mut K = unsafe { (*slot).as_mut_k() };
-        let state_raw: *mut K::Target = K::as_ptr(k);
-        let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+        let target: &mut K::Target = DerefMut::deref_mut(k);
+        let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+        let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the receiver came from this slot (the contract).
@@ -539,7 +540,8 @@ where
             // SAFETY: the slot is live and exclusively owned by this
             // chain (the mint's discipline).
             let k: &mut K = unsafe { (*self.slot).as_mut_k() };
-            let state_raw: *mut K::Target = K::as_ptr(k);
+            let target: &mut K::Target = DerefMut::deref_mut(k);
+            let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
             let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
@@ -747,7 +749,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     where
         T: Send,
         V: Send + 'static,
-    K: DerefMut + AsPtr + Sized + Send + 'static,
+    K: DerefMut + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
@@ -775,8 +777,9 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 // disjointly; the chain is the exclusive writer
                 // between checkpoints — the mint's discipline.
                 let k: &mut K = unsafe { child.as_mut_k() };
-                let state_raw: *mut K::Target = K::as_ptr(k);
-                let erased: &mut dyn HandleAble<V> = unsafe { &mut *(state_raw as *mut dyn HandleAble<V>) };
+                let target: &mut K::Target = DerefMut::deref_mut(k);
+                let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+                let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                 // each child gets its OWN Shared (its parking
                 // identity), weakly registered into the parent's vec
                 // — insert under the lock, release (the convention)
