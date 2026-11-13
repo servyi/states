@@ -165,6 +165,18 @@ impl Shared {
             .push(Arc::downgrade(child));
     }
 
+    /// One backoff step for a subtask WAITING on a global claim: the
+    /// Shared is preallocated and registered before the claim loop,
+    /// so the world must be able to stop while it waits — park on a
+    /// pending request (the subtask has no children yet: it has not
+    /// minted), then a short sleep before the next attempt.
+    fn backoff_checkpoint(&self) {
+        if self.is_pending() {
+            self.park_self();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
     /// A child Shared: the parking identity is its own, the claims
     /// registry is INHERITED from the parent (tree-wide).
     fn new_child(&self) -> Shared {
@@ -840,7 +852,14 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
             for (child, child_shared) in prepared {
                 let claims = Arc::clone(&claims);
                 joins.push(scope.spawn(move || {
-                    // THE GLOBAL CLAIM: insert-retry with a short backoff
+                    // THE GLOBAL CLAIM: insert-retry with a short backoff.
+                    // The Shared is preallocated and registered BEFORE
+                    // this loop — so on each failed attempt the
+                    // WAITING subtask must still answer checkpoint
+                    // requests: park here when one is pending, or a
+                    // save arriving during the backoff would deadlock
+                    // the tree (the parent waits for this subtask to
+                    // park; a bare sleep never would).
                     let key: usize = child as *const PersistentCell<K> as usize;
                     loop {
                         match claims.entry(key) {
@@ -848,7 +867,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                                 v.insert(());
                                 break;
                             }
-                            _ => std::thread::sleep(Duration::from_millis(1)),
+                            _ => child_shared.backoff_checkpoint(),
                         }
                     }
                     // release on unwind or completion — a panicked
@@ -927,6 +946,34 @@ mod tests {
         parent.register_child(&a);
         parent.register_child(&b);
         assert_eq!(parent.child_weaks().len(), 2);
+    }
+
+    /// A WAITING subtask must still answer checkpoint requests: its
+    /// backoff step parks on a pending request (or a save arriving
+    /// during the wait would deadlock the tree).
+    #[test]
+    fn backoff_parks_on_pending() {
+        let shared = Arc::new(Shared::new());
+        let saw_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = shared.clone();
+        let flag = saw_parked.clone();
+        let weak = Arc::downgrade(&shared);
+        let requester = std::thread::spawn(move || {
+            // blocks until the waiter parks
+            let _ = request_until_parked(&weak);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_request(&s2); // resume the world (and the waiter)
+        });
+        // the waiting subtask's role: spin until the request is
+        // visible, then the backoff step — which must PARK (the
+        // requester's handshake only completes when it does)
+        while !shared.is_pending() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        shared.backoff_checkpoint();
+        requester.join().expect("requester");
+        assert!(saw_parked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!shared.is_pending(), "the world resumed");
     }
 
     /// The handshake dance, thread-to-Weak: a mutator that parks at
