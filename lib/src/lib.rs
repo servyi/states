@@ -1,11 +1,31 @@
-//! The library half of the runnable sketch (issue #18, 16:38):
-//! the typing discipline — erased outer `Box<K>` reassignment through
-//! `Unsize`-witnessed handles — with no vocabulary in it.
+//! The library half of the runnable sketch: the typing discipline —
+//! erased outer `Box<K>` reassignment through `Unsize`-witnessed
+//! handles — with no vocabulary in it.
 //!
-//! Shortcut kept from the sketch (still, per the 00:09 step): the
-//! InnerHandle points at the HOLDER (the erased box slot), derefs
-//! through the holder chain onto T.
-
+//! # Soundness invariants
+//!
+//! **I1 (access paths).** The container `K`'s content may be
+//! accessed by client code ONLY through the line the library drives:
+//! the `PersistentCell`'s own `Deref`/`DerefMut` and the container's
+//! `DerefMut` they lead to. A client knows the concrete `K` and
+//! could reach its pointee in other ways — that is forbidden; every
+//! content access rides the library's line, which is the line the
+//! mint's receiver and the guard's reads share.
+//!
+//! **I2 (slot lifetime).** The client hands the library a `&` to
+//! each `PersistentCell` (the fanout split's children and the root).
+//! A sound client can never invalidate that reference: doing so
+//! requires a `&mut` to the cell proving the `&` is gone, and the
+//! library hands out no such `&mut` to client code until it is done
+//! with the subtask. Hence the backing store outlives every handle.
+//!
+//! **I4 (tree shape of borrows).** While a node is not a leaf node,
+//! no `&mut` to it exists. While a node IS a leaf node, a `&mut` to
+//! it exists only through borrowing `DerefMut` of the handle.
+//! Consequence: while all leaf nodes are in a safepoint, no `&mut`
+//! exists to any node in the tree — which lets the guard spring a
+//! fresh `&` to the root, from which non-conflicting `&` to every
+//! node can be derived (the checkpoint read side).
 #![feature(unsize)]
 
 use std::cell::UnsafeCell;
@@ -626,10 +646,13 @@ impl<K: Sized> PersistentCell<K> {
         PersistentCell { cell: UnsafeCell::new(k) }
     }
 
-    /// The mint's escape hatch: `&self` to `&mut K`, sound only
-    /// under the chain's exclusivity discipline (one handle chain,
-    /// the split yielded this child exactly once, and the mutator is
-    /// the only writer between checkpoints).
+    /// The mint's escape hatch: `&self` to `&mut K`. Sound under
+    /// **I1** (this is the library's line — the only permitted access
+    /// path to the content), **I2** (the cell outlives the borrow:
+    /// the client's `&` to this cell cannot be invalidated while the
+    /// subtask runs), and **I4** (the `&mut` exists only inside the
+    /// library's mint/deref discipline, never handed to client code
+    /// as a cell `&mut`).
     ///
     /// # Safety
     ///
