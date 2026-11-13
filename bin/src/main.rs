@@ -20,7 +20,7 @@ struct YourStruct {
     val: i32,
 }
 
-impl Trait for InnerHandle<MyStruct, dyn Trait> {
+impl Trait for InnerHandle<MyStruct> {
     fn bark(&mut self) -> i32 {
         println!("MyStruct");
         let sums: Vec<i32> = self.fanout(
@@ -53,7 +53,7 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
     }
 }
 
-impl Trait for InnerHandle<YourStruct, dyn Trait> {
+impl Trait for InnerHandle<YourStruct> {
     fn bark(&mut self) -> i32 {
         println!("{}", self.val); // through DerefMut onto YourStruct
         self.val

@@ -334,7 +334,7 @@ pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
 /// `&'x mut T` was taken out of the library's own `&'x mut K`, and
 /// the only writer of the slot while a handle lives is `replace`
 /// (on the outer), which re-mints the pair.
-pub struct InnerHandle<T: ?Sized, V: ?Sized> {
+pub struct InnerHandle<T: ?Sized> {
     /// the state raw — carrying the box's STORED provenance (minted
     /// by a raw borrow of the K's deref place, not from any materialized
     /// `&mut`), so the persistent line's path to the allocation root
@@ -342,13 +342,13 @@ pub struct InnerHandle<T: ?Sized, V: ?Sized> {
     /// reference off it; nothing persistent is ever a mutable line.
     state: *mut T,
     status: Arc<Shared>,
-    _marker: PhantomData<fn(*mut T, *mut V)>,
+    _marker: PhantomData<fn(*mut T)>,
 }
 
 // Sound: the state raw is exclusively reachable through this handle
 // for its life (the mint's discipline), the status Arc is Send+Sync,
 // and T: Send crosses with it.
-unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
+unsafe impl<T: ?Sized + Send> Send for InnerHandle<T> {}
 
 // The payload crosses threads: the box (an InnerHandle: its T: Send
 // by the HandleAble blanket), and the K cell it exclusively owns —
@@ -739,8 +739,8 @@ unsafe impl<T: ?Sized> AsPtr for Box<T> {
 /// crate; a foreign implementation would have to uphold all of the
 /// following, which the blanket implementation here carries:
 ///
-/// - `T` may implement this trait only if `InnerHandle<T, V>` can
-///   be unsized to `V` (`InnerHandle<T, V>: Unsize<V>`).
+/// - `T` may implement this trait only if `InnerHandle<T>` can
+///   be unsized to `V` (`InnerHandle<T>: Unsize<V>`).
 /// - The `Box` returned by [`HandleAble::box_innerhandle`] must be
 ///   the `InnerHandle<T, V>` over the PASSED state raw (the blanket
 ///   impl stores it verbatim).
@@ -768,7 +768,7 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
 
 unsafe impl<T: Send, V: ?Sized> HandleAble<V> for T
 where
-    InnerHandle<T, V>: Unsize<V>,
+    InnerHandle<T>: Unsize<V>,
 {
     unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V> {
         // T is fixed by the dispatch that landed here; the persisted
@@ -779,7 +779,7 @@ where
         let raw: *mut T = state as *mut T;
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
-        let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
+        let handle: Box<InnerHandle<T>> = Box::new(InnerHandle {
             state: raw,
             status: shared.0,
             _marker: PhantomData,
@@ -788,7 +788,7 @@ where
     }
 }
 
-impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
+impl<T: Sized> InnerHandle<T> {
     /// Park while a checkpoint has been requested, then return.
     /// Requires `&mut self`: no deref borrow can be live across it.
     pub fn safepoint(&mut self) {
@@ -819,15 +819,14 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// leave the callback at all — strictly stronger than branding
     /// it with the root task's `'o`, which is why fanout no longer
     /// carries an `'o` of its own.
-    pub fn fanout<K, F, R>(
+    pub fn fanout<V: ?Sized + Send + 'static, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
     ) -> Vec<R>
     where
         T: Send,
-        V: Send + 'static,
-    K: DerefMut + Sized + Send + 'static,
+        K: DerefMut + Sized + Send + 'static,
     K::Target: Unsize<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
@@ -937,7 +936,7 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     }
 }
 
-impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
+impl<T: Sized> Deref for InnerHandle<T> {
     type Target = T;
     fn deref(&self) -> &T {
         // a FRESH reference off the stored-provenance raw — nothing
@@ -949,7 +948,7 @@ impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
     }
 }
 
-impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
+impl<T: Sized> DerefMut for InnerHandle<T> {
     fn deref_mut(&mut self) -> &mut T {
         // SAFETY: as Deref — exclusive, tied to `&mut self`.
         unsafe { &mut *self.state }

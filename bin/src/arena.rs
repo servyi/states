@@ -105,7 +105,7 @@ struct Counter {
     val: i32,
 }
 
-impl Trait for InnerHandle<Machine, dyn Trait> {
+impl Trait for InnerHandle<Machine> {
     fn step(&mut self) {
         self.steps += 1; // the historical TB failure site
         // the children WRITE too — every arena line takes the
@@ -129,7 +129,7 @@ impl Trait for InnerHandle<Machine, dyn Trait> {
     }
 }
 
-impl Trait for InnerHandle<Counter, dyn Trait> {
+impl Trait for InnerHandle<Counter> {
     fn step(&mut self) {
         self.val += 1;
     }

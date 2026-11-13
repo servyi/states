@@ -53,7 +53,7 @@ struct YourStruct {
     val: i32,
 }
 
-impl Trait for InnerHandle<MyStruct, dyn Trait> {
+impl Trait for InnerHandle<MyStruct> {
     fn bark(&mut self) -> i32 {
         let sums: Vec<i32> = self.fanout(
             &|m: &MyStruct| m.children.iter().collect(),
@@ -64,7 +64,7 @@ impl Trait for InnerHandle<MyStruct, dyn Trait> {
     }
 }
 
-impl Trait for InnerHandle<YourStruct, dyn Trait> {
+impl Trait for InnerHandle<YourStruct> {
     fn bark(&mut self) -> i32 {
         self.val
     }

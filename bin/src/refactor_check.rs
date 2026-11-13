@@ -51,7 +51,7 @@ struct Counter {
     val: i32,
 }
 
-impl Trait for InnerHandle<PersistentCell<Machine>, dyn Trait> {
+impl Trait for InnerHandle<PersistentCell<Machine>> {
     fn step(&mut self) {
         self.steps += 1;
         self.fanout(
@@ -83,7 +83,7 @@ impl Trait for InnerHandle<PersistentCell<Machine>, dyn Trait> {
     }
 }
 
-impl Trait for InnerHandle<PersistentCell<Counter>, dyn Trait> {
+impl Trait for InnerHandle<PersistentCell<Counter>> {
     fn step(&mut self) {
         self.val += 1;
     }
