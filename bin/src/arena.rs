@@ -118,7 +118,7 @@ impl Trait for InnerHandle<Machine> {
         // write-save-write ride, not just the root's
         self.fanout(
             &|m: &Machine| m.children.iter().collect(),
-            |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.step(),
+            |mut o: OuterHandle<'_, dyn SaveAble, ArenaSlot, dyn Trait>| o.step(),
         );
         self.safepoint();
     }
@@ -158,7 +158,7 @@ impl SaveAble for Counter {
 
 /// a save while parked in the safepoint windows
 fn park_save(
-    outer: &mut OuterHandle<'_, ArenaSlot, dyn Trait>,
+    outer: &mut OuterHandle<'_, dyn SaveAble, ArenaSlot, dyn Trait>,
     ck: &Checkpointer<ArenaSlot>,
 ) -> String {
     std::thread::scope(|s| {
