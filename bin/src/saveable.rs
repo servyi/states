@@ -70,7 +70,7 @@ fn main() {
             ],
         }) as Box<dyn SaveAble>,
     ));
-    independent_task_root(&mut m, |mut outer: OuterHandle<dyn SaveAble, SaveSlot, dyn Trait>, checkpointer: Checkpointer<SaveSlot>| {
+    independent_task_root(&mut m, |mut outer: OuterHandle<SaveSlot, dyn Trait>, checkpointer: Checkpointer<SaveSlot>| {
         // THE SNAPSHOT READS CLIENT VOCABULARY through the guard's &K
         let ck = checkpointer.clone();
         std::thread::scope(|scope| {

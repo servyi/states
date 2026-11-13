@@ -304,7 +304,7 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
 /// (and everything minted under it, via `fanout`'s own `'n`)
 /// structurally cannot leave that call.
-pub struct OuterHandle<'o, Z: ?Sized, K: Sized, V: ?Sized> {
+pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
     current: Box<V>,
     /// the PersistentCell cell this chain owns — `replace`'s write
     /// target, typed at the wrapper (the container K lives inside)
@@ -314,9 +314,6 @@ pub struct OuterHandle<'o, Z: ?Sized, K: Sized, V: ?Sized> {
     /// Invariant in `'o`: the brand cannot shrink to a foreign
     /// lifetime — the handle stays inside the root task.
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
-    /// the erased state type this chain was minted over — fixes the
-    /// `AsPtr` instantiation for the lifetime of the handle
-    _z: PhantomData<fn(*mut Z)>,
 }
 
 /// The mutator-side handle: `state` (deref's target — captured at
@@ -357,7 +354,7 @@ unsafe impl<T: ?Sized + Send> Send for InnerHandle<T> {}
 // by the HandleAble blanket), and the K cell it exclusively owns —
 // moving the outer moves the exclusive access to both, so K must be
 // Send for the pointee's sake.
-unsafe impl<'o, Z: ?Sized, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, Z, K, V> {}
+unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
 /// through a **Weak** (the mutator side owns the last strong `Arc` —
@@ -488,14 +485,14 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// `slot` inaccessible (borrowed) for the whole call. The `'o` brand
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
-pub fn independent_task_root<K, Z, V: ?Sized + 'static, R>(
+pub fn independent_task_root<K, V: ?Sized + 'static, R>(
     slot: &mut PersistentCell<K>,
-    f: impl for<'o> FnOnce(OuterHandle<'o, Z, K, V>, Checkpointer<'o, K>) -> R,
+    f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
     K: DerefMut + Sized + Send + 'static,
-    K::Target: AsPtr<Z> + 'static,
-    Z: HandleAble<V> + Unsize<dyn HandleAble<V>> + ?Sized + 'static,
+    K::Target: AsPtr + 'static,
+    <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -517,13 +514,13 @@ where
     f(outer, checkpointer)
 }
 
-impl<'o, Z: ?Sized, K, V: ?Sized> OuterHandle<'o, Z, K, V> {
+impl<'o, K, V: ?Sized> OuterHandle<'o, K, V> {
     fn shared(&self) -> &Arc<Shared> {
         &self.shared
     }
 }
 
-impl<'o, Z: ?Sized, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, Z, K, V> {
+impl<'o, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     type Target = V;
     fn deref(&self) -> &V {
         // the box is the load-bearing invariant (always an
@@ -535,18 +532,18 @@ impl<'o, Z: ?Sized, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, Z, K, V> {
     }
 }
 
-impl<'o, Z: ?Sized, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, Z, K, V> {
+impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
     fn deref_mut(&mut self) -> &mut V {
         // SAFETY: as Deref — exclusive.
         unsafe { &mut *(self.current.as_mut() as *mut V) }
     }
 }
 
-impl<'o, Z: ?Sized, K, V: ?Sized + 'static> OuterHandle<'o, Z, K, V>
+impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
     K: DerefMut + Send + 'static,
-    K::Target: AsPtr<Z> + 'static,
-    Z: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
+    K::Target: AsPtr + 'static,
+    <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -583,14 +580,13 @@ where
         // SAFETY: the caller's contract above.
         let k: &mut K = unsafe { (*slot).as_mut_k() };
         let target: &mut K::Target = DerefMut::deref_mut(k);
-        let raw: *mut Z = AsPtr::as_ptr(target);
-        let state_raw: *mut dyn HandleAble<V> = raw;
+        let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
         let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the receiver came from this slot (the contract).
         let current = unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(shared.clone())) };
-        OuterHandle { current, slot, shared, _brand: PhantomData, _z: PhantomData }
+        OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
     /// The successor install: write the K cell THIS handle owns
@@ -649,13 +645,13 @@ where
 /// one-line identity impl (`impl AsPtr<dyn HandleAble<V>> for
 /// MyState`) — orphan-legal for their local type, and unable to
 /// overlap ours.
-pub unsafe trait AsPtr<T: ?Sized>: DerefMut<Target = T> {
-    fn as_ptr(&mut self) -> *mut T;
+pub unsafe trait AsPtr: DerefMut {
+    fn as_ptr(&mut self) -> *mut Self::Target;
 }
 
 // the cell: the content through the hatch — the IM-covered line.
 // NO vocabulary bounds: the impl is fully general over the content.
-unsafe impl<T: ?Sized> AsPtr<T> for PersistentCell<T> {
+unsafe impl<T: ?Sized> AsPtr for PersistentCell<T> {
     fn as_ptr(&mut self) -> *mut T {
         // SAFETY: the wrapper's own hatch; the content is the store
         unsafe { self.as_mut_k() }
@@ -663,7 +659,7 @@ unsafe impl<T: ?Sized> AsPtr<T> for PersistentCell<T> {
 }
 
 // the box: the STORED line, not the deref-fresh one. Fully general.
-unsafe impl<T: ?Sized> AsPtr<T> for Box<T> {
+unsafe impl<T: ?Sized> AsPtr for Box<T> {
     fn as_ptr(&mut self) -> *mut T {
         &raw mut **self
     }
@@ -843,7 +839,7 @@ impl<T: Sized> InnerHandle<T> {
     /// leave the callback at all — strictly stronger than branding
     /// it with the root task's `'o`, which is why fanout no longer
     /// carries an `'o` of its own.
-    pub fn fanout<Z, V: ?Sized + Send + 'static, K, F, R>(
+    pub fn fanout<V: ?Sized + Send + 'static, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
@@ -851,9 +847,9 @@ impl<T: Sized> InnerHandle<T> {
     where
         T: Send,
         K: DerefMut + Sized + Send + 'static,
-        K::Target: AsPtr<Z> + 'static,
-        Z: HandleAble<V> + Unsize<dyn HandleAble<V>> + ?Sized + 'static,
-        F: for<'n> Fn(OuterHandle<'n, Z, K, V>) -> R + Send + Sync,
+        K::Target: AsPtr + 'static,
+        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
+        F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
         // Collect offsite through a SHARED node borrow: the split
@@ -927,8 +923,7 @@ impl<T: Sized> InnerHandle<T> {
                     // driver of the slot; the mint's discipline holds.
                     let k: &mut K = unsafe { child.as_mut_k() };
                     let target: &mut K::Target = DerefMut::deref_mut(k);
-                    let raw: *mut Z = AsPtr::as_ptr(target);
-                    let state_raw: *mut dyn HandleAble<V> = raw;
+                    let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
                     let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
@@ -940,7 +935,6 @@ impl<T: Sized> InnerHandle<T> {
                         slot: child as *const PersistentCell<K> as *mut PersistentCell<K>,
                         shared: child_shared,
                         _brand: PhantomData,
-                        _z: PhantomData,
                     };
                     f(outer)
                 }));
