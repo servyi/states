@@ -56,8 +56,14 @@ impl ArenaSlot {
         assert!(!mem.is_null(), "arena allocation failed");
         // SAFETY: fresh valid allocation of T's layout
         unsafe { std::ptr::write(mem as *mut T, val) };
-        // SAFETY: T: SaveAble, so &mut T erases to the fat pointer
-        let fat: *mut dyn SaveAble = unsafe { &mut *(mem as *mut T) };
+        // SAFETY: T: SaveAble — the state is erased into a box,
+        // then adopted as a boxed CELL (the variant-B slot shape:
+        // the cell covers the state, the registry holds the cell)
+        // SAFETY: mem holds a valid T we just wrote; adopting it as
+        // the box's allocation (the layout matches — both are T's)
+        let boxed: Box<dyn SaveAble> = unsafe { Box::from_raw(mem as *mut T) };
+        let cell: Box<PersistentCell<dyn SaveAble>> = PersistentCell::from_boxed(boxed);
+        let fat: *mut PersistentCell<dyn SaveAble> = Box::into_raw(cell);
         // SAFETY: pointer-to-pointer components of a fat pointer
         let (data, vtable): (*mut (), *const ()) = unsafe { std::mem::transmute(fat) };
         let idx = ARENA.lock().unwrap().len();
@@ -65,7 +71,7 @@ impl ArenaSlot {
         ArenaSlot { idx }
     }
 
-    fn fat(&self) -> *mut dyn SaveAble {
+    fn fat(&self) -> *mut PersistentCell<dyn SaveAble> {
         let e = ARENA.lock().unwrap()[self.idx];
         // SAFETY: reassemble the registered fat pointer
         unsafe { std::mem::transmute(e) }
@@ -73,7 +79,7 @@ impl ArenaSlot {
 }
 
 impl Deref for ArenaSlot {
-    type Target = dyn SaveAble;
+    type Target = PersistentCell<dyn SaveAble>;
     fn deref(&self) -> &Self::Target {
         DEREF_CALLS.fetch_add(1, Ordering::Relaxed);
         // SAFETY: the registered entry is live for the program's life

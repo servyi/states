@@ -13,7 +13,7 @@ trait Trait: Send {
 static DROPS: AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// the client's own container: a counted-Drop wrapper
-struct CustomBox(Box<dyn HandleAble<dyn Trait>>);
+struct CustomBox(Box<PersistentCell<dyn HandleAble<dyn Trait>>>);
 
 impl Drop for CustomBox {
     fn drop(&mut self) {
@@ -22,10 +22,10 @@ impl Drop for CustomBox {
     }
 }
 
-// plain Deref/DerefMut to the erased target — the crate's AsErased
-// blanket covers this K with zero unsafe
+// the container: derefs to its boxed cell — the cell impl covers the
+// AsPtr bound with zero client unsafe
 impl Deref for CustomBox {
-    type Target = dyn HandleAble<dyn Trait>;
+    type Target = PersistentCell<dyn HandleAble<dyn Trait>>;
     fn deref(&self) -> &Self::Target {
         &*self.0
     }
@@ -33,15 +33,6 @@ impl Deref for CustomBox {
 impl DerefMut for CustomBox {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut *self.0
-    }
-}
-
-// SAFETY: the pointer is the inner builtin box's stored line (the
-// raw borrow of the builtin deref place); the store can only be
-// deleted by dropping the box, which needs exclusive access.
-unsafe impl hslib::AsPtr for CustomBox {
-    fn as_ptr(&mut self) -> *mut Self::Target {
-        &raw mut *self.0
     }
 }
 
@@ -59,7 +50,7 @@ impl Trait for InnerHandle<MyStruct> {
             |mut o| {
                 // the child installs a successor built with the
                 // CLIENT'S constructor — the library never constructs
-                let successor = CustomBox(Box::new(YourStruct { val: 99 }));
+                let successor = CustomBox(PersistentCell::from_boxed(Box::new(YourStruct { val: 99 }) as Box<dyn HandleAble<dyn Trait>>));
                 o.replace(successor);
                 o.bark()
             },
@@ -76,17 +67,21 @@ impl Trait for InnerHandle<YourStruct> {
 }
 
 fn main() {
-    let mut m = PersistentCell::new(CustomBox(Box::new(MyStruct {
-        children: vec![
-            PersistentCell::new(CustomBox(Box::new(YourStruct { val: 5 }))),
-            PersistentCell::new(CustomBox(Box::new(YourStruct { val: 7 }))),
-        ],
-    })));
+    let mut m = PersistentCell::new(CustomBox(PersistentCell::from_boxed(
+        Box::new(MyStruct {
+            children: vec![
+                PersistentCell::new(CustomBox(PersistentCell::from_boxed(
+                    Box::new(YourStruct { val: 5 }) as Box<dyn HandleAble<dyn Trait>>))),
+                PersistentCell::new(CustomBox(PersistentCell::from_boxed(
+                    Box::new(YourStruct { val: 7 }) as Box<dyn HandleAble<dyn Trait>>))),
+            ],
+        }) as Box<dyn HandleAble<dyn Trait>>,
+    )));
     independent_task_root(&mut m, |mut outer, _ck| {
         let first = outer.bark();
         println!("sum: {} (children replaced themselves)", first);
         // the ROOT install with the client's constructor
-        let successor = CustomBox(Box::new(YourStruct { val: 42 }));
+        let successor = CustomBox(PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn HandleAble<dyn Trait>>));
         outer.replace(successor);
         let second = outer.bark();
         println!("sum: {}", second);

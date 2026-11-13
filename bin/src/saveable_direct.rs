@@ -21,7 +21,7 @@ trait SaveAble: HandleAble<dyn Trait> {
 }
 
 /// K, LITERALLY the subtrait box
-type SaveSlot = Box<dyn SaveAble>;
+type SaveSlot = Box<PersistentCell<dyn SaveAble>>;
 
 struct MyStruct {
     children: Vec<PersistentCell<SaveSlot>>,
@@ -38,7 +38,7 @@ impl Trait for InnerHandle<MyStruct> {
                 // THE CHILD-CALLBACK INSTALL: the callback owns its
                 // outer, constructs the successor K at the call site,
                 // and swaps its own subtree from its own thread
-                let successor: SaveSlot = Box::new(YourStruct { val: 99 });
+                let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 99 }) as Box<dyn SaveAble>);
                 o.replace(successor);
                 o.bark()
             },
@@ -67,12 +67,14 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m: PersistentCell<SaveSlot> = PersistentCell::new(Box::new(MyStruct {
-        children: vec![
-            PersistentCell::new(Box::new(YourStruct { val: 5 })),
-            PersistentCell::new(Box::new(YourStruct { val: 7 })),
-        ],
-    }));
+    let mut m: PersistentCell<SaveSlot> = PersistentCell::new(PersistentCell::from_boxed(
+        Box::new(MyStruct {
+            children: vec![
+                PersistentCell::new(PersistentCell::from_boxed(Box::new(YourStruct { val: 5 }) as Box<dyn SaveAble>)),
+                PersistentCell::new(PersistentCell::from_boxed(Box::new(YourStruct { val: 7 }) as Box<dyn SaveAble>)),
+            ],
+        }) as Box<dyn SaveAble>,
+    ));
     independent_task_root(&mut m, |mut outer, checkpointer| {
         let ck = checkpointer.clone();
         std::thread::scope(|scope| {
@@ -80,11 +82,11 @@ fn main() {
                 let guard = ck.request();
                 // the guard DIRECTLY speaks the client vocabulary —
                 // auto-deref through the box onto dyn SaveAble
-                println!("checkpoint snapshot: {}", guard.save());
+                println!("checkpoint snapshot: {}", { (****guard).save() });
             });
             let first = outer.bark();
             println!("sum: {} (99+99: the children replaced themselves)", first);
-            let successor: SaveSlot = Box::new(YourStruct { val: 42 });
+            let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn SaveAble>);
             outer.replace(successor);
             let second = outer.bark();
             println!("sum: {}", second);

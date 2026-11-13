@@ -8,8 +8,7 @@
 //! site, plus `replace(val: K)` (plain K-cell assignment — the
 //! identity pass-through that made ReplaceAble deletable).
 
-use std::ops::{Deref, DerefMut};
-use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
+use hslib::{ Checkpointer,OuterHandle, PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 /// the drive vocabulary (as in the main demo)
 trait Trait: Send {
@@ -21,30 +20,8 @@ trait SaveAble: HandleAble<dyn Trait> {
     fn save(&self) -> String;
 }
 
-/// the slot: the wrapper whose safe Derefs upcast to the erased form
-struct SaveSlot(Box<dyn SaveAble>);
-
-impl Deref for SaveSlot {
-    type Target = dyn HandleAble<dyn Trait>;
-    fn deref(&self) -> &Self::Target {
-        &*self.0 // &dyn SaveAble -> &dyn HandleAble (stable upcast)
-    }
-}
-impl DerefMut for SaveSlot {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
-    }
-}
-
-// SAFETY: the pointer is the inner builtin box's stored line (the
-// raw borrow of the builtin deref place — no reference materialized,
-// not the wrapper's Deref return); the wrapper cannot delete or move
-// the store except through &mut (dropping/moving the box).
-unsafe impl hslib::AsPtr for SaveSlot {
-    fn as_ptr(&mut self) -> *mut Self::Target {
-        &raw mut *self.0
-    }
-}
+/// the variant-B slot: a box of a cell over the erased SaveAble
+type SaveSlot = Box<PersistentCell<dyn SaveAble>>;
 
 struct MyStruct {
     children: Vec<PersistentCell<SaveSlot>>,
@@ -72,7 +49,7 @@ impl Trait for InnerHandle<YourStruct> {
 
 impl SaveAble for MyStruct {
     fn save(&self) -> String {
-        let kids: Vec<String> = self.children.iter().map(|c| c.0.save()).collect();
+        let kids: Vec<String> = self.children.iter().map(|c| { (***c).save() }).collect();
         format!("My({})", kids.join(","))
     }
 }
@@ -83,25 +60,29 @@ impl SaveAble for YourStruct {
 }
 
 fn main() {
-    let mut m = PersistentCell::new(SaveSlot(Box::new(MyStruct {
-        children: vec![
-            PersistentCell::new(SaveSlot(Box::new(YourStruct { val: 5 }))),
-            PersistentCell::new(SaveSlot(Box::new(YourStruct { val: 7 }))),
-        ],
-    })));
-    independent_task_root(&mut m, |mut outer, checkpointer| {
+    let mut m = PersistentCell::new(PersistentCell::from_boxed(
+        Box::new(MyStruct {
+            children: vec![
+                PersistentCell::new(PersistentCell::from_boxed(
+                    Box::new(YourStruct { val: 5 }) as Box<dyn SaveAble>)),
+                PersistentCell::new(PersistentCell::from_boxed(
+                    Box::new(YourStruct { val: 7 }) as Box<dyn SaveAble>)),
+            ],
+        }) as Box<dyn SaveAble>,
+    ));
+    independent_task_root(&mut m, |mut outer: OuterHandle<SaveSlot, dyn Trait>, checkpointer: Checkpointer<SaveSlot>| {
         // THE SNAPSHOT READS CLIENT VOCABULARY through the guard's &K
         let ck = checkpointer.clone();
         std::thread::scope(|scope| {
             let checker = scope.spawn(move || {
                 let guard = ck.request();
-                let snapshot: String = guard.0.save(); // <-- the gap closed
+                let snapshot: String = { (***guard).save() };
                 println!("checkpoint snapshot: {}", snapshot);
             });
             let first = outer.bark();
             println!("sum: {}", first);
             // the install, K directly:
-            let successor = SaveSlot(Box::new(YourStruct { val: 42 }));
+            let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn SaveAble>);
             outer.replace(successor);
             let second = outer.bark();
             println!("sum: {}", second);

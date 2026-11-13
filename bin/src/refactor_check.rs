@@ -41,7 +41,7 @@ enum Snap {
 }
 
 /// K, literally the subtrait box
-type SaveSlot = Box<dyn SaveAble>;
+type SaveSlot = Box<PersistentCell<dyn SaveAble>>;
 
 struct Machine {
     children: Vec<PersistentCell<SaveSlot>>,
@@ -51,11 +51,11 @@ struct Counter {
     val: i32,
 }
 
-impl Trait for InnerHandle<PersistentCell<Machine>> {
+impl Trait for InnerHandle<Machine> {
     fn step(&mut self) {
         self.steps += 1;
         self.fanout(
-            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
+            &|m: &Machine| m.children.iter().collect(),
             |mut o| o.step(),
         );
         // the SAFETY POINT: the checker's requests land here
@@ -64,7 +64,7 @@ impl Trait for InnerHandle<PersistentCell<Machine>> {
 
     fn observe(&mut self) -> String {
         let obs: Vec<String> = self.fanout(
-            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
+            &|m: &Machine| m.children.iter().collect(),
             |mut o| o.observe(),
         );
         obs.join("+")
@@ -74,16 +74,17 @@ impl Trait for InnerHandle<PersistentCell<Machine>> {
         // the push goes through the handle's own deref_mut (the
         // exclusive access the method has), BEFORE the fanout — the
         // shared split then hands out all children, grown one included
-        self.children.push(PersistentCell::new(Box::new(PersistentCell::new(Counter { val: 100 })) as SaveSlot));
+        self.children.push(PersistentCell::new(
+            PersistentCell::from_boxed(Box::new(Counter { val: 100 }) as Box<dyn SaveAble>)));
         self.fanout(
-            &|m: &PersistentCell<Machine>| m.children.iter().collect(),
+            &|m: &Machine| m.children.iter().collect(),
             |mut o| o.observe(),
         );
         self.safepoint();
     }
 }
 
-impl Trait for InnerHandle<PersistentCell<Counter>> {
+impl Trait for InnerHandle<Counter> {
     fn step(&mut self) {
         self.val += 1;
     }
@@ -95,12 +96,12 @@ impl Trait for InnerHandle<PersistentCell<Counter>> {
 
 /// the INNER layer: the states themselves cell-covered before
 /// boxing — orphan-legal (SaveAble is this crate's trait)
-impl SaveAble for PersistentCell<Machine> {
+impl SaveAble for Machine {
     fn save(&self) -> Snap {
         Snap::Node(self.children.iter().map(|c| c.save()).collect())
     }
 }
-impl SaveAble for PersistentCell<Counter> {
+impl SaveAble for Counter {
     fn save(&self) -> Snap {
         Snap::Leaf(self.val)
     }
@@ -109,11 +110,13 @@ impl SaveAble for PersistentCell<Counter> {
 /// rebuild a live slot from a snapshot — the mirror of the save
 fn restore(s: &Snap) -> SaveSlot {
     match s {
-        Snap::Leaf(v) => Box::new(PersistentCell::new(Counter { val: *v })),
-        Snap::Node(kids) => Box::new(PersistentCell::new(Machine {
-            children: kids.iter().map(|k| PersistentCell::new(restore(k))).collect(),
-            steps: 0,
-        })),
+        Snap::Leaf(v) => PersistentCell::from_boxed(Box::new(Counter { val: *v }) as Box<dyn SaveAble>),
+        Snap::Node(kids) => PersistentCell::from_boxed(
+            Box::new(Machine {
+                children: kids.iter().map(|k| PersistentCell::new(restore(k))).collect(),
+                steps: 0,
+            }) as Box<dyn SaveAble>,
+        ),
     }
 }
 

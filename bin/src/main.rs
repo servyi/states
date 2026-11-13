@@ -8,10 +8,9 @@ trait Trait: Send {
     fn dup_probe(&mut self);
 }
 
-/// The demo's slot shape: the erased box (no Holder needed — with
-/// HandleAble<V> single-param, Box<dyn HandleAble<V>> is not
-/// recursive).
-type Slot = Box<dyn HandleAble<dyn Trait> + 'static>;
+/// The variant-B slot: a box OF A CELL — the cell covers the state
+/// (the IM line), the box is the container K.
+type Slot = Box<PersistentCell<dyn HandleAble<dyn Trait>>>;
 
 struct MyStruct {
     children: Vec<PersistentCell<Slot>>,
@@ -64,12 +63,16 @@ impl Trait for InnerHandle<YourStruct> {
 /// Wrap a LIVE driver-owned slot in the OuterHandle (the library's
 /// over_slot does the mint).
 fn main() {
-    let mut m: PersistentCell<Slot> = PersistentCell::new(Box::new(MyStruct {
-        children: vec![
-            PersistentCell::new(Box::new(YourStruct { val: 5 })),
-            PersistentCell::new(Box::new(YourStruct { val: 7 })),
-        ],
-    }));
+    let mut m: PersistentCell<Slot> = PersistentCell::new(PersistentCell::from_boxed(
+        Box::new(MyStruct {
+            children: vec![
+                PersistentCell::new(PersistentCell::from_boxed(Box::new(YourStruct { val: 5 })
+                    as Box<dyn HandleAble<dyn Trait>>)),
+                PersistentCell::new(PersistentCell::from_boxed(Box::new(YourStruct { val: 7 })
+                    as Box<dyn HandleAble<dyn Trait>>)),
+            ],
+        }) as Box<dyn HandleAble<dyn Trait>>,
+    ));
     // the ROOT task: the slot is inaccessible inside (borrowed by the
     // call); the outer handle and its Checkpointer travel together
     independent_task_root(&mut m, |mut outer, checkpointer| {
@@ -90,7 +93,8 @@ fn main() {
             println!("sum: {}", first);
             // THE INSTALL: the OuterHandle walks to the slot through the
             // current inner handle, swaps it, re-mints, keeps the fresh one
-            let successor: Slot = Box::new(YourStruct { val: 42 });
+            let successor: Slot =
+                PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }));
             outer.replace(successor);
             let second = outer.bark();
             println!("sum: {}", second);
@@ -98,9 +102,12 @@ fn main() {
         });
     });
 
-    let mut y: PersistentCell<Slot> = PersistentCell::new(Box::new(MyStruct {
-        children: vec![PersistentCell::new(Box::new(YourStruct { val: 5 }))],
-    }));
+    let mut y: PersistentCell<Slot> = PersistentCell::new(PersistentCell::from_boxed(
+        Box::new(MyStruct {
+            children: vec![PersistentCell::new(PersistentCell::from_boxed(Box::new(YourStruct { val: 5 })
+                as Box<dyn HandleAble<dyn Trait>>))],
+        }) as Box<dyn HandleAble<dyn Trait>>,
+    ));
     independent_task_root(&mut y, |mut outer2, _checkpointer| {
         outer2.dup_probe();
     });

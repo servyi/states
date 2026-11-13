@@ -491,7 +491,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
 ) -> R
 where
     K: DerefMut + Sized + Send + 'static,
-    K::Target: Unsize<dyn HandleAble<V>> + 'static,
+    K::Target: AsPtr<dyn HandleAble<V>> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -541,7 +541,7 @@ impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
     K: DerefMut + Send + 'static,
-    K::Target: Unsize<dyn HandleAble<V>> + 'static,
+    K::Target: AsPtr<dyn HandleAble<V>> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -578,7 +578,7 @@ where
         // SAFETY: the caller's contract above.
         let k: &mut K = unsafe { (*slot).as_mut_k() };
         let target: &mut K::Target = DerefMut::deref_mut(k);
-        let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+        let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
         let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
@@ -610,7 +610,7 @@ where
             // chain (the mint's discipline).
             let k: &mut K = unsafe { (*self.slot).as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
-            let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+            let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
             let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
@@ -618,6 +618,53 @@ where
             unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
         self.current = fresh;
+    }
+}
+
+/// A slot target that can hand out the pointer to its erased `H`
+/// view — the line the mint persists. Three impls, one per shape:
+///
+/// - **`PersistentCell<T>`**: the content through the hatch — the
+///   interior-mutable line (the sound shape for erased states);
+/// - **`Box<X>`**: the *stored* line (`&raw mut **self`) — for
+///   containers whose target is itself a box.
+///
+/// # Safety
+///
+/// For implementors: the returned pointer must be the line the
+/// container's own `Deref`/`DerefMut` spring from — never a freshly
+/// minted reference to foreign storage — and the backing store must
+/// not be deleted until the next `&mut` method call on the container.
+///
+/// **Coherence is structural:** these are the only library impls,
+/// and a client cannot write one for `PersistentCell` or `Box`
+/// (foreign trait, foreign type — E0210). For a CONCRETE state `T`
+/// as a slot target (`Box<T>` children), the client writes their own
+/// one-line identity impl (`impl AsPtr<dyn HandleAble<V>> for
+/// MyState`) — orphan-legal for their local type, and unable to
+/// overlap ours.
+pub unsafe trait AsPtr<H: ?Sized> {
+    fn as_ptr(&mut self) -> *mut H;
+}
+
+// the cell: the content through the hatch — the IM-covered line
+unsafe impl<X, V: ?Sized> AsPtr<dyn HandleAble<V>> for PersistentCell<X>
+where
+    X: HandleAble<V> + Unsize<dyn HandleAble<V>> + ?Sized,
+{
+    fn as_ptr(&mut self) -> *mut dyn HandleAble<V> {
+        // SAFETY: the wrapper's own hatch; the content is the store
+        unsafe { &mut *self.as_mut_k() as *mut dyn HandleAble<V> }
+    }
+}
+
+// the box: the STORED line, not the deref-fresh one
+unsafe impl<X, V: ?Sized> AsPtr<dyn HandleAble<V>> for Box<X>
+where
+    X: HandleAble<V> + Unsize<dyn HandleAble<V>> + ?Sized,
+{
+    fn as_ptr(&mut self) -> *mut dyn HandleAble<V> {
+        &raw mut **self as *mut dyn HandleAble<V>
     }
 }
 
@@ -637,13 +684,26 @@ where
 /// mutability pattern). The fanout's mint path uses the crate-private
 /// [`PersistentCell::as_mut_k`] — sound only under the chain's exclusivity
 /// discipline, which the library maintains.
-pub struct PersistentCell<K> {
+pub struct PersistentCell<K: ?Sized> {
     cell: UnsafeCell<K>,
 }
 
 impl<K: Sized> PersistentCell<K> {
     pub fn new(k: K) -> Self {
         PersistentCell { cell: UnsafeCell::new(k) }
+    }
+}
+
+impl<K: ?Sized> PersistentCell<K> {
+    /// Adopt a boxed value as a boxed cell — the cell's single field
+    /// is `repr(transparent)`, so the layouts are identical and the
+    /// box is re-typed in place. This is the constructor for cells
+    /// over erased (`?Sized`) content: `Box<dyn ...>` in, boxed cell
+    /// out, no reallocation.
+    pub fn from_boxed(b: Box<K>) -> Box<PersistentCell<K>> {
+        // SAFETY: UnsafeCell is repr(transparent); PersistentCell's
+        // only field is the cell — layout-identical to K.
+        unsafe { std::mem::transmute(b) }
     }
 
     /// The mint's escape hatch: `&self` to `&mut K`. Sound under
@@ -667,7 +727,7 @@ impl<K: Sized> PersistentCell<K> {
     }
 }
 
-impl<K> Deref for PersistentCell<K> {
+impl<K: ?Sized> Deref for PersistentCell<K> {
     type Target = K;
     fn deref(&self) -> &K {
         // SAFETY: shared access to the cell's content — the wrapper's
@@ -676,7 +736,7 @@ impl<K> Deref for PersistentCell<K> {
     }
 }
 
-impl<K> DerefMut for PersistentCell<K> {
+impl<K: ?Sized> DerefMut for PersistentCell<K> {
     fn deref_mut(&mut self) -> &mut K {
         // SAFETY: `&mut self` is exclusive on the wrapper — no other
         // access can exist.
@@ -685,50 +745,13 @@ impl<K> DerefMut for PersistentCell<K> {
 }
 
 // The wrapper crosses threads exactly when its content does.
-unsafe impl<K: Send> Send for PersistentCell<K> {}
+unsafe impl<K: ?Sized + Send> Send for PersistentCell<K> {}
 
 // SAFETY: the cell's interior mutability is serialized by the
 // library's own discipline — the global claims registry ensures one
 // exclusive driver per slot at a time, and the checkpoints stop the
 // world — so shared references may cross threads to waiting subtasks.
-unsafe impl<K: Send> Sync for PersistentCell<K> {}
-
-/// A container that can hand out the pointer its `Deref`s spring
-/// from — the provenance vehicle the mint needs.
-///
-/// # Safety
-///
-/// For implementors:
-///
-/// 1. The returned pointer must NOT be a freshly minted reference:
-///    it must originate from the same raw line the container's
-///    `Deref`/`DerefMut` also spring from (the underlying stored
-///    pointer). Under Tree Borrows a freshly minted reference is a
-///    fresh tag — a sibling of the readers' tags — and every
-///    checkpoint read would then permanently freeze the writer's
-///    line (the 450 pattern, demonstrated on custom containers and
-///    sized builtin targets).
-/// 2. The backing store must not be deleted until the next `&mut`
-///    method call on the container: disposal may only happen when
-///    the container regains exclusive control, and by then every
-///    handle minted over the old content must already be dropped
-///    (the mint's existing contract).
-pub unsafe trait AsPtr: DerefMut {
-    /// The pointer to the container's current pointee, on the
-    /// stored line (see the trait's safety requirements).
-    fn as_ptr(&mut self) -> *mut Self::Target;
-}
-
-// SAFETY: `&raw mut **self` borrows the BUILTIN box-deref place —
-// the loaded stored pointer itself, no reference is materialized,
-// so the raw carries the stored line; and a `Box` cannot delete or
-// move its backing store except by dropping/moving the box, which
-// requires exclusive access (a `&mut` method call or the owner).
-unsafe impl<T: ?Sized> AsPtr for Box<T> {
-    fn as_ptr(&mut self) -> *mut Self::Target {
-        &raw mut **self
-    }
-}
+unsafe impl<K: ?Sized + Send> Sync for PersistentCell<K> {}
 
 /// The erasure vocabulary: a state type `T` whose
 /// `InnerHandle<T, V>` can be erased to `V`.
@@ -827,7 +850,7 @@ impl<T: Sized> InnerHandle<T> {
     where
         T: Send,
         K: DerefMut + Sized + Send + 'static,
-    K::Target: Unsize<dyn HandleAble<V>> + 'static,
+        K::Target: AsPtr<dyn HandleAble<V>> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -902,7 +925,7 @@ impl<T: Sized> InnerHandle<T> {
                     // driver of the slot; the mint's discipline holds.
                     let k: &mut K = unsafe { child.as_mut_k() };
                     let target: &mut K::Target = DerefMut::deref_mut(k);
-                    let state_raw: *mut dyn HandleAble<V> = target as *mut dyn HandleAble<V>;
+                    let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
                     let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
