@@ -613,6 +613,24 @@ where
             let k: &mut K = unsafe { (*self.slot).as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
             let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
+            // THE CONTENT CLAIM: a replacement whose content is
+            // aliased with another live chain (a duplicable container
+            // handed in by value) serializes here before the re-mint —
+            // same level-2 rule as the fanout children.
+            let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
+            loop {
+                match claims.entry(state_raw as *const () as usize) {
+                    dashmap::Entry::Vacant(v) => {
+                        v.insert(());
+                        break;
+                    }
+                    _ => self.shared.backoff_checkpoint(),
+                }
+            }
+            let _content_claim = ClaimGuard {
+                claims: Arc::clone(&claims),
+                key: state_raw as *const () as usize,
+            };
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
             let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
@@ -916,14 +934,40 @@ impl<T: Sized> InnerHandle<T> {
                     // release on unwind or completion — a panicked
                     // subtask must not leave its slot claimed
                     let _claim = ClaimGuard { claims: Arc::clone(&claims), key };
-                    // THE MINT (only after uniqueness is ensured): the
-                    // K-side access through the wrapper's escape hatch
-                    // (the chain's exclusivity), the receiver transient
-                    // SAFETY: the claim makes this thread the sole
-                    // driver of the slot; the mint's discipline holds.
-                    let k: &mut K = unsafe { child.as_mut_k() };
-                    let target: &mut K::Target = DerefMut::deref_mut(k);
-                    let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
+                    // LEVEL 2 — the CONTENT claim: de-duplicate on the
+                    // `AsPtr` raw of the containee. The cell claim above
+                    // guarantees uniqueness of the reference to the
+                    // CONTAINER; this one guarantees uniqueness of the
+                    // CHILD NODE itself — two distinct cells holding
+                    // container values that deref to the same content
+                    // (a Copy/index container) serialize here, exactly
+                    // like same-cell subtasks do on level 1. Claim
+                    // order is globally cell-then-content, so no
+                    // cross-thread claim cycle can form.
+                    let state_raw: *mut dyn HandleAble<V> = loop {
+                        // the transient container derefs re-run per
+                        // attempt; nothing is driven until the claim
+                        // succeeds
+                        let k: &mut K = unsafe { child.as_mut_k() };
+                        let target: &mut K::Target = DerefMut::deref_mut(k);
+                        let raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
+                        match claims.entry(raw as *const () as usize) {
+                            dashmap::Entry::Vacant(v) => {
+                                v.insert(());
+                                break raw;
+                            }
+                            _ => child_shared.backoff_checkpoint(),
+                        }
+                    };
+                    let _content_claim = ClaimGuard {
+                        claims: Arc::clone(&claims),
+                        key: state_raw as *const () as usize,
+                    };
+                    // THE MINT (only after BOTH uniqueness levels):
+                    // the raw is claimed; the receiver transient
+                    // SAFETY: the claims make this thread the sole
+                    // driver of both the slot and its content; the
+                    // mint's discipline holds.
                     let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
