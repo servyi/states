@@ -51,3 +51,16 @@ required-features = ["never"]
 [[bin]]
 name = "attack-crosstree"
 path = "src/crosstree.rs"
+
+[[bin]]
+name = "attack-cellwrite"
+path = "src/cellwrite.rs"
+
+[[bin]]
+name = "attack-multireader"
+path = "src/multireader.rs"
+
+[[bin]]
+name = "attack-gatedead"
+path = "src/gatedead.rs"
+required-features = ["never"]
