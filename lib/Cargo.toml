@@ -3,3 +3,6 @@ name = "hslib"
 version = "0.1.0"
 edition = "2021"
 
+[dependencies]
+dashmap = "6.2.1"
+

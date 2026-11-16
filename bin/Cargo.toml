@@ -5,3 +5,26 @@ edition = "2021"
 
 [dependencies]
 hslib = { path = "../lib" }
+
+[[bin]]
+name = "hsbin-saveable"
+path = "src/saveable.rs"
+
+[[bin]]
+name = "hsbin-saveable-direct"
+path = "src/saveable_direct.rs"
+
+[[bin]]
+name = "hsbin-custombox"
+path = "src/custombox.rs"
+
+[features]
+never = []
+
+[[bin]]
+name = "hsbin-refactor-check"
+path = "src/refactor_check.rs"
+
+[[bin]]
+name = "hsbin-arena"
+path = "src/arena.rs"
