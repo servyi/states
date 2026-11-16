@@ -1,11 +1,17 @@
-//! ATTACK: cross-tree shared content — the claims registry is
-//! PER-ROOT, so nothing deduplicates two concurrent trees over the
-//! SAME state. A sound client puts one registered state into two
-//! trees (a Copy container: two distinct PersistentCell<ArenaSlot>
-//! with the SAME index), and both mutator chains drive it
-//! concurrently. The container's unsafe is confined alloc/fat-ptr
-//! plumbing (the data-structure-author kind, as in the arena demo);
-//! the tree usage below is plain safe client code.
+//! ATTACK (INVALID — retracted): cross-tree shared content.
+//!
+//! Jonas's ruling: the container itself is unsound, independent of
+//! the library. The root takes &mut (or ownership) of the tree, so
+//! every content is soundly reachable only as a &mut borrow of that
+//! chain; an arena handing the same memory to two slots lets even a
+//! plain safe user derive two conflicting &mut borrows WITHOUT the
+//! library — verified: two ArenaSlots with one index, &mut *a and
+//! &mut *b, aliasing &mut — Miri UB (SB: dead tag; TB likewise), no
+//! hslib involved. The DerefMut exclusivity contract is the
+//! container author's to uphold; a Copy slot with shared indices
+//! violates it by construction. The cross-tree 'finding' therefore
+//! says nothing about the library — kept as the record of the
+//! retraction.
 
 use std::cell::UnsafeCell;
 use std::ops::{Deref, DerefMut};
