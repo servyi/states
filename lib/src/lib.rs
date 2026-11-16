@@ -121,6 +121,13 @@ const JOIN_POLL_INTERVAL_MS: u64 = 1;
 /// being short.
 const REQUEST_WAIT_MS: u64 = 10;
 
+/// How long a LEVEL-2 (content) claim may wait before panicking.
+/// Unlike cell claims (which resolve when the owning subtask ends),
+/// content waits can form cross-claim cycles and intrathread
+/// self-deadlocks — the bounded window turns those into a
+/// deterministic abort instead of a silent hang.
+const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Shared {
     fn new() -> Self {
         Shared {
@@ -613,18 +620,31 @@ where
             let k: &mut K = unsafe { (*self.slot).as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
             let state_raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
-            // THE CONTENT CLAIM: a replacement whose content is
-            // aliased with another live chain (a duplicable container
-            // handed in by value) serializes here before the re-mint —
-            // same level-2 rule as the fanout children.
+            // THE CONTENT CLAIM, on the SAME map: a replacement whose
+            // content is aliased with another live chain waits — but
+            // bounded: content waits can form claim cycles and
+            // self-deadlocks, so after the window this PANICS (the
+            // deterministic abort) instead of hanging.
             let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
-            loop {
-                match claims.entry(state_raw as *const () as usize) {
-                    dashmap::Entry::Vacant(v) => {
-                        v.insert(());
-                        break;
+            {
+                let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
+                loop {
+                    match claims.entry(state_raw as *const () as usize) {
+                        dashmap::Entry::Vacant(v) => {
+                            v.insert(());
+                            break;
+                        }
+                        _ => {
+                            if std::time::Instant::now() >= deadline {
+                                panic!(
+                                    "content claim timeout: replacement content is still \
+                                     driven by another chain (cross-claim cycle or \
+                                     self-deadlock)"
+                                );
+                            }
+                            self.shared.backoff_checkpoint();
+                        }
                     }
-                    _ => self.shared.backoff_checkpoint(),
                 }
             }
             let _content_claim = ClaimGuard {
@@ -934,29 +954,44 @@ impl<T: Sized> InnerHandle<T> {
                     // release on unwind or completion — a panicked
                     // subtask must not leave its slot claimed
                     let _claim = ClaimGuard { claims: Arc::clone(&claims), key };
-                    // LEVEL 2 — the CONTENT claim: de-duplicate on the
-                    // `AsPtr` raw of the containee. The cell claim above
-                    // guarantees uniqueness of the reference to the
-                    // CONTAINER; this one guarantees uniqueness of the
-                    // CHILD NODE itself — two distinct cells holding
-                    // container values that deref to the same content
-                    // (a Copy/index container) serialize here, exactly
-                    // like same-cell subtasks do on level 1. Claim
-                    // order is globally cell-then-content, so no
-                    // cross-thread claim cycle can form.
-                    let state_raw: *mut dyn HandleAble<V> = loop {
-                        // the transient container derefs re-run per
-                        // attempt; nothing is driven until the claim
-                        // succeeds
-                        let k: &mut K = unsafe { child.as_mut_k() };
-                        let target: &mut K::Target = DerefMut::deref_mut(k);
-                        let raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
-                        match claims.entry(raw as *const () as usize) {
-                            dashmap::Entry::Vacant(v) => {
-                                v.insert(());
-                                break raw;
+                    // LEVEL 2 — the CONTENT claim, on the SAME map:
+                    // de-duplicate on the `AsPtr` raw of the containee
+                    // (two distinct cells holding container values that
+                    // deref to the same content — a Copy/index
+                    // container). A content duplicate WAITS, but only
+                    // briefly: unlike cell duplicates (which resolve
+                    // when the owning subtask ends), content waits can
+                    // form CROSS-CLAIM CYCLES (A holds content x wants
+                    // y; B holds y wants x) and INTRATHREAD SELF-
+                    // DEADLOCKS (a nested fanout re-claiming content
+                    // its own ancestor already holds) — so after the
+                    // bounded window this PANICS: a deterministic
+                    // abort instead of a silent deadlock.
+                    let state_raw: *mut dyn HandleAble<V> = {
+                        let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
+                        loop {
+                            // the transient container derefs re-run per
+                            // attempt; nothing is driven until the claim
+                            // succeeds
+                            let k: &mut K = unsafe { child.as_mut_k() };
+                            let target: &mut K::Target = DerefMut::deref_mut(k);
+                            let raw: *mut dyn HandleAble<V> = AsPtr::as_ptr(target);
+                            match claims.entry(raw as *const () as usize) {
+                                dashmap::Entry::Vacant(v) => {
+                                    v.insert(());
+                                    break raw;
+                                }
+                                _ => {
+                                    if std::time::Instant::now() >= deadline {
+                                        panic!(
+                                            "content claim timeout: the same state is still \
+                                             driven by another chain (cross-claim cycle or \
+                                             self-deadlock)"
+                                        );
+                                    }
+                                    child_shared.backoff_checkpoint();
+                                }
                             }
-                            _ => child_shared.backoff_checkpoint(),
                         }
                     };
                     let _content_claim = ClaimGuard {
