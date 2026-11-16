@@ -72,3 +72,8 @@ path = "src/nestedroot.rs"
 [[bin]]
 name = "attack-panicchild"
 path = "src/panicchild.rs"
+
+[[bin]]
+name = "attack-forgetouter"
+path = "src/forgetouter.rs"
+required-features = ["never"]
