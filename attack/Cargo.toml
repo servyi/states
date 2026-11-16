@@ -64,3 +64,11 @@ path = "src/multireader.rs"
 name = "attack-gatedead"
 path = "src/gatedead.rs"
 required-features = ["never"]
+
+[[bin]]
+name = "attack-nestedroot"
+path = "src/nestedroot.rs"
+
+[[bin]]
+name = "attack-panicchild"
+path = "src/panicchild.rs"
