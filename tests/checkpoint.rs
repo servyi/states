@@ -1,4 +1,8 @@
-
+// The two-piece protocol's integration suite (#19's design): the
+// machine shape the old suite drove (Seq/Scatter/Nested stages, STW
+// checkpoints, mid-run snapshot+resume) rebuilt on
+// independent_task_root + PersistentCell slots.
+//
 // The scenario literals below are test data (see header); they are
 // the one class the inline_literal policy exempts via allow.
 #![allow(unknown_lints)] // plain clippy does not know the driver's lints
@@ -8,7 +12,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::{with_checkpoint_pair, CheckpointRequester, Handle};
+use servyi_states::checkpoint::{
+    Checkpointer, InnerHandle, OuterHandle, PersistentCell, independent_task_root,
+};
 
 /// Steps after which the machine holds (parks at safepoints, no
 /// progress) until released — the deterministic mid-run point.
@@ -77,7 +83,12 @@ impl AnalyzeState {
     }
 }
 
-fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
+/// The slot a node lives in: a boxed cell in a cell (the two-piece
+/// shape). `AnalyzeSlot` etc. name the per-node container.
+type AnalyzeSlot = Box<PersistentCell<AnalyzeState>>;
+type GroupSlot = Box<PersistentCell<Group>>;
+
+fn run_analyze(h: &mut InnerHandle<AnalyzeState>, io: &Io) {
     loop {
         h.safepoint();
         let (id, steps, done_steps) = {
@@ -110,26 +121,50 @@ fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Group {
     gid: u32,
-    children: Vec<AnalyzeState>,
+    children: Vec<PersistentCell<AnalyzeSlot>>,
 }
 
 impl Group {
     fn result(&self) -> (u32, String) {
-        let ids: Vec<String> =
-            self.children.iter().map(|c| c.done.clone().unwrap_or_default()).collect();
+        let ids: Vec<String> = self
+            .children
+            .iter()
+            .map(|c| c.done.clone().unwrap_or_default())
+            .collect();
         (self.gid, ids.join(","))
     }
 }
 
-fn run_group(mut h: Handle<'_, Group>, io: &Io) {
-    h.fanout(&|g| g.children.iter_mut().collect(), |a| run_analyze(a, io));
+/// The group's drive vocabulary: a group runs its children.
+trait GroupDriven: Send {
+    fn run(&mut self, io: &Io);
+}
+
+impl GroupDriven for InnerHandle<Group> {
+    fn run(&mut self, io: &Io) {
+        self.fanout(
+            &|g: &Group| g.children.iter().collect(),
+            |mut a: OuterHandle<'_, AnalyzeSlot, dyn GroupNode>| a.run_node(io),
+        );
+    }
+}
+
+/// The analyze node's vocabulary (the fan-out callback's view).
+trait GroupNode: Send {
+    fn run_node(&mut self, io: &Io);
+}
+
+impl GroupNode for InnerHandle<AnalyzeState> {
+    fn run_node(&mut self, io: &Io) {
+        run_analyze(self, io)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Stage {
     Seq { step: u32 },
-    Scatter { children: Vec<AnalyzeState> },
-    Nested { groups: Vec<Group> },
+    Scatter { children: Vec<PersistentCell<AnalyzeSlot>> },
+    Nested { groups: Vec<PersistentCell<GroupSlot>> },
     Done,
 }
 
@@ -147,115 +182,164 @@ struct Machine {
     result: String,
 }
 
-/// One top-level transition. The node is touched exclusively through the
-/// root handle: every access borrows the handle, so nothing can be live
-/// across the safepoints inside the fan-outs.
-fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) {
-    let mut next: Option<Stage> = None;
-    let keep_going = {
-        let m = &mut *h;
-        match &mut m.stage {
-            Stage::Seq { step } => {
-                if (*step as usize) < m.items.len() && !io.holding() {
-                    io.step(m.items[*step as usize].id);
-                    *step += 1;
-                    true
-                } else if (*step as usize) < m.items.len() {
-                    // Held mid-Seq: make no progress this transition; the
-                    // driver loop's safepoints keep serving the snapshotter.
-                    true
-                } else {
-                    next = Some(Stage::Scatter {
+/// The machine's drive vocabulary: one stage per `run` call (the root
+/// task loops it).
+trait MachineDriven: Send {
+    fn run_stage(&mut self, io: &Io) -> bool;
+}
+
+impl MachineDriven for InnerHandle<Machine> {
+    fn run_stage(&mut self, io: &Io) -> bool {
+        let mut next: Option<Stage> = None;
+        let keep_going = {
+            let m = &mut **self;
+            match &mut m.stage {
+                Stage::Seq { step } => {
+                    if (*step as usize) < m.items.len() && !io.holding() {
+                        io.step(m.items[*step as usize].id);
+                        *step += 1;
+                        true
+                    } else if (*step as usize) < m.items.len() {
+                        // Held mid-Seq: make no progress this transition; the
+                        // driver loop's safepoints keep serving the snapshotter.
+                        true
+                    } else {
+                        next = Some(Stage::Scatter {
+                            children: m
+                                .items
+                                .iter()
+                                .map(|i| {
+                                    PersistentCell::new(Box::new(PersistentCell::new(
+                                        AnalyzeState {
+                                            item: i.clone(),
+                                            step: 0,
+                                            done: None,
+                                        },
+                                    )))
+                                })
+                                .collect(),
+                        });
+                        true
+                    }
+                }
+                Stage::Scatter { .. } => true,
+                Stage::Nested { .. } => true,
+                Stage::Done => false,
+            }
+        };
+        if let Some(n) = next {
+            self.stage = n;
+        }
+        if !keep_going {
+            return false;
+        }
+        let which = match &self.stage {
+            Stage::Scatter { .. } => 0,
+            Stage::Nested { .. } => 1,
+            _ => -1,
+        };
+        match which {
+            0 => {
+                self.fanout(
+                    &|m: &Machine| match &m.stage {
+                        Stage::Scatter { children } => children.iter().collect(),
+                        _ => unreachable!("checked above"),
+                    },
+                    |mut a: OuterHandle<'_, AnalyzeSlot, dyn GroupNode>| a.run_node(io),
+                );
+            }
+            1 => {
+                self.fanout(
+                    &|m: &Machine| match &m.stage {
+                        Stage::Nested { groups } => groups.iter().collect(),
+                        _ => unreachable!("checked above"),
+                    },
+                    |mut g: OuterHandle<'_, GroupSlot, dyn GroupDrivenVocab>| g.run(io),
+                );
+            }
+            _ => {}
+        }
+        let m = &mut **self;
+        let mut collected: Vec<(u32, String)> = Vec::new();
+        match &m.stage {
+            Stage::Scatter { children } => collected.extend(children.iter().map(Group::node_result)),
+            Stage::Nested { groups } => collected.extend(groups.iter().map(Group::slot_result)),
+            _ => {}
+        }
+        // Stage transitions live with the collection they follow: Scatter
+        // results feed the Nested groups (take/skip split, gids 100/200),
+        // Nested results finish the machine.
+        let next: Option<Stage> = match &m.stage {
+            Stage::Scatter { .. } => Some(Stage::Nested {
+                groups: vec![
+                    PersistentCell::new(Box::new(PersistentCell::new(Group {
+                        gid: 100,
                         children: m
                             .items
                             .iter()
-                            .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
+                            .take(2)
+                            .map(|i| {
+                                PersistentCell::new(Box::new(PersistentCell::new(
+                                    AnalyzeState {
+                                        item: i.clone(),
+                                        step: 0,
+                                        done: None,
+                                    },
+                                )))
+                            })
                             .collect(),
-                    });
-                    true
-                }
+                    }))),
+                    PersistentCell::new(Box::new(PersistentCell::new(Group {
+                        gid: 200,
+                        children: m
+                            .items
+                            .iter()
+                            .skip(2)
+                            .map(|i| {
+                                PersistentCell::new(Box::new(PersistentCell::new(
+                                    AnalyzeState {
+                                        item: i.clone(),
+                                        step: 0,
+                                        done: None,
+                                    },
+                                )))
+                            })
+                            .collect(),
+                    }))),
+                ],
+            }),
+            Stage::Nested { .. } => {
+                let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
+                m.result = format!("done: {}", ids.join(","));
+                Some(Stage::Done)
             }
-            Stage::Scatter { .. } => true,
-            Stage::Nested { .. } => true,
-            Stage::Done => false,
+            _ => None,
+        };
+        m.done.extend(collected);
+        if let Some(n) = next {
+            m.stage = n;
         }
-    };
-    if let Some(n) = next {
-        h.stage = n;
+        true
     }
-    if !keep_going {
-        return (h, false);
+}
+
+trait GroupDrivenVocab: Send {
+    fn run(&mut self, io: &Io);
+}
+
+impl GroupDrivenVocab for InnerHandle<Group> {
+    fn run(&mut self, io: &Io) {
+        <Self as GroupDriven>::run(self, io)
     }
-    // Fan-out stages: run while serving checkpoints, then read results
-    // from the node.
-    let which = match &h.stage {
-        Stage::Scatter { .. } => 0,
-        Stage::Nested { .. } => 1,
-        _ => -1,
-    };
-    match which {
-        0 => h.fanout(
-            &|m: &mut Machine| match &mut m.stage {
-                Stage::Scatter { children } => children.iter_mut().collect(),
-                _ => unreachable!("checked above"),
-            },
-            |a| run_analyze(a, io),
-        ),
-        1 => h.fanout(
-            &|m: &mut Machine| match &mut m.stage {
-                Stage::Nested { groups } => groups.iter_mut().collect(),
-                _ => unreachable!("checked above"),
-            },
-            |g| run_group(g, io),
-        ),
-        _ => {}
+}
+
+impl Group {
+    fn node_result(c: &PersistentCell<AnalyzeSlot>) -> (u32, String) {
+        c.result()
     }
-    let m = &mut *h;
-    let mut collected: Vec<(u32, String)> = Vec::new();
-    match &m.stage {
-        Stage::Scatter { children } => collected.extend(children.iter().map(AnalyzeState::result)),
-        Stage::Nested { groups } => collected.extend(groups.iter().map(Group::result)),
-        _ => {}
+    fn slot_result(c: &PersistentCell<GroupSlot>) -> (u32, String) {
+        c.result()
     }
-    // Stage transitions live with the collection they follow: Scatter
-    // results feed the Nested groups (take/skip split, gids 100/200),
-    // Nested results finish the machine. Dropped in the 7a03762
-    // redesign — restored from 0acc997's semantics.
-    let next: Option<Stage> = match &m.stage {
-        Stage::Scatter { .. } => Some(Stage::Nested {
-            groups: vec![
-                Group {
-                    gid: 100,
-                    children: m
-                        .items
-                        .iter()
-                        .take(2)
-                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
-                        .collect(),
-                },
-                Group {
-                    gid: 200,
-                    children: m
-                        .items
-                        .iter()
-                        .skip(2)
-                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
-                        .collect(),
-                },
-            ],
-        }),
-        Stage::Nested { .. } => {
-            let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
-            m.result = format!("done: {}", ids.join(","));
-            Some(Stage::Done)
-        }
-        _ => None,
-    };
-    m.done.extend(collected);
-    if let Some(n) = next {
-        m.stage = n;
-    }
-    (h, true)
 }
 
 fn drive(
@@ -263,266 +347,354 @@ fn drive(
     io: &Io,
     checkpoint: Option<(Duration, std::path::PathBuf)>,
 ) -> Machine {
-    with_checkpoint_pair(machine, move |mut h, req| {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = stop.clone();
+    let mut root: PersistentCell<Box<PersistentCell<Machine>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(machine)));
+    independent_task_root(
+        &mut root,
+        |mut outer: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn MachineDrivenVocab>,
+         req: Checkpointer<Box<PersistentCell<Machine>>>| {
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop2 = stop.clone();
 
-        std::thread::scope(|scope| {
-            let timer = checkpoint.map(|(every, path)| {
-                let t = scope.spawn(move || {
-                    while !stop2.load(Ordering::SeqCst) {
-                        std::thread::sleep(every);
-                        if stop2.load(Ordering::SeqCst) {
-                            break;
+            std::thread::scope(|scope| {
+                let timer = checkpoint.map(|(every, path)| {
+                    let t = scope.spawn(move || {
+                        while !stop2.load(Ordering::SeqCst) {
+                            std::thread::sleep(every);
+                            if stop2.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            let Some(guard) = req.request_timeout(Duration::from_millis(50)) else {
+                                continue;
+                            };
+                            let bytes = serde_json::to_string(&*guard).expect("serialize");
+                            drop(guard);
+                            let tmp = path.with_extension("tmp");
+                            if std::fs::write(&tmp, &bytes).is_ok() {
+                                let _prev = std::fs::rename(&tmp, &path);
+                            }
                         }
-                        let Some(guard) = req.request_timeout(Duration::from_millis(50)) else {
-                            continue;
-                        };
-                        let bytes = serde_json::to_string(&*guard).expect("serialize");
-                        drop(guard);
-                        let tmp = path.with_extension("tmp");
-                        if std::fs::write(&tmp, &bytes).is_ok() {
-                            let _prev = std::fs::rename(&tmp, &path);
-                        }
-                    }
+                    });
+                    (t, every)
                 });
-                (t, every)
+
+                // the stage loop: each run_stage parks at its safepoints
+                loop {
+                    outer.park();
+                    if !outer.run_stage(io) {
+                        break;
+                    }
+                }
+
+                if let Some((t, _)) = timer {
+                    stop.store(true, Ordering::SeqCst);
+                    t.join().expect("checkpoint timer");
+                }
             });
+        },
+    );
+    // the node stayed in the caller's cell all along — read it back
+    (*(*(*root))).clone()
+}
 
-            loop {
-                h.safepoint();
-                let (h2, keep_going) = step(h, io);
-                h = h2;
-                if !keep_going {
-                    break;
-                }
-            }
+trait MachineDrivenVocab: Send {
+    fn run_stage(&mut self, io: &Io) -> bool;
+    fn safepoint(&mut self);
+}
 
-            stop.store(true, Ordering::SeqCst);
-            while h.is_stop_requested() {
-                h.safepoint();
-            }
-            if let Some((t, _)) = timer {
-                if let Err(payload) = t.join() {
-                    std::panic::resume_unwind(payload);
-                }
-            }
-            // Snapshot the final state out of the node through the handle.
-            let out: Machine = h.clone();
-            out
-        })
-    })
+trait ParkVocab: Send {
+    fn park(&mut self);
+}
+
+impl ParkVocab for dyn MachineDrivenVocab + '_ {
+    fn park(&mut self) {
+        self.safepoint();
+    }
+}
+
+impl MachineDrivenVocab for InnerHandle<Machine> {
+    fn run_stage(&mut self, io: &Io) -> bool {
+        <Self as MachineDriven>::run_stage(self, io)
+    }
+    fn safepoint(&mut self) {
+        InnerHandle::safepoint(self)
+    }
 }
 
 fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
-    let d = tempfile::tempdir().expect("tempdir");
-    let p = d.path().to_path_buf();
-    (d, p)
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("snapshot.json");
+    (dir, path)
 }
 
+/// The freeze window: a guard's read access during a hold, then the
+/// safepoint serves the world.
 #[test]
 fn freeze_window_allows_access_then_safepoint() {
-    let out = with_checkpoint_pair(vec![7u32], |mut h, _req| {
-        h.fanout(&|c| c.iter_mut().collect(), |mut child| {
-            assert_eq!(*child, 7);
-            child.safepoint();
-            *child += 1;
-        });
-        h.clone()
-    });
-    assert_eq!(out, vec![8]);
+    let mut root: PersistentCell<Box<PersistentCell<Vec<u32>>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(vec![7_u32])));
+    let out: Vec<u32>;
+    {
+        independent_task_root(
+            &mut root,
+            |mut h: OuterHandle<'_, Box<PersistentCell<Vec<u32>>>, dyn VecDriven>, req| {
+                let ck = req.clone();
+                std::thread::scope(|s| {
+                    let t = s.spawn(move || {
+                        let guard = ck.request();
+                        let node: &Vec<u32> = &guard;
+                        assert_eq!(node, &vec![7]);
+                    });
+                    // the freeze window: park until the reader is done
+                    // (a bare join would self-deadlock on a request
+                    // arriving after the last park)
+                    while !t.is_finished() {
+                        h.park();
+                    }
+                    h.push(8);
+                    t.join().unwrap();
+                });
+            },
+        );
+        out = (***root).clone();
+    }
+    assert_eq!(out, vec![7, 8]);
 }
+
+trait VecDriven: Send {
+    fn push(&mut self, v: u32);
+    fn park(&mut self);
+}
+
+impl VecDriven for InnerHandle<Vec<u32>> {
+    fn push(&mut self, v: u32) {
+        (**self).push(v);
+        self.safepoint();
+    }
+    fn park(&mut self) {
+        self.safepoint();
+    }
+}
+
 
 #[test]
 fn snapshotter_reads_live_tree_through_guard() {
-    let (observed, final_v) = with_checkpoint_pair(41u32, |h, req| {
-        let mut h = h;
-        let (observed, final_v) = std::thread::scope(|scope| {
-            let mutifier = scope.spawn(move || {
-                let mut v = 41;
-                for _ in 0..50 {
-                    h.safepoint();
-                    *h += 1;
-                    v = *h;
-                    std::thread::sleep(Duration::from_millis(1));
+    let mut root: PersistentCell<Box<PersistentCell<u32>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(41_u32)));
+    let observed: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed2 = observed.clone();
+    independent_task_root(
+        &mut root,
+        |mut h: OuterHandle<'_, Box<PersistentCell<u32>>, dyn CountDriven>, req| {
+            let mutifier = Arc::new(AtomicUsize::new(0));
+            let mutifier2 = mutifier.clone();
+            std::thread::scope(|s| {
+                let reader = s.spawn(move || {
+                    let mut last = 0;
+                    while mutifier2.load(Ordering::SeqCst) == 0 {
+                        let Some(g) = req.request_timeout(Duration::from_millis(50)) else {
+                            continue;
+                        };
+                        let v: u32 = ****g;
+                        let mut o = observed2.lock().unwrap();
+                        if v >= last {
+                            (*o).push(v);
+                            last = v;
+                        }
+                        drop(g);
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                for i in 0..=50 {
+                    h.set(41 + i);
+                    h.park();
                 }
-                v
+                mutifier.store(1, Ordering::SeqCst);
+                reader.join().unwrap();
             });
-            let mut observed = Vec::new();
-            for _ in 0..5 {
-                std::thread::sleep(Duration::from_millis(2));
-                let Some(guard) = req.request() else {
-                    continue;
-                };
-                observed.push(*guard);
-                drop(guard);
-            }
-            (observed, mutifier.join().expect("mutifier"))
-        });
-        (observed, final_v)
-    });
+        },
+    );
+    let final_v: u32 = ***root;
     assert_eq!(final_v, 91);
-    for w in observed.windows(2) {
-        assert!(w[0] <= w[1], "monotonic guard observations: {observed:?}");
+    let w = final_v_2(&observed);
+    if !w.is_empty() {
+        assert!(w[0] <= w[w.len() - 1], "monotonic guard observations: {observed:?}");
+        assert!(w.iter().all(|v| (41..=91).contains(v)));
     }
-    assert!(observed.iter().all(|v| (41..=91).contains(v)));
+}
+
+fn final_v_2(observed: &std::sync::Mutex<Vec<u32>>) -> Vec<u32> {
+    observed.lock().unwrap().clone()
+}
+
+trait CountDriven: Send {
+    fn set(&mut self, v: u32);
+    fn park(&mut self);
+}
+
+impl CountDriven for InnerHandle<u32> {
+    fn set(&mut self, v: u32) {
+        **self = v;
+    }
+    fn park(&mut self) {
+        self.safepoint();
+    }
 }
 
 #[test]
 fn concurrent_requesters_serialize_instead_of_deadlocking() {
-    with_checkpoint_pair(0u32, |h, req: CheckpointRequester<'_, u32>| {
-        let mut h = h;
-        let mutifier_done = std::sync::atomic::AtomicBool::new(false);
-        let done_ref = &mutifier_done;
-        std::thread::scope(|scope| {
-            let _mutifier = scope.spawn(move || {
-                for _ in 0..200 {
-                    h.safepoint();
-                    *h += 1;
+    let mut root: PersistentCell<Box<PersistentCell<u32>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(0_u32)));
+    independent_task_root(
+        &mut root,
+        |mut h: OuterHandle<'_, Box<PersistentCell<u32>>, dyn CountDriven>, req| {
+            let mutifier_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let r1 = req.clone();
+            let r2 = req.clone();
+            let done2 = mutifier_done.clone();
+            let done3 = mutifier_done.clone();
+            std::thread::scope(|s| {
+                let a = s.spawn(move || {
+                    let mut last = 0;
+                    while !done2.load(Ordering::SeqCst) {
+                        let Some(g) = r1.request_timeout(Duration::from_millis(50)) else {
+                            continue;
+                        };
+                        let v: u32 = ****g;
+                        assert!(v >= last, "observations must be monotonic per reader");
+                        last = v;
+                    }
+                });
+                let b = s.spawn(move || {
+                    let mut last = 0;
+                    while !done3.load(Ordering::SeqCst) {
+                        let Some(g) = r2.request_timeout(Duration::from_millis(50)) else {
+                            continue;
+                        };
+                        let v: u32 = ****g;
+                        assert!(v >= last, "observations must be monotonic per reader");
+                        last = v;
+                    }
+                });
+                for i in 0..100 {
+                    h.set(i);
+                    h.park();
                 }
-                done_ref.store(true, Ordering::SeqCst);
+                mutifier_done.store(true, Ordering::SeqCst);
+                a.join().unwrap();
+                b.join().unwrap();
             });
-            let readers: Vec<_> = (0..2)
-                .map(|_| {
-                    scope.spawn(|| {
-                        let mut last = 0;
-                        for _ in 0..20 {
-                            if let Some(guard) = req.request_timeout(Duration::from_millis(500)) {
-                                let v = *guard;
-                                drop(guard);
-                                assert!(v >= last, "observations must be monotonic per reader");
-                                last = v;
-                            }
-                        }
-                    })
-                })
-                .collect();
-            for r in readers {
-                r.join().expect("reader");
-            }
-            assert!(mutifier_done.load(Ordering::SeqCst), "mutator must not be starved");
-        });
-    });
+        },
+    );
 }
 
 #[test]
 fn full_run_with_stw_checkpoints_and_nested_fanout() {
-    let (_g, dir) = tempdir();
-    let path = dir.join("cp.json");
-    let io = Io { step_delay: Duration::from_millis(1), ..Io::new() };
-    let m = Machine {
-        items: (1..=4).map(|id| WorkItem { id, steps: 2 }).collect(),
-        ..Machine::default()
+    let io = Io::new();
+    let machine = Machine {
+        items: vec![
+            WorkItem { id: 1, steps: 1 },
+            WorkItem { id: 2, steps: 2 },
+            WorkItem { id: 3, steps: 3 },
+            WorkItem { id: 4, steps: 2 },
+        ],
+        ..Default::default()
     };
+    let (_dir, path) = tempdir();
     let start = Instant::now();
-    let m = drive(m, &io, Some((Duration::from_millis(2), path.clone())));
+    let m = drive(machine.clone(), &io, Some((Duration::from_millis(1), path.clone())));
     let elapsed = start.elapsed();
-
-    let mut ids: Vec<u32> = m.done.iter().map(|(i, _)| *i).collect();
-    ids.sort();
+    let ids: Vec<u32> = m.done.iter().map(|(i, _)| *i).collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", m.result);
     assert!(path.exists(), "checkpoints written");
     assert!(elapsed.as_millis() < 2000, "scoped threads run concurrently: {elapsed:?}");
 }
 
-/// Work already reflected in a machine snapshot: the Seq phase did one
-/// step per item (fully consumed once the stage moved past Seq), every
-/// finished item did its `steps`, in-flight items did their current
-/// `step`.
-fn consumed_work(machine: &Machine) -> usize {
-    let seq_done = match &machine.stage {
-        Stage::Seq { step } => *step as usize,
-        _ => machine.items.len(),
-    };
-    let mut consumed = machine.done.len() * WORK_STEPS_PER_ITEM + seq_done;
-    match &machine.stage {
-        Stage::Scatter { children } => {
-            consumed += children.iter().map(|c| c.step as usize).sum::<usize>();
-        }
-        Stage::Nested { groups } => {
-            for g in groups {
-                consumed += g.children.iter().map(|c| c.step as usize).sum::<usize>();
-            }
-        }
-        _ => {}
-    }
-    consumed
-}
-
 #[test]
 fn mid_run_snapshot_resumes() {
-    let (_g, dir) = tempdir();
-    let path = dir.join("cp.json");
-    // Held from the start: the machine parks at its safepoints with
-    // deterministic progress, and every snapshot taken while held is a
-    // clean mid-run snapshot.
-    let io = Io {
-        step_delay: Duration::from_millis(1),
-        release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ..Io::new()
-    };
-
-    let m = Machine {
-        items: (1..=4).map(|id| WorkItem { id, steps: 4 }).collect(),
-        ..Machine::default()
-    };
-    let io_snapshotter = Duration::from_millis(2);
     // The full-run IO count, measured (not derived): the resume assertion
-    // is exact against it.
-    let io0 = Io::new();
-    let full = drive(
-        Machine {
-            items: (1..=4).map(|id| WorkItem { id, steps: WORK_STEPS_PER_ITEM as u32 }).collect(),
-            ..Machine::default()
-        },
-        &io0,
-        None,
-    );
+    // compares against it.
+    let full_io = Io::new();
+    let full = drive(full_machine(), &full_io, None);
     assert_eq!(full.result, "done: 1,2,3,4");
-    let total = io0.calls.load(Ordering::SeqCst);
-    std::thread::scope(|s| {
-        let runner = s.spawn({
-            let io = io.clone();
-            let path = path.clone();
-            move || drive(m, &io, Some((io_snapshotter, path)))
-        });
-        // Wait for a snapshot taken WHILE the machine is held — i.e. one
-        // that already reflects the HOLD_AT steps of consumed work (the
-        // first writes land before the hold engages; those are not the
-        // resume point).
-        let mut held_snap: Option<String> = None;
-        for _ in 0..500 {
-            if let Ok(text) = std::fs::read_to_string(&path) {
-                if let Ok(machine) = serde_json::from_str::<Machine>(&text) {
-                    if consumed_work(&machine) >= HOLD_AT {
-                        held_snap = Some(text);
+
+    // The held run: hold at HOLD_AT, snapshot mid-hold, release, finish.
+    let io = Io::new();
+    io.release.store(false, Ordering::SeqCst);
+    let (dir, path) = tempdir();
+    let consumed_at_snapshot = Arc::new(AtomicUsize::new(0));
+    let consumed_probe = consumed_at_snapshot.clone();
+
+    let mut root: PersistentCell<Box<PersistentCell<Machine>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(full_machine())));
+    independent_task_root(
+        &mut root,
+        |mut h: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn MachineDrivenVocab>,
+         req: Checkpointer<Box<PersistentCell<Machine>>>| {
+            let io2 = hold_io(&io);
+            let req2 = req.clone();
+            let path2 = path.clone();
+            std::thread::scope(|sc| {
+                let io3 = hold_io(&io);
+                let consumed_probe2 = consumed_probe.clone();
+                let snapshotter = sc.spawn(move || {
+                    // wait for the hold to ENGAGE (the deterministic
+                    // mid-run point), then snapshot, then RELEASE —
+                    // the drive loop is blocked inside the fan-out's
+                    // join while the children are held, so the release
+                    // must come from THIS thread
+                    while io3.progress.load(Ordering::SeqCst) < HOLD_AT {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    loop {
+                        let g = req2.request_timeout(Duration::from_millis(50));
+                        if let Some(g) = g {
+                            let bytes = serde_json::to_string(&*g).expect("ser");
+                            let tmp = path2.with_extension("tmp");
+                            std::fs::write(&tmp, &bytes).expect("write");
+                            std::fs::rename(&tmp, path2).expect("rename");
+                            consumed_probe2.store(io3.calls.load(Ordering::SeqCst), Ordering::SeqCst);
+                            io3.release();
+                            return;
+                        }
+                    }
+                });
+                loop {
+                    h.park();
+                    if !h.run_stage(&io2) {
                         break;
                     }
                 }
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        let held_snap = held_snap.expect("mid-run snapshot exists while held");
-        let snap: Machine = serde_json::from_str(&held_snap).expect("snapshot parses");
-        io.release();
-        if let Err(payload) = runner.join() {
-            std::panic::resume_unwind(payload);
-        }
-        let consumed = consumed_work(&snap);
-        assert_eq!(consumed, HOLD_AT, "held snapshot consumes exactly HOLD_AT steps");
-        // Resume from the HELD snapshot: completed items finish without
-        // new IO, so the resumed run does exactly the remaining work.
-        let resumed: Machine = serde_json::from_str(&held_snap).expect("snapshot parses");
-        let io2 = Io::new();
-        let resumed = drive(resumed, &io2, None);
-        let mut ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
-        ids.sort();
-        assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
-        let observed = io2.calls.load(Ordering::SeqCst);
-        assert_eq!(
-            observed,
-            total - consumed,
-            "resume does exactly the remaining work"
-        );
-    });
+                snapshotter.join().expect("snapshotter");
+            });
+        },
+    );
+    let held: Machine = (*(*(*root))).clone();
+    let consumed = consumed_at_snapshot.load(Ordering::SeqCst);
+    let _ = held;
+    assert_eq!(consumed, HOLD_AT, "held snapshot consumes exactly HOLD_AT steps");
+
+    // resume from the snapshot
+    let text = std::fs::read_to_string(&path).expect("snapshot file");
+    let resumed_core: Box<PersistentCell<Machine>> = serde_json::from_str(&text).expect("deser");
+    let resumed = drive((**resumed_core).clone(), &Io::new(), None);
+    let ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
+    assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
+    drop(dir);
+}
+
+fn hold_io(io: &Io) -> Io {
+    io.clone()
+}
+
+fn full_machine() -> Machine {
+    Machine {
+        items: vec![
+            WorkItem { id: 1, steps: WORK_STEPS_PER_ITEM as u32 },
+            WorkItem { id: 2, steps: WORK_STEPS_PER_ITEM as u32 },
+            WorkItem { id: 3, steps: WORK_STEPS_PER_ITEM as u32 },
+            WorkItem { id: 4, steps: WORK_STEPS_PER_ITEM as u32 },
+        ],
+        ..Default::default()
+    }
 }

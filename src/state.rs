@@ -1,5 +1,5 @@
-//! The state machine on the checkpoint protocol — 100% safe code over
-//! the public [`Handle`] API (issue #13).
+//! The state machine on the two-piece checkpoint protocol — 100% safe
+//! code over the public [`InnerHandle`] API (issues #13/#19).
 //!
 //! The machine node is [`Context`]: the state's context id and the
 //! state, side by side. The environment is an EXPLICIT parameter of
@@ -7,46 +7,43 @@
 //! lifetime (`Context<'e, K, E>`), so `E` may borrow — a machine can
 //! hold `E = MachineEnv<'e>` over stack providers for the whole run.
 //! Through the deref chain
-//! `&mut Handle<Context>` → `&mut Context` → `&mut dyn State` the
-//! driver calls the state's `execute` and installs successors with a
-//! plain field assignment (`h.state = next`) — no `unsafe`, no
-//! escape hatches, nothing added to [`crate::checkpoint`].
+//! `&mut InnerHandle<Context>` → `&mut Context` → `&mut dyn State`
+//! the driver calls the state's `execute` and installs successors
+//! with a plain field assignment (`(**h).state = next`) — no
+//! `unsafe`, no escape hatches, nothing added to
+//! [`crate::checkpoint`].
 //!
 //! A fan-out phase is the concrete [`ParallelState`], instantiated by
 //! the client: it allocates each child's [`ContextId`] at spawn and
 //! hands the id to the state's constructor; its children are
-//! [`Context`]s of the same tree, wrapped in handles by
-//! [`Handle::fanout`] and run by the same
-//! [`Handle::run_to_completion`] under a
-//! [`with_checkpoint_pair`](crate::checkpoint::with_checkpoint_pair).
-//! Results land in each child's own slot, read in spawn order after
-//! the join.
+//! [`Context`]s of the same tree, each in its own slot (a
+//! [`PersistentCell`] over the boxed node), wrapped in outers by
+//! [`InnerHandle::fanout`] and run by the same
+//! [`InnerHandle::run_to_completion`] under an
+//! [`independent_task_root`](crate::checkpoint::independent_task_root).
+//! Results return in spawn order through the fan-out join.
 
 use anyhow::Result;
 use std::sync::Mutex;
 
-use crate::checkpoint::Handle;
+use crate::checkpoint::{InnerHandle, OuterHandle, PersistentCell};
 use crate::context_id::ContextId;
 
 /// The machine node: the state's context id and the state. Derefs all
-/// the way to the state (`&mut Context` → `&mut dyn State`), so a
-/// handle over a Context drives the machine directly.
+/// the way to the state (`&mut Context` → `&mut dyn State`), so an
+/// inner handle over a Context drives the machine directly.
 pub struct Context<'e, K, E: ?Sized + 'e> {
     /// This state's context id.
     pub id: ContextId,
     /// The current state.
     pub state: Box<dyn State<K, E> + Send + Sync + 'e>,
-    /// The child's landing slot: a parallel worker writes its result
-    /// here, through its own handle; the machine driver never touches
-    /// it.
-    pub result: Option<K>,
 }
 
 impl<'e, K, E: ?Sized + 'e> Context<'e, K, E> {
     /// A node for `state` under `ctx`: allocates the state's context
     /// id (a child of `ctx`).
     pub fn new(ctx: &ContextId, state: Box<dyn State<K, E> + Send + Sync + 'e>) -> Self {
-        Context { id: ctx.new_child(), state, result: None }
+        Context { id: ctx.new_child(), state }
     }
 }
 
@@ -87,13 +84,55 @@ where
     fn execute<'r>(&mut self, env: &E) -> Result<Step<'r, K, E>>;
 }
 
+/// The tree's DRIVE vocabulary (the `V` of the two-piece protocol):
+/// what a fan-out callback can ask of a child through its outer.
+/// Implemented for the inner handle over the node — running IS
+/// driving the machine — and that impl is what lets a boxed node
+/// erase into a slot at all (the `Unsize` witness).
+pub trait Driven<K, E: ?Sized>: Send {
+    /// Drive this node's machine to completion.
+    fn run(&mut self, env: &E) -> Result<K>;
+}
+
+impl<'e, K, E> Driven<K, E> for InnerHandle<Context<'e, K, E>>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'e,
+{
+    fn run(&mut self, env: &E) -> Result<K> {
+        self.run_to_completion(env)
+    }
+}
+
+impl<'e, K, E> Driven<Vec<K>, E> for InnerHandle<ParallelState<'e, K, E>>
+where
+    K: Send + 'static,
+    E: ?Sized + Sync + 'e,
+{
+    fn run(&mut self, env: &E) -> Result<Vec<K>> {
+        self.run_children(env)
+    }
+}
+
+/// The slot a node lives in: a boxed cell, in a cell — the two-piece
+/// shape. Homogeneous trees (all children the same node type) need
+/// no erasure beyond this.
+pub type NodeSlot<'e, K, E> = Box<PersistentCell<Context<'e, K, E>>>;
+
+/// The tree's erased vocabulary: `dyn Driven`, the fan-out callback's
+/// view of a child.
+pub type Vocab<'e, K, E> = dyn Driven<K, E> + 'e;
+
+/// The slot a PHASE root lives in (the phase-as-root shape).
+pub type NodeSlotParallel<K, E> = Box<PersistentCell<ParallelState<'static, K, E>>>;
+
 /// A fan-out phase: allocates each child's [`ContextId`] itself and
 /// hands the id to the state's constructor; the children are
-/// [`Context`]s of this same tree. Run it with
-/// [`Handle::run_children`].
+/// [`Context`]s of this same tree, each in its own slot. Run it with
+/// [`InnerHandle::run_children`].
 pub struct ParallelState<'e, K, E: ?Sized + 'e> {
     id: ContextId,
-    children: Vec<Context<'e, K, E>>,
+    children: Vec<PersistentCell<NodeSlot<'e, K, E>>>,
 }
 
 impl<'e, K, E> ParallelState<'e, K, E>
@@ -114,56 +153,54 @@ where
         make: impl FnOnce(&ContextId) -> Box<dyn State<K, E> + Send + Sync + 'e>,
     ) {
         let child_id = self.id.new_child();
-        self.children.push(Context::new(&self.id, make(&child_id)));
+        self.children.push(PersistentCell::new(Box::new(PersistentCell::new(Context::new(
+            &child_id,
+            make(&child_id),
+        )))));
     }
 }
 
-impl<'o, 'e, K, E> Handle<'o, ParallelState<'e, K, E>>
+impl<'e, K, E> InnerHandle<ParallelState<'e, K, E>>
 where
     K: Send + 'static,
     E: ?Sized + Sync,
-    'e: 'o,
 {
     /// Run every child to completion, each on its own thread: the
-    /// children — [`Context`]s of this same tree — are wrapped in
-    /// handles by `fanout` and run by the same
-    /// [`Handle::run_to_completion`]. Each result lands in its
-    /// child's own slot; the joined slots are returned in spawn
-    /// order. The first child error aborts the phase.
+    /// children — [`Context`]s of this same tree, each in its own
+    /// slot — are wrapped in outers by `fanout` and run by the same
+    /// [`InnerHandle::run_to_completion`]. Results return in spawn
+    /// order through the join. The first child error aborts the
+    /// phase.
     ///
     /// # Panics
     ///
     /// Panics if a panicked child propagates from the fan-out scope —
-    /// see [`Handle::fanout`].
+    /// see [`InnerHandle::fanout`].
     pub fn run_children(&mut self, env: &E) -> Result<Vec<K>> {
         self.safepoint();
         let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
-        self.fanout(
-            &|phase: &mut ParallelState<'e, K, E>| phase.children.iter_mut().collect(),
-            |mut child: Handle<'_, Context<'e, K, E>>| match child.run_to_completion(env) {
-                Ok(result) => child.result = Some(result),
+        let results: Vec<Result<K, ()>> = self.fanout(
+            &|phase: &ParallelState<'e, K, E>| phase.children.iter().collect(),
+            |mut child: OuterHandle<'_, NodeSlot<'e, K, E>, Vocab<'e, K, E>>| match child.run(env)
+            {
+                Ok(result) => Ok(result),
                 Err(e) => {
-                    let mut slot =
-                        first_error.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut slot = first_error.lock().unwrap_or_else(|e| e.into_inner());
                     if slot.is_none() {
                         *slot = Some(e);
                     }
+                    Err(())
                 }
             },
         );
         if let Some(e) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
             return Err(e);
         }
-        Ok(self
-            .children
-            .iter_mut()
-            .map(|c| c.result.take())
-            .collect::<Option<Vec<_>>>()
-            .unwrap_or_else(|| unreachable!("every child ran to completion and landed")))
+        Ok(results.into_iter().map(|r| r.expect("every child ran to completion")).collect())
     }
 }
 
-impl<'o, 'e, K, E> Handle<'o, Context<'e, K, E>>
+impl<'e, K, E> InnerHandle<Context<'e, K, E>>
 where
     K: Send + 'static,
     E: ?Sized + Sync,
@@ -176,26 +213,24 @@ where
     /// # Panics
     ///
     /// Panics if a panicked child propagates from a fan-out scope —
-    /// see [`Handle::fanout`].
+    /// see [`InnerHandle::fanout`].
     pub fn run_to_completion(&mut self, env: &E) -> Result<K> {
         loop {
             self.safepoint();
-            // &mut Handle → &mut Context → &mut dyn State: the
+            // &mut InnerHandle → &mut Context → &mut dyn State: the
             // state's own execute, through nothing but DerefMut.
             match (**self).execute(env)? {
-                Step::Continue(next) => self.state = next,
+                Step::Continue(next) => (**self).state = next,
                 Step::Done(result) => return Ok(result),
             }
         }
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint::with_checkpoint_pair;
+    use crate::checkpoint::independent_task_root;
 
     /// Countdown start in the linear-machine test.
     const LINEAR_START: u32 = 3;
@@ -226,9 +261,12 @@ mod tests {
 
     #[test]
     fn linear_machine_completes() {
-        let machine = Context::new(ContextId::root(), Box::new(Countdown { left: LINEAR_START }));
-        let result = with_checkpoint_pair(machine, |mut handle, _requester| {
-            handle.run_to_completion(&Env)
+        let mut root = PersistentCell::new(Box::new(PersistentCell::new(Context::new(
+            ContextId::root(),
+            Box::new(Countdown { left: LINEAR_START }),
+        ))));
+        let result = independent_task_root(&mut root, |mut outer: OuterHandle<'_, NodeSlot<u32, Env>, Vocab<u32, Env>>, _ck| {
+            outer.run(&Env)
         })
         .expect("machine completes");
         assert_eq!(result, LINEAR_RESULT);
@@ -257,12 +295,12 @@ mod tests {
         }
     }
 
-    /// The phase under its own pair: spawn allocates each child's
+    /// The phase under its own root: spawn allocates each child's
     /// context id and hands it to the constructor; children run on
-    /// their own threads through the SAME tree; results land in the
-    /// children's slots, in spawn order.
+    /// their own threads through the SAME tree; results return in
+    /// spawn order.
     #[test]
-    fn parallel_children_run_and_land_in_spawn_order() {
+    fn parallel_children_run_and_return_in_spawn_order() {
         let hashes: Mutex<Vec<u64>> = Mutex::new(Vec::new());
         let mut phase = ParallelState::<u64, Env>::new(ContextId::root());
         for steps in WORK_STEPS {
@@ -278,10 +316,18 @@ mod tests {
         let expected: Vec<u64> = hashes.into_inner().expect("hash vec");
         assert_eq!(expected.len(), WORK_ITEMS);
 
-        let results = with_checkpoint_pair(phase, |mut handle, _requester| {
-            handle.run_children(&Env).expect("children complete")
-        });
-        assert_eq!(results, expected, "slots landed in spawn order");
+        let mut root: PersistentCell<Box<PersistentCell<ParallelState<u64, Env>>>> =
+            PersistentCell::new(Box::new(PersistentCell::new(phase)));
+        let results = independent_task_root(
+            &mut root,
+            |mut outer: OuterHandle<
+                '_,
+                NodeSlotParallel<u64, Env>,
+                dyn Driven<Vec<u64>, Env>,
+            >,
+            _ck| { outer.run(&Env).expect("children complete") },
+        );
+        assert_eq!(results, expected, "results returned in spawn order");
     }
 
     #[test]
@@ -333,9 +379,12 @@ mod tests {
     fn machine_env_may_borrow_for_the_run() {
         let providers = Providers { label: String::from(BORROWED_LABEL) };
         let env = MachineEnv { providers: &providers };
-        let machine = Context::new(ContextId::root(), Box::new(Borrowing { left: LINEAR_START }));
-        let result = with_checkpoint_pair(machine, |mut handle, _requester| {
-            handle.run_to_completion(&env)
+        let mut root = PersistentCell::new(Box::new(PersistentCell::new(Context::new(
+            ContextId::root(),
+            Box::new(Borrowing { left: LINEAR_START }),
+        ))));
+        let result = independent_task_root(&mut root, |mut outer: OuterHandle<'_, NodeSlot<String, MachineEnv>, Vocab<String, MachineEnv>>, _ck| {
+            outer.run(&env)
         })
         .expect("borrowing machine completes");
         assert_eq!(result, providers.label);
