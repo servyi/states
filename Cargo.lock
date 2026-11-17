@@ -255,6 +255,7 @@ dependencies = [
  "dashmap",
  "serde",
  "serde_json",
+ "servyi-states",
  "servyi-states-snapshot",
  "tempfile",
  "tracing",

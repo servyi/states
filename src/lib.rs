@@ -1,4 +1,4 @@
-#![feature(register_tool)]
+#![feature(register_tool, unsize)]
 #![register_tool(servyi)]
 
 pub mod checkpoint;
