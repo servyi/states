@@ -9,6 +9,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  negative-control:
+    # The fault-injection convention, enforced (reusable gate from
+    # servyi/lints): every test touched by a PR must FAIL on at least
+    # one declared fault branch (or be its own negative control).
+    # Declare branches in the PR body:
+    #   Negative Control:
+    #   ```
+    #   /my-fault-branch
+    #   ```
+    uses: servyi/lints/.github/workflows/negative-control.yml@main
+    with:
+      toolchain: nightly-2026-09-21
+
   hygiene:
     # Repo hygiene is part of the policy: build artifacts and binaries
     # must never be tracked. Failed once (2179 fixture target files);
