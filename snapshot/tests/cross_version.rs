@@ -39,7 +39,7 @@ impl<T: Send + 'static> PairInner<T> for InnerHandle<T> {
 /// drives the inner handle (the old `Handle<'_, T>`).
 fn with_pair<T, R>(
     node: T,
-    f: impl FnOnce(&mut InnerHandle<T>, &Checkpointer<Box<PersistentCell<T>>>) -> R,
+    f: impl FnOnce(&mut InnerHandle<T>, &Checkpointer<'_, Box<PersistentCell<T>>>) -> R,
 ) -> R
 where
     T: Send + 'static,

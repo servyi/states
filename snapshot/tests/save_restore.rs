@@ -14,8 +14,6 @@ use servyi_states::checkpoint::{
 };
 use servyi_states_snapshot as snapshot;
 
-/// Steps after which the machine holds until released.
-const HOLD_AT: usize = 6;
 /// Steps per work item in the mid-run tests.
 const WORK_STEPS_PER_ITEM: u32 = 6;
 
@@ -133,7 +131,7 @@ impl VocabIo for InnerHandle<AnalyzeState> {
                 self.safepoint();
                 (**self).step += 1;
             }
-            (**self).done = Some(format!("v{}", (**self).item.id));
+            self.done = Some(format!("v{}", (**self).item.id));
             let _prev = early_done.fetch_add(1, Ordering::SeqCst);
         }
         while !snap_taken.load(Ordering::SeqCst) {
@@ -152,7 +150,7 @@ impl VocabIo for InnerHandle<AnalyzeState> {
                 (st.item.id, st.item.steps, st.step)
             };
             if done_steps >= steps {
-                (**self).done = Some(format!("v{id}"));
+                self.done = Some(format!("v{id}"));
                 return;
             }
             io.step(id);
@@ -180,13 +178,13 @@ impl VocabIo for InnerHandle<Machine> {
     }
     fn run(&mut self, io: &Io) {
         self.safepoint();
-        let seq_done = match &(**self).stage {
-            Stage::Seq { step } => (*step as usize) >= (**self).items.len(),
+        let seq_done = match &self.stage {
+            Stage::Seq { step } => (*step as usize) >= self.items.len(),
             _ => false,
         };
         if seq_done {
-            let items = (**self).items.clone();
-            (**self).stage = Stage::Scatter {
+            let items = self.items.clone();
+            self.stage = Stage::Scatter {
                 children: items
                     .iter()
                     .map(|i| {
@@ -200,21 +198,21 @@ impl VocabIo for InnerHandle<Machine> {
             };
             return;
         }
-        let seq_next: Option<(usize, u32)> = match &(**self).stage {
-            Stage::Seq { step } if (*step as usize) < (**self).items.len() => {
-                Some((*step as usize, (**self).items[*step as usize].id))
+        let seq_next: Option<(usize, u32)> = match &self.stage {
+            Stage::Seq { step } if (*step as usize) < self.items.len() => {
+                Some((*step as usize, self.items[*step as usize].id))
             }
             _ => None,
         };
         if let Some((idx, id)) = seq_next {
             io.step(id);
-            if let Stage::Seq { step } = &mut (**self).stage {
+            if let Stage::Seq { step } = &mut self.stage {
                 *step = (idx + 1) as u32;
             }
             return;
         }
-        match &mut (**self).stage {
-            Stage::Seq { .. } => return,
+        match &mut self.stage {
+            Stage::Seq { .. } => {}
             Stage::Scatter { .. } => {
                 let io_ref: &Io = io;
                 self.fanout(
@@ -224,14 +222,14 @@ impl VocabIo for InnerHandle<Machine> {
                     },
                     |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
                 );
-                let collected: Vec<(u32, String)> = match &(**self).stage {
+                let collected: Vec<(u32, String)> = match &self.stage {
                     Stage::Scatter { children } => {
                         children.iter().map(|c| c.result()).collect()
                     }
                     _ => unreachable!("just ran Scatter"),
                 };
-                (**self).done.extend(collected);
-                let items: Vec<WorkItem> = (**self).items.clone();
+                self.done.extend(collected);
+                let items: Vec<WorkItem> = self.items.clone();
                 let g100 = Group {
                     gid: 100,
                     children: items
@@ -260,7 +258,7 @@ impl VocabIo for InnerHandle<Machine> {
                         })
                         .collect(),
                 };
-                (**self).stage = Stage::Nested {
+                self.stage = Stage::Nested {
                     groups: vec![
                         PersistentCell::new(Box::new(PersistentCell::new(g100))),
                         PersistentCell::new(Box::new(PersistentCell::new(g200))),
@@ -276,18 +274,18 @@ impl VocabIo for InnerHandle<Machine> {
                     },
                     |mut g: OuterHandle<'_, GroupSlot, dyn VocabIo>| g.run(io_ref),
                 );
-                let collected: Vec<(u32, String)> = match &(**self).stage {
+                let collected: Vec<(u32, String)> = match &self.stage {
                     Stage::Nested { groups } => groups.iter().map(|c| c.result()).collect(),
                     _ => unreachable!("just ran Nested"),
                 };
                 // result from the done-list AS IT WAS at Nested entry
                 // (the old semantics: the stage ids, not the gids)
-                let done_snapshot: Vec<(u32, String)> = (**self).done.clone();
+                let done_snapshot: Vec<(u32, String)> = self.done.clone();
                 let ids: Vec<String> =
                     done_snapshot.iter().map(|(i, _)| i.to_string()).collect();
-                (**self).result = format!("done: {}", ids.join(","));
-                (**self).done.extend(collected);
-                (**self).stage = Stage::Done;
+                self.result = format!("done: {}", ids.join(","));
+                self.done.extend(collected);
+                self.stage = Stage::Done;
             }
             Stage::Done => {}
         }
@@ -304,7 +302,7 @@ fn drive(machine: Machine, io: &Io) -> Machine {
         |mut outer: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn VocabIo>, _ck| loop {
             outer.run(io);
             let done = matches!(
-                outer.machine().map(|inner| &(**inner).stage),
+                outer.machine().map(|inner| &inner.stage),
                 Some(Stage::Done)
             );
             if done {
@@ -367,12 +365,12 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
     independent_task_root(
         &mut root,
         |mut h: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn VocabIo>,
-         req: Checkpointer<Box<PersistentCell<Machine>>>| {
+         req: Checkpointer<'_, Box<PersistentCell<Machine>>>| {
             // Seq to Scatter: run transitions until the stage flips
             loop {
                 h.run(&slow_io);
                 let at_scatter = matches!(
-                    h.machine().map(|inner| &(**inner).stage),
+                    h.machine().map(|inner| &inner.stage),
                     Some(Stage::Scatter { .. })
                 );
                 if at_scatter {
