@@ -124,7 +124,7 @@ pub type NodeSlot<'e, K, E> = Box<PersistentCell<Context<'e, K, E>>>;
 pub type Vocab<'e, K, E> = dyn Driven<K, E> + 'e;
 
 /// The slot a PHASE root lives in (the phase-as-root shape).
-pub type NodeSlotParallel<K, E> = Box<PersistentCell<ParallelState<'static, K, E>>>;
+pub type NodeSlotParallel<'e, K, E> = Box<PersistentCell<ParallelState<'e, K, E>>>;
 
 /// A fan-out phase: allocates each child's [`ContextId`] itself and
 /// hands the id to the state's constructor; the children are
@@ -265,7 +265,7 @@ mod tests {
             ContextId::root(),
             Box::new(Countdown { left: LINEAR_START }),
         ))));
-        let result = independent_task_root(&mut root, |mut outer: OuterHandle<'_, NodeSlot<u32, Env>, Vocab<u32, Env>>, _ck| {
+        let result = independent_task_root(&mut root, |mut outer: OuterHandle<'_, NodeSlot<'_, u32, Env>, Vocab<'_, u32, Env>>, _ck| {
             outer.run(&Env)
         })
         .expect("machine completes");
@@ -316,14 +316,14 @@ mod tests {
         let expected: Vec<u64> = hashes.into_inner().expect("hash vec");
         assert_eq!(expected.len(), WORK_ITEMS);
 
-        let mut root: PersistentCell<Box<PersistentCell<ParallelState<u64, Env>>>> =
+        let mut root: PersistentCell<Box<PersistentCell<ParallelState<'_, u64, Env>>>> =
             PersistentCell::new(Box::new(PersistentCell::new(phase)));
         let results = independent_task_root(
             &mut root,
             |mut outer: OuterHandle<
                 '_,
-                NodeSlotParallel<u64, Env>,
-                dyn Driven<Vec<u64>, Env>,
+                NodeSlotParallel<'_, u64, Env>,
+                dyn Driven<Vec<u64>, Env> + '_,
             >,
             _ck| { outer.run(&Env).expect("children complete") },
         );
@@ -383,9 +383,17 @@ mod tests {
             ContextId::root(),
             Box::new(Borrowing { left: LINEAR_START }),
         ))));
-        let result = independent_task_root(&mut root, |mut outer: OuterHandle<'_, NodeSlot<String, MachineEnv>, Vocab<String, MachineEnv>>, _ck| {
-            outer.run(&env)
-        })
+        fn borrow_run<'e>(
+            mut outer: crate::checkpoint::OuterHandle<
+                '_,
+                NodeSlot<'e, String, MachineEnv<'e>>,
+                Vocab<'e, String, MachineEnv<'e>>,
+            >,
+            env: &MachineEnv<'e>,
+        ) -> Result<String> {
+            outer.run(env)
+        }
+        let result = independent_task_root(&mut root, |outer, _ck| borrow_run(outer, &env))
         .expect("borrowing machine completes");
         assert_eq!(result, providers.label);
     }

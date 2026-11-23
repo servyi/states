@@ -35,7 +35,7 @@ pub fn save_handle<T: serde::Serialize>(
 /// parks, like [`Checkpointer::request`]) and serialize the node the
 /// slot holds.
 pub fn save_requester<K>(
-    requester: &Checkpointer<K>,
+    requester: &Checkpointer<'_, K>,
     path: impl AsRef<Path>,
 ) -> std::io::Result<()>
 where
@@ -49,7 +49,7 @@ where
 /// [`save_requester`] with a deadline: `Ok(false)` means the world did
 /// not stop in time and nothing was written.
 pub fn try_save_requester<K>(
-    requester: &Checkpointer<K>,
+    requester: &Checkpointer<'_, K>,
     path: impl AsRef<Path>,
     timeout: Duration,
 ) -> std::io::Result<bool>

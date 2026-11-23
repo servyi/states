@@ -19,9 +19,40 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::{with_checkpoint_pair, Handle};
+use servyi_states::checkpoint::{Checkpointer, InnerHandle, OuterHandle, PersistentCell, independent_task_root};
 use servyi_states_snapshot as snapshot;
 
+/// The pair shim's vocab: hand the test closure the INNER handle —
+/// exactly the old `Handle<'_, T>`.
+trait PairInner<T>: Send {
+    fn inner(&mut self) -> &mut InnerHandle<T>;
+}
+
+impl<T: Send + 'static> PairInner<T> for InnerHandle<T> {
+    fn inner(&mut self) -> &mut InnerHandle<T> {
+        self
+    }
+}
+
+/// Test-side compatibility: the old `with_checkpoint_pair` shape over
+/// the two-piece root. The node moves into the slot; the closure
+/// drives the inner handle (the old `Handle<'_, T>`).
+fn with_pair<T, R>(
+    node: T,
+    f: impl FnOnce(&mut InnerHandle<T>, &Checkpointer<Box<PersistentCell<T>>>) -> R,
+) -> R
+where
+    T: Send + 'static,
+{
+    let mut slot: PersistentCell<Box<PersistentCell<T>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(node)));
+    independent_task_root(
+        &mut slot,
+        |mut outer: OuterHandle<'_, Box<PersistentCell<T>>, dyn PairInner<T>>, ck| {
+            f(outer.inner(), &ck)
+        },
+    )
+}
 // ---------------------------------------------------------------------------
 // The stable shape: what v1 wrote, what v2 reads. NEVER changes once
 // published — this is the contract. Restoring goes through a dyn impl of
@@ -163,7 +194,7 @@ impl CountingIo {
 
 /// v2's driver: run every item to completion, skipping done items (the
 /// resume property), then aggregate.
-fn drive_v2(mut h: Handle<'_, v2::MachineV2>, io: &CountingIo) -> String {
+fn drive_v2(h: &mut InnerHandle<v2::MachineV2>, io: &CountingIo) -> String {
     loop {
         h.safepoint();
         h.safepoint();
@@ -205,7 +236,7 @@ fn cross_version_restore_produces_prefix_state_then_fixer_completes_it() {
     };
     // v1's saver runs on ITS machine through the same protocol crate:
     // serialize the shape itself — save_handle takes any Serialize.
-    with_checkpoint_pair(machine_v1, |mut h, _req| {
+    with_pair(machine_v1, |h, _req| {
         h.safepoint();
         snapshot::write_value(&h.to_shape(), &path).expect("v1 saves the shape");
     });
@@ -235,7 +266,7 @@ fn cross_version_restore_produces_prefix_state_then_fixer_completes_it() {
 
     // ── v2 RUNS to completion on the checkpoint protocol. ──
     let io = CountingIo::default();
-    let out = with_checkpoint_pair(machine_v2, |h, _req| drive_v2(h, &io));
+    let out = with_pair(machine_v2, |h, _req| drive_v2(h, &io));
     assert_eq!(out, "v1,v2,v3");
 
     // THE RESUME PROPERTY across versions: the two v1-finished items cost
@@ -260,7 +291,7 @@ fn unfixed_prefix_state_refuses_to_run_and_reports() {
     assert!(machine_v2.items[0].needs_fix);
 
     let io = CountingIo::default();
-    let stalled = with_checkpoint_pair(machine_v2.clone(), |mut h, _req| {
+    let stalled = with_pair(machine_v2.clone(), |h, _req| {
         // Bounded probe: a real deployment would park in the error gate
         // here; we just observe that no work happens.
         std::thread::sleep(Duration::from_millis(5));
@@ -270,7 +301,7 @@ fn unfixed_prefix_state_refuses_to_run_and_reports() {
     });
     assert!(stalled, "pre-fix item is visible in the node state");
 
-    let out = with_checkpoint_pair(machine_v2, |h, _req| drive_v2(h, &io));
+    let out = with_pair(machine_v2, |h, _req| drive_v2(h, &io));
     assert_eq!(out, "v1");
     assert_eq!(io.calls.load(Ordering::SeqCst), 0);
 }

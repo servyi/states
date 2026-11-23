@@ -142,7 +142,7 @@ trait GroupDriven: Send {
 
 impl GroupDriven for InnerHandle<Group> {
     fn run(&mut self, io: &Io) {
-        self.fanout(
+        let _joined: Vec<()> = self.fanout(
             &|g: &Group| g.children.iter().collect(),
             |mut a: OuterHandle<'_, AnalyzeSlot, dyn GroupNode>| a.run_node(io),
         );
@@ -240,7 +240,7 @@ impl MachineDriven for InnerHandle<Machine> {
         };
         match which {
             0 => {
-                self.fanout(
+                let _joined: Vec<()> = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Scatter { children } => children.iter().collect(),
                         _ => unreachable!("checked above"),
@@ -249,7 +249,7 @@ impl MachineDriven for InnerHandle<Machine> {
                 );
             }
             1 => {
-                self.fanout(
+                let _joined: Vec<()> = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Nested { groups } => groups.iter().collect(),
                         _ => unreachable!("checked above"),
@@ -352,7 +352,7 @@ fn drive(
     independent_task_root(
         &mut root,
         |mut outer: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn MachineDrivenVocab>,
-         req: Checkpointer<Box<PersistentCell<Machine>>>| {
+         req: Checkpointer<'_, Box<PersistentCell<Machine>>>| {
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let stop2 = stop.clone();
 
@@ -630,7 +630,7 @@ fn mid_run_snapshot_resumes() {
     independent_task_root(
         &mut root,
         |mut h: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn MachineDrivenVocab>,
-         req: Checkpointer<Box<PersistentCell<Machine>>>| {
+         req: Checkpointer<'_, Box<PersistentCell<Machine>>>| {
             let io2 = hold_io(&io);
             let req2 = req.clone();
             let path2 = path.clone();

@@ -3,7 +3,42 @@
 //! a dyn impl of exactly the shape it reads.
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::with_checkpoint_pair;
+use servyi_states::checkpoint::{InnerHandle, OuterHandle, PersistentCell, independent_task_root};
+
+/// The pair shim's vocab: the inner handle reach (the old
+/// `Handle<'_, T>`).
+trait PairInner<T>: Send {
+    fn inner(&mut self) -> &mut InnerHandle<T>;
+}
+
+impl<T: Send + 'static> PairInner<T> for InnerHandle<T> {
+    fn inner(&mut self) -> &mut InnerHandle<T> {
+        self
+    }
+}
+
+/// The old `with_checkpoint_pair` shape over the two-piece root, macro
+/// form (the shim fn trips a compiler ICE on this toolchain).
+macro_rules! with_pair {
+    ($node:expr, | $h:ident, $req:ident | $body:expr) => {
+        with_pair!(@i $node, | mut $h, $req | $body)
+    };
+    ($node:expr, | mut $h:ident, $req:ident | $body:expr) => {
+        with_pair!(@i $node, | mut $h, $req | $body)
+    };
+    (@i $node:expr, | mut $h:ident, $req:ident | $body:expr) => {{
+        let mut slot = PersistentCell::new(Box::new(PersistentCell::new($node)));
+        independent_task_root(
+            &mut slot,
+            |mut outer: OuterHandle<'_, Box<PersistentCell<_>>, dyn PairInner<_>>, ck| {
+                let mut $h = outer.inner();
+                let $req = &ck;
+                $body
+            },
+        )
+    }};
+}
+
 
 /// v2's snapshot vocabulary — frozen at v2 (adds `polished`).
 #[derive(Serialize, Deserialize)]
@@ -134,7 +169,7 @@ fn save(path: &str) {
             Item { id: 2, steps: 3, step: 0, done: None, polished: false, needs_fix: false },
         ],
     };
-    with_checkpoint_pair(machine, |mut h, _req| {
+    with_pair!(machine, |mut h, _req| {
         h.safepoint();
         let shape = ShapeV2 {
             steps_total: h.items.iter().map(|i| i.steps).collect(),
@@ -167,7 +202,7 @@ fn run(machine: Machine) -> (String, usize) {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = std::sync::Arc::clone(&calls);
     let mut skip_logged = std::collections::HashSet::new();
-    let out = with_checkpoint_pair(machine, move |mut h, _req| loop {
+    let out = with_pair!(machine, |mut h, _req| loop {
         h.safepoint();
         let m = &mut *h;
         for item in &mut m.items {
