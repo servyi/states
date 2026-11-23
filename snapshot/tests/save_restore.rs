@@ -123,15 +123,15 @@ impl VocabIo for InnerHandle<AnalyzeState> {
         snap_taken: &std::sync::atomic::AtomicBool,
         early_done: &AtomicUsize,
     ) {
-        let early = (**self).item.id <= 2;
+        let early = self.item.id <= 2;
         if early {
-            for _ in 0..(**self).item.steps {
+            for _ in 0..self.item.steps {
                 self.safepoint();
-                io.step((**self).item.id);
+                io.step(self.item.id);
                 self.safepoint();
-                (**self).step += 1;
+                self.step += 1;
             }
-            self.done = Some(format!("v{}", (**self).item.id));
+            self.done = Some(format!("v{}", self.item.id));
             let _prev = early_done.fetch_add(1, Ordering::SeqCst);
         }
         while !snap_taken.load(Ordering::SeqCst) {
@@ -154,7 +154,7 @@ impl VocabIo for InnerHandle<AnalyzeState> {
                 return;
             }
             io.step(id);
-            (**self).step += 1;
+            self.step += 1;
         }
     }
 }
@@ -165,7 +165,7 @@ impl VocabIo for InnerHandle<Group> {
     }
     fn run(&mut self, io: &Io) {
         let io_ref: &Io = io;
-        self.fanout(
+        let _ = self.fanout(
             &|g: &Group| g.children.iter().collect(),
             |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
         );
@@ -215,7 +215,7 @@ impl VocabIo for InnerHandle<Machine> {
             Stage::Seq { .. } => {}
             Stage::Scatter { .. } => {
                 let io_ref: &Io = io;
-                self.fanout(
+                let _ = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Scatter { children } => children.iter().collect(),
                         _ => unreachable!("checked above"),
@@ -267,7 +267,7 @@ impl VocabIo for InnerHandle<Machine> {
             }
             Stage::Nested { .. } => {
                 let io_ref: &Io = io;
-                self.fanout(
+                let _ = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Nested { groups } => groups.iter().collect(),
                         _ => unreachable!("checked above"),
@@ -394,7 +394,7 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
                 // Scatter now; run its fan-out by hand with the barrier
                 let io_ref: &Io = &slow_io;
                 let Some(inner) = h.machine() else { unreachable!("the root IS the machine") };
-                inner.fanout(
+                let _ = inner.fanout(
                     &|mm: &Machine| match &mm.stage {
                         Stage::Scatter { children } => children.iter().collect(),
                         _ => unreachable!("checked above"),
