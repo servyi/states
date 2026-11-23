@@ -565,14 +565,14 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// `slot` inaccessible (borrowed) for the whole call. The `'o` brand
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
-pub fn independent_task_root<K, V: ?Sized, R>(
+pub fn independent_task_root<'v, K, V: ?Sized + 'v, R>(
     slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
     K: DerefMut + Sized + Send,
     K::Target: AsPtr,
-    <K::Target as Deref>::Target: HandleAble<V> + Sized,
+    <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -584,7 +584,7 @@ where
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
+    let outer = unsafe { OuterHandle::over_slot::<'v>(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
     // close; the gate serializes the requester side (see Checkpointer)
@@ -628,7 +628,6 @@ impl<'o, K, V: ?Sized> OuterHandle<'o, K, V>
 where
     K: DerefMut + Send,
     K::Target: AsPtr,
-    <K::Target as Deref>::Target: HandleAble<V> + Sized,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -655,9 +654,11 @@ where
     /// of the pointee of the `K` as stored by the box (the loaded
     /// provenance), and the typed `slot` stored here is exactly the
     /// `K` cell the raw was taken from.
-    unsafe fn over_slot(slot: *mut PersistentCell<K>) -> Self
+    unsafe fn over_slot<'v>(slot: *mut PersistentCell<K>) -> Self
     where
         K: Sized,
+        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
+        V: 'v,
     {
         // the state raw: deref_mut EXPLICITLY at the raw-mut side —
         // the returned reference is cast to the raw on the spot; the
@@ -671,9 +672,9 @@ where
         let k: &mut K = unsafe { slot_cell.as_mut_k() };
         let target: &mut K::Target = DerefMut::deref_mut(k);
         // SAFETY: the AsPtr contract (the cell/box store line).
-        let state_raw = AsPtr::as_ptr(target);
+        let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
         // SAFETY: the state raw is the store line the mint owns.
-        let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
+        let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         let state_erased: *mut () = state_raw as *mut ();
@@ -694,7 +695,11 @@ where
     /// is still driven by another live chain after 100 ms — the
     /// deterministic cycle-breaker abort), and if the mint's safety
     /// contract is violated.
-    pub fn replace(&mut self, val: K) {
+    pub fn replace<'v>(&mut self, val: K)
+    where
+        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
+        V: 'v,
+    {
         // 1) the swap — plain assignment through the typed slot
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
@@ -721,7 +726,7 @@ where
             let k: &mut K = unsafe { slot_cell.as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
             // SAFETY: the AsPtr contract (the store line).
-            let state_raw = AsPtr::as_ptr(target);
+            let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
             // THE CONTENT CLAIM, on the SAME map: a replacement whose
             // content is aliased with another live chain waits — but
             // bounded: content waits can form claim cycles and
@@ -760,7 +765,7 @@ where
             };
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
-            let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
+            let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
             let state_erased: *mut () = state_raw as *mut ();
             let shared_ref = SharedRef(self.shared.clone());
             // SAFETY: the mint's discipline over the fresh content.
@@ -1031,7 +1036,7 @@ impl<T: Sized> InnerHandle<T> {
     /// Propagates a panicked child from the fan-out scope, panics on a
     /// content-claim timeout (the same-content cycle breaker, 100 ms),
     /// and if the mint's safety contract is violated.
-    pub fn fanout<V: ?Sized + Send, K, F, R>(
+    pub fn fanout<'v, V: ?Sized + Send + 'v, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
@@ -1040,7 +1045,7 @@ impl<T: Sized> InnerHandle<T> {
         T: Send,
         K: DerefMut + Sized + Send,
         K::Target: AsPtr,
-        <K::Target as Deref>::Target: HandleAble<V> + Sized,
+        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -1131,7 +1136,7 @@ impl<T: Sized> InnerHandle<T> {
                     // driver of the slot (the mint's discipline).
                     let k: &mut K = unsafe { child.as_mut_k() };
                             let target: &mut K::Target = DerefMut::deref_mut(k);
-                            let raw = AsPtr::as_ptr(target);
+                            let raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
                             match claims.entry(raw as *const () as usize) {
                                 dashmap::Entry::Vacant(v) => {
                                     let _occupied = v.insert(());
@@ -1159,7 +1164,7 @@ impl<T: Sized> InnerHandle<T> {
                     // SAFETY: the claims make this thread the sole
                     // driver of both the slot and its content; the
                     // mint's discipline holds.
-                    let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
+                    let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
                     let state_erased: *mut () = state_raw as *mut ();
                     let shared_ref = SharedRef(child_shared.clone());
                     // SAFETY: as above; the child's Shared carries the
