@@ -19,40 +19,14 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::{Checkpointer, InnerHandle, OuterHandle, PersistentCell, independent_task_root};
+use servyi_states::checkpoint::InnerHandle;
 use servyi_states_snapshot as snapshot;
 
-/// The pair shim's vocab: hand the test closure the INNER handle —
-/// exactly the old `Handle<'_, T>`.
-trait PairInner<T>: Send {
-    fn inner(&mut self) -> &mut InnerHandle<T>;
-}
-
-impl<T: Send + 'static> PairInner<T> for InnerHandle<T> {
-    fn inner(&mut self) -> &mut InnerHandle<T> {
-        self
-    }
-}
-
-/// Test-side compatibility: the old `with_checkpoint_pair` shape over
-/// the two-piece root. The node moves into the slot; the closure
-/// drives the inner handle (the old `Handle<'_, T>`).
-fn with_pair<T, R>(
-    node: T,
-    f: impl FnOnce(&mut InnerHandle<T>, &Checkpointer<'_, Box<PersistentCell<T>>>) -> R,
-) -> R
-where
-    T: Send + 'static,
-{
-    let mut slot: PersistentCell<Box<PersistentCell<T>>> =
-        PersistentCell::new(Box::new(PersistentCell::new(node)));
-    independent_task_root(
-        &mut slot,
-        |mut outer: OuterHandle<'_, Box<PersistentCell<T>>, dyn PairInner<T>>, ck| {
-            f(outer.inner(), &ck)
-        },
-    )
-}
+// The old `with_checkpoint_pair` shape over the two-piece root — one
+// definition, shared with the fixtures (see the file).
+#[path = "../../cross-version-fixtures/legacy_pair.rs"]
+mod legacy_pair;
+use legacy_pair::with_pair;
 // ---------------------------------------------------------------------------
 // The stable shape: what v1 wrote, what v2 reads. NEVER changes once
 // published — this is the contract. Restoring goes through a dyn impl of
