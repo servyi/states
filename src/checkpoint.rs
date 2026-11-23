@@ -121,6 +121,21 @@ const REQUEST_WAIT_MS: u64 = 10;
 /// content waits can form cross-claim cycles and intrathread
 /// self-deadlocks — the bounded window turns those into a
 /// deterministic abort instead of a silent hang.
+/// The backoff sleep between pending-checks while parking.
+const PARK_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Payload of the level-2 content-claim timeout abort (the replace
+/// path): the replacement content is still driven elsewhere.
+const CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD: &str =
+    "content claim timeout: replacement content is still driven by \
+     another chain (cross-claim cycle or self-deadlock)";
+
+/// Payload of the level-2 content-claim timeout abort (the claim
+/// path): the claimed state is still driven elsewhere.
+const CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD: &str =
+    "content claim timeout: the same state is still driven by \
+     another chain (cross-claim cycle or self-deadlock)";
+
 const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Shared {
@@ -196,7 +211,7 @@ impl Shared {
         if self.is_pending() {
             self.park_self();
         }
-        std::thread::sleep(Duration::from_millis(1));
+        std::thread::sleep(PARK_SLEEP);
     }
 
     /// A child Shared: the parking identity is its own, the claims
@@ -594,16 +609,18 @@ impl<'o, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
         // the box is the load-bearing invariant (always an
         // InnerHandle<_, V> over the K-shaped slot) — deref lands on
         // the V through it, the box itself is never handed out
+        let current: *const V = self.current.as_ref() as *const V;
         // SAFETY: the box holds an InnerHandle<_, V> (the invariant);
         // viewing it as the V it erases is the Unsize correspondence.
-        unsafe { &*(self.current.as_ref() as *const V) }
+        unsafe { &*current }
     }
 }
 
 impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
     fn deref_mut(&mut self) -> &mut V {
+        let current: *mut V = self.current.as_mut() as *mut V;
         // SAFETY: as Deref — exclusive.
-        unsafe { &mut *(self.current.as_mut() as *mut V) }
+        unsafe { &mut *current }
     }
 }
 
@@ -659,8 +676,10 @@ where
         let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
+        let state_erased: *mut () = state_raw as *mut ();
+        let shared_ref = SharedRef(shared.clone());
         // SAFETY: the receiver came from this slot (the contract).
-        let current = unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(shared.clone())) };
+        let current = unsafe { erased.box_innerhandle(state_erased, shared_ref) };
         OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
@@ -681,7 +700,9 @@ where
         // this chain (the mint's discipline; the old inner handle is
         // replaced by the re-mint below, so no stale pointer
         // survives the write).
-        unsafe { *self.slot = PersistentCell::new(val) };
+        let replacement = PersistentCell::new(val);
+        // SAFETY: as above — the write itself.
+        unsafe { *self.slot = replacement };
         // 2) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (K's own
         // DerefMut, consulted once) — to mint a fresh InnerHandle
@@ -724,11 +745,8 @@ where
                                 // resume_unwind: the sanctioned
                                 // unwinding abort — no panic-macro, and
                                 // the ClaimGuards release on the unwind
-                                let abort: Box<dyn std::any::Any + Send> = Box::new(
-                                    "content claim timeout: replacement content is still \
-                                     driven by another chain (cross-claim cycle or \
-                                     self-deadlock)",
-                                );
+                                let abort: Box<dyn std::any::Any + Send> =
+                                    Box::new(CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD);
                                 std::panic::resume_unwind(abort);
                             }
                             self.shared.backoff_checkpoint();
@@ -743,8 +761,10 @@ where
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return.
             let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
+            let state_erased: *mut () = state_raw as *mut ();
+            let shared_ref = SharedRef(self.shared.clone());
             // SAFETY: the mint's discipline over the fresh content.
-            unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
+            unsafe { erased.box_innerhandle(state_erased, shared_ref) }
         };
         self.current = fresh;
     }
@@ -811,7 +831,7 @@ unsafe impl<T: ?Sized> AsPtr for Box<T> {
 /// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
 /// `&mut self` — exclusive on the wrapper, the ordinary interior-
 /// mutability pattern). The fanout's mint path uses the crate-private
-/// [`PersistentCell::as_mut_k`] — sound only under the chain's exclusivity
+/// `PersistentCell::as_mut_k` — sound only under the chain's exclusivity
 /// discipline, which the library maintains.
 pub struct PersistentCell<K: ?Sized> {
     cell: UnsafeCell<K>,
@@ -877,26 +897,29 @@ impl<K: ?Sized> PersistentCell<K> {
     /// ends (the mint's discipline).
     #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is PersistentCell's whole point; soundness rides the chain's exclusivity (the safety contract above)
     pub(crate) unsafe fn as_mut_k(&self) -> &mut K {
+        let cell_ptr: *mut K = self.cell.get();
         // SAFETY: the caller's contract above — this is the wrapper's
         // own UnsafeCell, accessed under the library's exclusivity.
-        unsafe { &mut *self.cell.get() }
+        unsafe { &mut *cell_ptr }
     }
 }
 
 impl<K: ?Sized> Deref for PersistentCell<K> {
     type Target = K;
     fn deref(&self) -> &K {
+        let cell_ptr: *const K = self.cell.get();
         // SAFETY: shared access to the cell's content — the wrapper's
         // own UnsafeCell grants exactly this.
-        unsafe { &*self.cell.get() }
+        unsafe { &*cell_ptr }
     }
 }
 
 impl<K: ?Sized> DerefMut for PersistentCell<K> {
     fn deref_mut(&mut self) -> &mut K {
+        let cell_ptr: *mut K = self.cell.get();
         // SAFETY: `&mut self` is exclusive on the wrapper — no other
         // access can exist.
-        unsafe { &mut *self.cell.get() }
+        unsafe { &mut *cell_ptr }
     }
 }
 
@@ -1118,11 +1141,8 @@ impl<T: Sized> InnerHandle<T> {
                                     if std::time::Instant::now() >= deadline {
                                         // as above: unwind so the guards release
                                         // as above: the sanctioned unwinding abort
-                                        let abort: Box<dyn std::any::Any + Send> = Box::new(
-                                            "content claim timeout: the same state is still \
-                                             driven by another chain (cross-claim cycle or \
-                                             self-deadlock)",
-                                        );
+                                        let abort: Box<dyn std::any::Any + Send> =
+                                            Box::new(CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD);
                                         std::panic::resume_unwind(abort);
                                     }
                                     child_shared.backoff_checkpoint();
@@ -1140,11 +1160,11 @@ impl<T: Sized> InnerHandle<T> {
                     // driver of both the slot and its content; the
                     // mint's discipline holds.
                     let erased: &mut (dyn HandleAble<V> + '_) = unsafe { &mut *state_raw };
+                    let state_erased: *mut () = state_raw as *mut ();
+                    let shared_ref = SharedRef(child_shared.clone());
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
-                    let current = unsafe {
-                        erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone()))
-                    };
+                    let current = unsafe { erased.box_innerhandle(state_erased, shared_ref) };
                     let outer = OuterHandle {
                         current,
                         slot: child as *const PersistentCell<K> as *mut PersistentCell<K>,
@@ -1199,6 +1219,9 @@ impl<T: Sized> DerefMut for InnerHandle<T> {
 #[cfg(test)]
 #[cfg_attr(test, allow(clippy::panic))]
 mod tests {
+
+    /// Both registry tests register exactly two children.
+    const REGISTERED_CHILDREN: usize = 2;
     use super::*;
 
     /// Two registered children, both listed in the Weak snapshot.
@@ -1209,7 +1232,7 @@ mod tests {
         let b = Arc::new(Shared::new());
         parent.register_child(&a);
         parent.register_child(&b);
-        assert_eq!(parent.child_weaks().len(), 2);
+        assert_eq!(parent.child_weaks().len(), REGISTERED_CHILDREN);
     }
 
     /// A WAITING subtask must still answer checkpoint requests: its
@@ -1232,7 +1255,7 @@ mod tests {
         // visible, then the backoff step — which must PARK (the
         // requester's handshake only completes when it does)
         while !shared.is_pending() {
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(PARK_SLEEP);
         }
         shared.backoff_checkpoint();
         requester.join().expect("requester");
@@ -1255,7 +1278,7 @@ mod tests {
             // visible first (park_self would return immediately
             // otherwise and the handshake would miss)
             while !mutator.is_pending() {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::sleep(PARK_SLEEP);
             }
             mutator.park_self();
             saw_park.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1301,7 +1324,7 @@ mod tests {
         drop(transient);
         assert!(transient_weak.upgrade().is_none());
         // the registry entry survives (a Weak can), the child doesn't
-        assert_eq!(parent.child_weaks().len(), 2);
+        assert_eq!(parent.child_weaks().len(), REGISTERED_CHILDREN);
         // and the request through it answers Closed, not a hang
         match request_until_parked(&transient_weak) {
             Handshake::Closed => {}

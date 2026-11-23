@@ -130,6 +130,18 @@ mod tests {
     const PHASE_RETRY: &str = "retry";
     const PHASE_DONE: &str = "done";
     const PHASE_UNEXPECTED: &str = "wrong";
+
+    /// The serde roundtrip tracks this many contexts.
+    const TRACKED_CONTEXTS: usize = 2;
+    /// Window width of the sortedness check.
+    const SORTED_WINDOW: usize = 2;
+    /// Index of the current element inside a sortedness window.
+    const CUR: usize = 0;
+    /// Index of the next element inside a sortedness window.
+    const NEXT: usize = 1;
+    /// A malformed artifact: the same context id twice.
+    #[allow(unknown_lints, inline_literal)] // the artifact IS the scenario — quoted phase names inside JSON
+    const DUPLICATE_ENTRIES_JSON: &str = r#"[[1,"open"],[1,"done"]]"#;
     const PHASE_OF_A: &str = "phase_a";
     const PHASE_OF_B: &str = "phase_b";
 
@@ -199,25 +211,25 @@ mod tests {
         let a = root.new_child();
         let b = root.new_child();
         let tracker = DefaultPhaseTracker::<&str>::new();
-        tracker.advance(&a, None, "open");
-        tracker.advance(&b, None, "done");
+        tracker.advance(&a, None, PHASE_OPEN);
+        tracker.advance(&b, None, PHASE_DONE);
 
         let json = serde_json::to_string(&tracker).expect("serialize");
         let entries: Vec<(u64, &str)> = serde_json::from_str(&json).expect("parse back");
         // Sorted by hash for deterministic artifacts.
-        assert!(entries.windows(2).all(|w| w[0].0 < w[1].0));
-        assert_eq!(entries.len(), 2);
+        assert!(entries.windows(SORTED_WINDOW).all(|w| w[CUR].0 < w[NEXT].0));
+        assert_eq!(entries.len(), TRACKED_CONTEXTS);
 
         let restored: DefaultPhaseTracker<&str> =
             serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(restored.get_phase(&a), Some("open"));
-        assert_eq!(restored.get_phase(&b), Some("done"));
+        assert_eq!(restored.get_phase(&a), Some(PHASE_OPEN));
+        assert_eq!(restored.get_phase(&b), Some(PHASE_DONE));
     }
 
     #[cfg(feature = "serde")]
     #[test]
     fn test_serde_rejects_duplicate_entries() {
-        let json = r#"[[1,"open"],[1,"done"]]"#;
+        let json = DUPLICATE_ENTRIES_JSON;
         let result: Result<DefaultPhaseTracker<&str>, _> = serde_json::from_str(json);
         assert!(result.is_err());
     }
