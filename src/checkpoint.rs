@@ -1,7 +1,46 @@
 //! The two-piece checkpointing library (#19's design): the typing
-//! discipline — erased state slots through `Unsize`-witnessed handles —
-//! with no vocabulary in it.
+//! discipline — erased outer `Box<K>` reassignment through `Unsize`-witnessed
+//! handles — with no vocabulary in it.
 //!
+//! # Soundness invariants
+//!
+//! **I1 (access paths).** The container `K`'s content may be
+//! accessed by client code ONLY through the line the library drives:
+//! the `PersistentCell`'s own `Deref`/`DerefMut` and the container's
+//! `DerefMut` they lead to. A client knows the concrete `K` and
+//! could reach its pointee in other ways — that is forbidden; every
+//! content access rides the library's line, which is the line the
+//! mint's receiver and the guard's reads share.
+//!
+//! **I2 (slot lifetime).** The client hands the library a `&` to
+//! each `PersistentCell` (the fanout split's children and the root).
+//! A sound client can never invalidate that reference: doing so
+//! requires a `&mut` to the cell proving the `&` is gone, and the
+//! library hands out no such `&mut` to client code until it is done
+//! with the subtask. Hence the backing store outlives every handle.
+//!
+//! **I4 (tree shape of borrows).** While a node is not a leaf node,
+//! no `&mut` to it exists. While a node IS a leaf node, a `&mut` to
+//! it exists only through borrowing `DerefMut` of the handle.
+//! Consequence: while all leaf nodes are in a safepoint, no `&mut`
+//! exists to any node in the tree — which lets the guard spring a
+//! fresh `&` to the root, from which non-conflicting `&` to every
+//! node can be derived (the checkpoint read side).
+//!
+//! # The erasure's object lifetime `'v`
+//!
+//! The sketch bounds the slot content by `Unsize<dyn HandleAble<V>>`,
+//! whose object lifetime is `'static`. Here that lifetime is a
+//! parameter: [`independent_task_root`], [`OuterHandle::replace`] and
+//! [`InnerHandle::fanout`] bound the content by
+//! `Unsize<dyn HandleAble<V> + 'v>` and `V: 'v`, and every call site
+//! infers `'v`. `'v = 'static` is exactly the sketch's bound — the
+//! erased slot (`Box<PersistentCell<dyn HandleAble<dyn Vocab>>>`, the
+//! shape every sketch demo uses) is admitted unchanged — while a
+//! machine whose environment borrows for the run infers `'v` shorter.
+//! `'v` only has to outlive the mint: the `dyn HandleAble<V> + 'v`
+//! receiver the mint dispatches through is transient.
+
 use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
 use dashmap::DashMap;
@@ -116,12 +155,14 @@ const JOIN_POLL_INTERVAL_MS: u64 = 1;
 /// being short.
 const REQUEST_WAIT_MS: u64 = 10;
 
-/// How long a LEVEL-2 (content) claim may wait before panicking.
-/// Unlike cell claims (which resolve when the owning subtask ends),
+/// How long a LEVEL-2 (content) claim may wait before the cycle-breaker
+/// abort. Unlike cell claims (which resolve when the owning subtask ends),
 /// content waits can form cross-claim cycles and intrathread
 /// self-deadlocks — the bounded window turns those into a
 /// deterministic abort instead of a silent hang.
-/// The backoff sleep between pending-checks while parking.
+const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The backoff sleep between pending-checks while waiting on a claim.
 const PARK_SLEEP: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Payload of the level-2 content-claim timeout abort (the replace
@@ -135,8 +176,6 @@ const CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD: &str =
 const CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD: &str =
     "content claim timeout: the same state is still driven by \
      another chain (cross-claim cycle or self-deadlock)";
-
-const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
 
 impl Shared {
     fn new() -> Self {
@@ -394,20 +433,15 @@ pub struct InnerHandle<T: ?Sized> {
     _marker: PhantomData<fn(*mut T)>,
 }
 
-// Sound: the state raw is exclusively reachable through this handle
+// SAFETY: the state raw is exclusively reachable through this handle
 // for its life (the mint's discipline), the status Arc is Send+Sync,
 // and T: Send crosses with it.
-// SAFETY: the state raw is exclusively owned for the handle's
-// life (the mint's discipline); T: Send crosses with it.
 unsafe impl<T: ?Sized + Send> Send for InnerHandle<T> {}
 
-// The payload crosses threads: the box (an InnerHandle: its T: Send
-// by the HandleAble blanket), and the K cell it exclusively owns —
-// moving the outer moves the exclusive access to both, so K must be
-// Send for the pointee's sake.
-// SAFETY: the box (an InnerHandle: its T: Send by the HandleAble
-// blanket) and the K cell it exclusively owns are the payload; moving
-// the outer moves the exclusive access to both.
+// SAFETY: the payload crosses threads: the box (an InnerHandle: its
+// T: Send by the HandleAble blanket), and the K cell it exclusively
+// owns — moving the outer moves the exclusive access to both, so K
+// must be Send for the pointee's sake.
 unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
@@ -565,6 +599,15 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// `slot` inaccessible (borrowed) for the whole call. The `'o` brand
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
+///
+/// `V` is the tree's vocabulary — what the callback drives through its
+/// outer handle — and the slot's content must erase to
+/// `dyn HandleAble<V> + 'v`: either a CONCRETE node (the blanket impl,
+/// `InnerHandle<Node>: Unsize<V>`) or an already-erased one (`dyn Erased`
+/// with `Erased: HandleAble<V>` — the sketch demos' shape, e.g.
+/// `Box<PersistentCell<dyn HandleAble<V>>>`). `'v` is that erasure's
+/// object lifetime (see the module docs): inferred at the call site,
+/// never named by callers, and only the mint has to outlive it.
 pub fn independent_task_root<'v, K, V: ?Sized + 'v, R>(
     slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
@@ -663,17 +706,17 @@ where
         // the state raw: deref_mut EXPLICITLY at the raw-mut side —
         // the returned reference is cast to the raw on the spot; the
         // dispatch receiver below is transient and dies at return
-        // SAFETY: the caller's contract above.
-        // SAFETY: the root task holds the slot exclusively for the
-        // whole call (the fn signature itself).
-        // SAFETY: as above — the root task's exclusive borrow.
+        // SAFETY: the caller's contract above — the root task holds the
+        // slot exclusively for the whole call.
         let slot_cell: &PersistentCell<K> = unsafe { &*slot };
-        // SAFETY: the hatch under the same exclusivity.
+        // SAFETY: the hatch, under that same exclusivity.
         let k: &mut K = unsafe { slot_cell.as_mut_k() };
         let target: &mut K::Target = DerefMut::deref_mut(k);
-        // SAFETY: the AsPtr contract (the cell/box store line).
+        // `as_ptr` is a safe method of an unsafe trait: its contract is
+        // discharged by the impl — the store line the Deref chain springs from.
         let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
-        // SAFETY: the state raw is the store line the mint owns.
+        // SAFETY: the state raw is that store line, live under the
+        // caller's contract; the receiver is transient and dies at return.
         let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
@@ -691,22 +734,22 @@ where
     /// so parking identity is untouched.
     /// # Panics
     ///
-    /// Panics on a content-claim timeout (a replacement whose content
-    /// is still driven by another live chain after 100 ms — the
-    /// deterministic cycle-breaker abort), and if the mint's safety
-    /// contract is violated.
+    /// Unwinds on a content-claim timeout — a replacement whose content
+    /// is still driven by another live chain after
+    /// `CONTENT_CLAIM_WINDOW`: the deterministic cycle-breaker abort.
+    /// The unwind does NOT run the panic hook (it is a `resume_unwind`,
+    /// not a `panic!`).
     pub fn replace<'v>(&mut self, val: K)
     where
         <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
         V: 'v,
     {
         // 1) the swap — plain assignment through the typed slot
+        let replacement = PersistentCell::new(val);
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
         // replaced by the re-mint below, so no stale pointer
         // survives the write).
-        let replacement = PersistentCell::new(val);
-        // SAFETY: as above — the write itself.
         unsafe { *self.slot = replacement };
         // 2) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (K's own
@@ -715,23 +758,21 @@ where
         // SAFETY: the mint's discipline over the fresh slot content;
         // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = {
-            // SAFETY: the slot is live and exclusively owned by this
-            // chain (the mint's discipline).
-            // SAFETY: this chain exclusively owns the slot (the
-            // mint's discipline; the old inner handle is replaced by
-            // the re-mint below).
-            // SAFETY: as above — the chain's exclusive ownership.
+            // SAFETY: this chain exclusively owns the slot (the mint's
+            // discipline; the old inner handle is replaced by the
+            // re-mint below).
             let slot_cell: &PersistentCell<K> = unsafe { &*self.slot };
             // SAFETY: the hatch under the same ownership.
             let k: &mut K = unsafe { slot_cell.as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
-            // SAFETY: the AsPtr contract (the store line).
+            // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
             let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
             // THE CONTENT CLAIM, on the SAME map: a replacement whose
             // content is aliased with another live chain waits — but
             // bounded: content waits can form claim cycles and
-            // self-deadlocks, so after the window this PANICS (the
-            // deterministic abort) instead of hanging.
+            // self-deadlocks, so after the window this ABORTS by
+            // unwinding (the deterministic cycle-breaker) instead of
+            // hanging.
             let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
             {
                 let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
@@ -743,13 +784,12 @@ where
                         }
                         _ => {
                             if std::time::Instant::now() >= deadline {
-                                // the abort MUST unwind: the ClaimGuards
-                                // release on unwind (a leak would leave
-                                // the claim held forever). `expect` is
-                                // the codebase's sanctioned form.
-                                // resume_unwind: the sanctioned
-                                // unwinding abort — no panic-macro, and
-                                // the ClaimGuards release on the unwind
+                                // the cycle-breaker abort MUST unwind: the
+                                // ClaimGuards release on unwind (a leak would
+                                // hold the claim forever). It is a
+                                // `resume_unwind`, not a `panic!`: the crate's
+                                // lint policy denies `panic!` here. Unlike
+                                // `panic!` it does not run the panic hook.
                                 let abort: Box<dyn std::any::Any + Send> =
                                     Box::new(CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD);
                                 std::panic::resume_unwind(abort);
@@ -775,8 +815,9 @@ where
     }
 }
 
-/// A slot target that can hand out the pointer to its erased `H`
-/// view — the line the mint persists. Three impls, one per shape:
+/// A slot target that can hand out the pointer to the line the mint
+/// persists — the store its own `Deref`/`DerefMut` spring from. Two
+/// impls, one per shape:
 ///
 /// - **`PersistentCell<T>`**: the content through the hatch — the
 ///   interior-mutable line (the sound shape for erased states);
@@ -928,7 +969,6 @@ impl<K: ?Sized> DerefMut for PersistentCell<K> {
     }
 }
 
-// The wrapper crosses threads exactly when its content does.
 // SAFETY: the wrapper crosses threads exactly when its content does.
 unsafe impl<K: ?Sized + Send> Send for PersistentCell<K> {}
 
@@ -1015,9 +1055,9 @@ impl<T: Sized> InnerHandle<T> {
 
     /// The fan-out (the protocol per main: parent parks in the join
     /// loop when a checkpoint is requested). `split`
-    /// runs on `&mut T` (the node's own fields) and yields the
-    /// children as the erased slots (`&mut Box<dyn HandleAble<V>>` in
-    /// the demo — any DerefMut-to-dyn holder works). Each element
+    /// runs on `&T` (a SHARED borrow of the node's own fields) and
+    /// yields the children as `&PersistentCell<K>` — one slot per
+    /// child. Each element
     /// becomes a `Box<V>` via `box_innerhandle`, and `f` runs on one
     /// scoped thread per box, whose results collect into the returned
     /// `Vec<R>` in DISPATCH order — `joins[i]` is child `i` (the
@@ -1031,11 +1071,13 @@ impl<T: Sized> InnerHandle<T> {
     /// leave the callback at all — strictly stronger than branding
     /// it with the root task's `'o`, which is why fanout no longer
     /// carries an `'o` of its own.
+    ///
     /// # Panics
     ///
-    /// Propagates a panicked child from the fan-out scope, panics on a
-    /// content-claim timeout (the same-content cycle breaker, 100 ms),
-    /// and if the mint's safety contract is violated.
+    /// Propagates a panicked child from the fan-out scope. Unwinds on
+    /// a content-claim timeout (the same-content cycle breaker, after
+    /// `CONTENT_CLAIM_WINDOW`) — by a `resume_unwind`, which does not
+    /// run the panic hook.
     pub fn fanout<'v, V: ?Sized + Send + 'v, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
@@ -1124,18 +1166,19 @@ impl<T: Sized> InnerHandle<T> {
                     // y; B holds y wants x) and INTRATHREAD SELF-
                     // DEADLOCKS (a nested fanout re-claiming content
                     // its own ancestor already holds) — so after the
-                    // bounded window this PANICS: a deterministic
-                    // abort instead of a silent deadlock.
+                    // bounded window this ABORTS by unwinding: a
+                    // deterministic abort instead of a silent deadlock.
                     let state_raw = {
                         let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
                         loop {
                             // the transient container derefs re-run per
                             // attempt; nothing is driven until the claim
                             // succeeds
-                            // SAFETY: the claim makes this thread the sole
-                    // driver of the slot (the mint's discipline).
-                    let k: &mut K = unsafe { child.as_mut_k() };
+                            // SAFETY: the CELL claim above makes this thread
+                            // the sole driver of the slot (the mint's discipline).
+                            let k: &mut K = unsafe { child.as_mut_k() };
                             let target: &mut K::Target = DerefMut::deref_mut(k);
+                            // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
                             let raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
                             match claims.entry(raw as *const () as usize) {
                                 dashmap::Entry::Vacant(v) => {
@@ -1144,8 +1187,9 @@ impl<T: Sized> InnerHandle<T> {
                                 }
                                 _ => {
                                     if std::time::Instant::now() >= deadline {
-                                        // as above: unwind so the guards release
-                                        // as above: the sanctioned unwinding abort
+                                        // as in `replace`: the abort unwinds (the
+                                        // ClaimGuards release on the unwind) and,
+                                        // being a `resume_unwind`, skips the panic hook.
                                         let abort: Box<dyn std::any::Any + Send> =
                                             Box::new(CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD);
                                         std::panic::resume_unwind(abort);
@@ -1222,12 +1266,11 @@ impl<T: Sized> DerefMut for InnerHandle<T> {
 }
 
 #[cfg(test)]
-#[cfg_attr(test, allow(clippy::panic))]
 mod tests {
+    use super::*;
 
     /// Both registry tests register exactly two children.
     const REGISTERED_CHILDREN: usize = 2;
-    use super::*;
 
     /// Two registered children, both listed in the Weak snapshot.
     #[test]
@@ -1292,7 +1335,7 @@ mod tests {
         // weak, like every requester-side look)
         match request_until_parked(&weak) {
             Handshake::Parked => {}
-            Handshake::Closed => panic!("live mutator answered Closed"), // test-only
+            Handshake::Closed => unreachable!("live mutator answered Closed"),
         }
         // release: the mutator runs again and finishes
         release_request(&shared);
@@ -1311,7 +1354,7 @@ mod tests {
         };
         match request_until_parked(&weak) {
             Handshake::Closed => {}
-            Handshake::Parked => panic!("a gone mutator cannot park"), // test-only
+            Handshake::Parked => unreachable!("a gone mutator cannot park"),
         }
     }
 
@@ -1333,7 +1376,7 @@ mod tests {
         // and the request through it answers Closed, not a hang
         match request_until_parked(&transient_weak) {
             Handshake::Closed => {}
-            Handshake::Parked => panic!("a dropped child cannot park"),
+            Handshake::Parked => unreachable!("a dropped child cannot park"),
         }
     }
 
@@ -1346,12 +1389,14 @@ mod tests {
         let weak = Arc::downgrade(&shared);
         let gate = Arc::new(Mutex::new(()));
         let gate2 = gate.clone();
-        // the mid-protocol death: pending set, then the panic unwinds
-        // through the held gate (poisoning it), never releasing
+        // the mid-protocol death: pending set, then the requester's own
+        // next step FAILS — it re-enters the gate it is holding — and the
+        // failed expectation unwinds through the held guard (poisoning
+        // it), never releasing
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _gate_guard = gate2.lock().unwrap();
             shared.pending_request.store(true, std::sync::atomic::Ordering::SeqCst);
-            panic!("requester died mid-protocol");
+            let _never_reached = gate2.try_lock().expect("the requester dies here: its own gate is held");
         }));
         assert!(result.is_err());
         assert!(shared.is_pending());

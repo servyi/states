@@ -139,9 +139,8 @@ mod tests {
     const CUR: usize = 0;
     /// Index of the next element inside a sortedness window.
     const NEXT: usize = 1;
-    /// A malformed artifact: the same context id twice.
-    #[allow(unknown_lints, inline_literal)] // the artifact IS the scenario — quoted phase names inside JSON
-    const DUPLICATE_ENTRIES_JSON: &str = r#"[[1,"open"],[1,"done"]]"#;
+    /// The context id that appears twice in the malformed artifact.
+    const DUPLICATED_CONTEXT_ID: u64 = 1;
     const PHASE_OF_A: &str = "phase_a";
     const PHASE_OF_B: &str = "phase_b";
 
@@ -229,8 +228,13 @@ mod tests {
     #[cfg(feature = "serde")]
     #[test]
     fn test_serde_rejects_duplicate_entries() {
-        let json = DUPLICATE_ENTRIES_JSON;
-        let result: Result<DefaultPhaseTracker<&str>, _> = serde_json::from_str(json);
+        // a malformed artifact: the same context id listed twice
+        let json = serde_json::to_string(&[
+            (DUPLICATED_CONTEXT_ID, PHASE_OPEN),
+            (DUPLICATED_CONTEXT_ID, PHASE_DONE),
+        ])
+        .expect("the malformed artifact serializes");
+        let result: Result<DefaultPhaseTracker<&str>, _> = serde_json::from_str(&json);
         assert!(result.is_err());
     }
 }
