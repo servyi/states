@@ -97,6 +97,29 @@ impl Drop for ClaimGuard {
     }
 }
 
+/// Take `key` in the claims registry if it is free: `true` when this
+/// call claimed it.
+///
+/// A function on purpose. A `dashmap::Entry` owns its registry shard's
+/// write lock, and the scrutinee of a `match` lives until the `match`
+/// ends — so a waiter that backed off from INSIDE
+/// `match claims.entry(key) { .. }` parked (whenever a checkpoint was
+/// requested) still holding that shard. Every other waiter with a key
+/// in that shard then blocked inside the registry, where it can never
+/// reach a safepoint, and the requester — waiting for that waiter to
+/// park — never released the first: a deadlock. Three subtasks handed
+/// the same cell, plus one checkpoint, were enough. Here the `Entry`
+/// is gone before the caller sees the result.
+fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
+    match claims.entry(key) {
+        dashmap::Entry::Vacant(v) => {
+            v.insert(());
+            true
+        }
+        dashmap::Entry::Occupied(_) => false,
+    }
+}
+
 /// The opaque shell for `Arc<Shared>` that crosses the one public
 /// signature which needs it (`box_innerhandle`): `Shared` itself is
 /// crate-private, and the shell's field is private, so no client can
@@ -642,22 +665,17 @@ where
             {
                 let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
                 loop {
-                    match claims.entry(state_raw as *const () as usize) {
-                        dashmap::Entry::Vacant(v) => {
-                            v.insert(());
-                            break;
-                        }
-                        _ => {
-                            if std::time::Instant::now() >= deadline {
-                                panic!(
-                                    "content claim timeout: replacement content is still \
-                                     driven by another chain (cross-claim cycle or \
-                                     self-deadlock)"
-                                );
-                            }
-                            self.shared.backoff_checkpoint();
-                        }
+                    if try_claim(&claims, state_raw as *const () as usize) {
+                        break;
                     }
+                    if std::time::Instant::now() >= deadline {
+                        panic!(
+                            "content claim timeout: replacement content is still \
+                             driven by another chain (cross-claim cycle or \
+                             self-deadlock)"
+                        );
+                    }
+                    self.shared.backoff_checkpoint();
                 }
             }
             let _content_claim = ClaimGuard {
@@ -980,14 +998,10 @@ impl<T: Sized> InnerHandle<T> {
                     // the tree (the parent waits for this subtask to
                     // park; a bare sleep never would).
                     let key: usize = child as *const PersistentCell<K> as usize;
-                    loop {
-                        match claims.entry(key) {
-                            dashmap::Entry::Vacant(v) => {
-                                v.insert(());
-                                break;
-                            }
-                            _ => child_shared.backoff_checkpoint(),
-                        }
+                    // the claim is taken through `try_claim`: the registry
+                    // lock is gone before the backoff (which parks)
+                    while !try_claim(&claims, key) {
+                        child_shared.backoff_checkpoint();
                     }
                     // release on unwind or completion — a panicked
                     // subtask must not leave its slot claimed
@@ -1023,22 +1037,17 @@ impl<T: Sized> InnerHandle<T> {
                                 AsPtr::as_ptr(k_ptr)
                             };
                             let raw: *mut dyn HandleAble<V> = unsafe { AsPtr::as_ptr(target_ptr) };
-                            match claims.entry(raw as *const () as usize) {
-                                dashmap::Entry::Vacant(v) => {
-                                    v.insert(());
-                                    break raw;
-                                }
-                                _ => {
-                                    if std::time::Instant::now() >= deadline {
-                                        panic!(
-                                            "content claim timeout: the same state is still \
-                                             driven by another chain (cross-claim cycle or \
-                                             self-deadlock)"
-                                        );
-                                    }
-                                    child_shared.backoff_checkpoint();
-                                }
+                            if try_claim(&claims, raw as *const () as usize) {
+                                break raw;
                             }
+                            if std::time::Instant::now() >= deadline {
+                                panic!(
+                                    "content claim timeout: the same state is still \
+                                     driven by another chain (cross-claim cycle or \
+                                     self-deadlock)"
+                                );
+                            }
+                            child_shared.backoff_checkpoint();
                         }
                     };
                     let _content_claim = ClaimGuard {
@@ -1105,6 +1114,20 @@ impl<T: Sized> DerefMut for InnerHandle<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FAILED claim must not leave its registry shard locked: the
+    /// `Entry` — and with it the shard's write lock — is dropped before
+    /// `try_claim` returns. Probed with `try_entry` from the same
+    /// thread: with the shard still held, every key hashing to it would
+    /// be unlockable.
+    #[test]
+    fn a_failed_claim_leaves_no_registry_shard_locked() {
+        let claims = DashMap::new();
+        assert!(try_claim(&claims, 1), "a free key is claimed");
+        assert!(!try_claim(&claims, 1), "a taken key is not claimed twice");
+        let lockable = (0..4096).filter(|key| claims.try_entry(*key).is_some()).count();
+        assert_eq!(lockable, 4096, "some key's shard is still locked");
+    }
 
     /// Two registered children, both listed in the Weak snapshot.
     #[test]
