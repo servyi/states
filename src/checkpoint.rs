@@ -29,7 +29,7 @@
 //!
 //! # The slot content's only bound is `HandleAble<V>`
 //!
-//! The content a slot holds — `<K::Target as Deref>::Target` — is
+//! The content a slot holds — `<K::Target as AsPtr>::Target` — is
 //! bounded by [`HandleAble<V>`] and nothing else: no `Unsize`, no
 //! `Sized`, no object lifetime. The mint dispatches
 //! `box_innerhandle` through that trait directly — statically for a
@@ -667,15 +667,16 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// [`HandleAble<V>`]: either a CONCRETE node (the blanket impl,
 /// `InnerHandle<Node>: Unsize<V>`) or an already-erased one (`dyn Erased`
 /// with `Erased: HandleAble<V>` — the sketch demos' shape, e.g.
-/// `Box<PersistentCell<dyn HandleAble<V>>>`).
+/// `Box<PersistentCell<dyn HandleAble<V>>>`). `K` and its line are
+/// reached through [`AsPtr`] alone: the mint projects through raws.
 pub fn independent_task_root<K, V: ?Sized, R>(
     slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut + Sized + Send,
+    K: AsPtr + Sized + Send,
     K::Target: AsPtr,
-    <K::Target as Deref>::Target: HandleAble<V>,
+    <K::Target as AsPtr>::Target: HandleAble<V>,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -729,16 +730,17 @@ impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized> OuterHandle<'o, K, V>
 where
-    K: DerefMut + Send,
+    K: AsPtr + Send,
     K::Target: AsPtr,
+    <K::Target as AsPtr>::Target: HandleAble<V>,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
     ///
     /// # Safety
     ///
-    /// The `&mut` resolves validity and mint-time exclusivity by
-    /// construction; what remains:
+    /// The caller's `&mut` slot (through `independent_task_root`)
+    /// resolves validity and mint-time exclusivity; what remains:
     ///
     /// - The `K` must stay valid and live, at that address, for the
     ///   handle's whole life (the raw stored in the minted chain
@@ -760,25 +762,27 @@ where
     unsafe fn over_slot(slot: *mut PersistentCell<K>) -> Self
     where
         K: Sized,
-        <K::Target as Deref>::Target: HandleAble<V>,
     {
-        // the state raw: deref_mut EXPLICITLY at the raw-mut side —
-        // the returned reference is cast to the raw on the spot; the
-        // dispatch receiver below is transient and dies at return
+        // the state raw: the mint projects through RAWS ONLY — the
+        // slot's hatch, the container's stored line, the content's
+        // line. No reference is materialized anywhere on the mint
+        // path: a `&mut` here would go Unique on the first write and
+        // freeze on the guard's read, forbidding every later write
+        // through the chain (see `AsPtr`).
         // SAFETY: the caller's contract above — the root task holds the
-        // slot exclusively for the whole call.
-        let slot_cell: &PersistentCell<K> = unsafe { &*slot };
-        // SAFETY: the hatch, under that same exclusivity.
-        let k: &mut K = unsafe { slot_cell.as_mut_k() };
-        let target: &mut K::Target = DerefMut::deref_mut(k);
-        // `as_ptr` is a safe method of an unsafe trait: its contract is
-        // discharged by the impl — the store line the Deref chain springs from.
-        let state_raw = AsPtr::as_ptr(target);
-        // SAFETY: the state raw is that store line, live under the
-        // caller's contract; the receiver is transient and dies at return.
-        // It is the CONTENT, bounded only by `HandleAble<V>`: the mint
-        // dispatches through that trait — never through `dyn HandleAble<V>`.
-        let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
+        // slot exclusively for the whole call, so the projections are
+        // the only live access (`as_ptr`'s caller obligation).
+        let k_ptr: *mut K = unsafe { AsPtr::as_ptr(slot) };
+        // SAFETY: as above.
+        let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(k_ptr) };
+        // SAFETY: as above.
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        // SAFETY: the state raw is the content's own line, live under
+        // the caller's contract; the receiver is transient and dies at
+        // return. It is the CONTENT, bounded only by `HandleAble<V>`:
+        // the mint dispatches through that trait — never through
+        // `dyn HandleAble<V>`.
+        let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         let state_erased: *mut () = state_raw as *mut ();
@@ -802,7 +806,7 @@ where
     /// as they were.
     pub fn replace(&mut self, mut val: K) -> Result<(), ContentClaimTimeout>
     where
-        <K::Target as Deref>::Target: HandleAble<V>,
+        <K::Target as AsPtr>::Target: HandleAble<V>,
     {
         // 1) THE CONTENT CLAIM, on the tree-wide registry, BEFORE
         // anything is written. An error gate has to leave the tree as it
@@ -817,9 +821,15 @@ where
         // Content that lives inline in its container cannot be shared,
         // so no other chain can hold a claim on it either way.
         let content_key: usize = {
-            // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-            let target: &mut K::Target = DerefMut::deref_mut(&mut val);
-            AsPtr::as_ptr(target) as *const () as usize
+            // the raw hops on `val` where it stands — two, not three:
+            // `val` IS the container, it is not behind a slot's hatch
+            // yet. No reference is materialized (see `AsPtr`).
+            // SAFETY: `val` is owned here, so the projections are the
+            // only live access (`as_ptr`'s caller obligation).
+            let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(val)) };
+            // SAFETY: as above.
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+            state_raw as *const () as usize
         };
         let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
         let claimed = claim_content(&claims, &self.shared, || content_key)?;
@@ -832,26 +842,27 @@ where
         // survives the write).
         unsafe { *self.slot = replacement };
         // 3) re-mint: use the HandleAble OF the replacement —
-        // reachable through the slot it now lives in (K's own
-        // DerefMut, consulted once) — to mint a fresh InnerHandle
+        // reachable through the slot it now lives in (the slot's own
+        // AsPtr hatch, consulted once) — to mint a fresh InnerHandle
         // over that same slot, and assign it into the own box
-        // SAFETY: the mint's discipline over the fresh slot content;
-        // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = {
+            // the raw hops — the slot's hatch, the container's stored
+            // line, the content's line; no reference is materialized
+            // (see `AsPtr`).
             // SAFETY: this chain exclusively owns the slot (the mint's
             // discipline; the old inner handle is replaced by the
-            // re-mint below).
-            let slot_cell: &PersistentCell<K> = unsafe { &*self.slot };
-            // SAFETY: the hatch under the same ownership.
-            let k: &mut K = unsafe { slot_cell.as_mut_k() };
-            let target: &mut K::Target = DerefMut::deref_mut(k);
-            // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-            let state_raw = AsPtr::as_ptr(target);
-            // SAFETY: the state raw is that store line, live under the
-            // mint's discipline; the receiver is transient and dies at
-            // return. As in `over_slot`: the content itself, dispatched
-            // through `HandleAble<V>`.
-            let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
+            // re-mint below), so the projections are the only live
+            // access (`as_ptr`'s caller obligation).
+            let k_ptr: *mut K = unsafe { AsPtr::as_ptr(self.slot) };
+            // SAFETY: as above.
+            let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(k_ptr) };
+            // SAFETY: as above.
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+            // SAFETY: the state raw is the content's own line, live under
+            // the mint's discipline; the receiver is transient and dies
+            // at return. As in `over_slot`: the content itself,
+            // dispatched through `HandleAble<V>`.
+            let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
             let state_erased: *mut () = state_raw as *mut ();
             let shared_ref = SharedRef(self.shared.clone());
             // SAFETY: the mint's discipline over the fresh content.
@@ -862,14 +873,21 @@ where
     }
 }
 
-/// A slot target that can hand out the pointer to the line the mint
-/// persists — the store its own `Deref`/`DerefMut` spring from. Two
+/// A container the mint can project through **on raws alone** — the
+/// line the container's own `Deref`/`DerefMut` spring from. Two
 /// impls, one per shape:
 ///
 /// - **`PersistentCell<T>`**: the content through the hatch — the
 ///   interior-mutable line (the sound shape for erased states);
-/// - **`Box<X>`**: the *stored* line (`&raw mut **self`) — for
+/// - **`Box<X>`**: the *stored* line (`&raw mut **this`) — for
 ///   containers whose target is itself a box.
+///
+/// The receiver is a RAW on purpose: no reference — least of all a
+/// `&mut` — is materialized anywhere on the mint path. A materialized
+/// `&mut` goes `Unique` on the first write and `Frozen` on the first
+/// foreign read (the checkpoint guard's read through the shared
+/// side), which forbids every later write through the chain's whole
+/// subtree (Tree Borrows). Raws never freeze.
 ///
 /// # Safety
 ///
@@ -877,27 +895,58 @@ where
 /// container's own `Deref`/`DerefMut` spring from — never a freshly
 /// minted reference to foreign storage — and the backing store must
 /// not be deleted until the next `&mut` method call on the container.
+/// The impl must not rely on an exclusive reference existing: the
+/// exclusivity is the CALLER's burden (the method's `unsafe` contract
+/// and the chain's discipline), not the receiver's.
 ///
 /// **Coherence is structural:** these are the only library impls,
 /// and a client cannot write one for `PersistentCell` or `Box`
 /// (foreign trait, foreign type — E0210). For a CONCRETE state `T`
-/// as a slot target (`Box<T>` children), the client writes their own
-/// one-line identity impl (`impl AsPtr<dyn HandleAble<V>> for
-/// MyState`) — orphan-legal for their local type, and unable to
+/// as a slot target (`Box<T>`), the client writes their own one-line
+/// identity impl (`unsafe impl AsPtr for MyState { type Target =
+/// MyState; unsafe fn as_ptr(this: *mut Self) -> *mut Self::Target {
+/// this } }`) — orphan-legal for their local type, and unable to
 /// overlap ours.
-pub unsafe trait AsPtr: DerefMut {
-    fn as_ptr(&mut self) -> *mut Self::Target;
+pub unsafe trait AsPtr {
+    /// The line this container hands out: the store its own
+    /// `Deref`/`DerefMut` spring from.
+    type Target: ?Sized;
+
+    /// Project the container to its line, through the raw alone.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the chain's exclusivity over the container
+    /// (the mint's discipline): no other access to it may be live, and
+    /// none may be created, until the mint is done. A `&mut self`
+    /// receiver would enforce that — and would put a materialized
+    /// reference on the mint path (see the trait's docs). The raw
+    /// receiver keeps every reference off it; the obligation is the
+    /// caller's.
+    unsafe fn as_ptr(this: *mut Self) -> *mut Self::Target;
 }
 
 // the cell: the content through the hatch — the IM-covered line.
 // NO vocabulary bounds: the impl is fully general over the content.
-// SAFETY: the hatch returns exactly the cell's own content — the
+// SAFETY: the projection takes exactly the wrapper's own field — the
 // store the Deref chain springs from — never foreign storage; the
-// store lives until the next `&mut` method call on the cell.
+// store lives until the next `&mut` method call on the cell. The
+// `UnsafeCell<T>` → `*mut T` cast preserves the unsize metadata —
+// `UnsafeCell<T>`'s layout is documented identical to `T` (the same
+// cast `get` performs); `addr_of_mut` computes the field's true
+// offset, and the sole field sits at offset 0.
 unsafe impl<T: ?Sized> AsPtr for PersistentCell<T> {
-    fn as_ptr(&mut self) -> *mut T {
-        // SAFETY: the wrapper's own hatch; the content is the store
-        unsafe { self.as_mut_k() }
+    type Target = T;
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut T {
+        // SAFETY: `this` is a live `PersistentCell` under the caller's
+        // exclusivity contract (the mint's discipline); the raw borrow
+        // of the field is the wrapper's own hatch — a place projection,
+        // no reference materialized.
+        let cell: *mut UnsafeCell<T> = unsafe { std::ptr::addr_of_mut!((*this).cell) };
+        // `UnsafeCell<T>` is layout-identical to `T` — the same cast
+        // `UnsafeCell::get` performs.
+        cell as *mut T
     }
 }
 
@@ -905,8 +954,35 @@ unsafe impl<T: ?Sized> AsPtr for PersistentCell<T> {
 // SAFETY: the raw borrow of the builtin deref place loads the
 // stored pointer itself — the box's own line, no fresh reference.
 unsafe impl<T: ?Sized> AsPtr for Box<T> {
-    fn as_ptr(&mut self) -> *mut T {
-        &raw mut **self
+    type Target = T;
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut T {
+        // The sketch's `&raw mut **this` — a raw borrow of the box-deref
+        // place — cannot be spelled past this crate's two rules at once:
+        // the raw deref has to sit in an unsafe block, and a block may
+        // not carry the Box-deref layer above it. So the stored line is
+        // loaded as the raw pointer it is: a `Box<T>` IS that pointer
+        // (the layout `Box::from_raw` relies on).
+        //
+        // What matters is that the stored pointer never becomes a `Box`
+        // VALUE on the mint path: Miri retags a Box value like a
+        // reference when it crosses a call — a materialized `&mut` to
+        // the content. Measured library-free, write -> guard's read ->
+        // write, on one box:
+        //
+        //   the sketch's `&raw mut **p`              SB ok    TB ok
+        //   loaded as a raw pointer (this form)      SB ok    TB ok
+        //   `ptr::read` + `transmute`                SB FAIL  TB FAIL
+        //   a reference to the box, then `&raw mut`  SB FAIL  TB FAIL
+        //   `ptr::read` + `Box::into_raw`             SB ok    TB FAIL
+        //
+        // (`into_raw` is `(&mut **b) as *mut T` in std.)
+        let slot: *mut *mut T = this as *mut *mut T;
+        // SAFETY: `this` is a live `Box` under the caller's exclusivity
+        // contract (the mint's discipline); reading its one word is the
+        // load of the stored line — nothing behind it is dereferenced,
+        // no reference is materialized.
+        unsafe { std::ptr::read(slot) }
     }
 }
 
@@ -923,9 +999,11 @@ unsafe impl<T: ?Sized> AsPtr for Box<T> {
 ///
 /// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
 /// `&mut self` — exclusive on the wrapper, the ordinary interior-
-/// mutability pattern). The fanout's mint path uses the crate-private
-/// `PersistentCell::as_mut_k` — sound only under the chain's exclusivity
-/// discipline, which the library maintains.
+/// mutability pattern). The mint path projects through [`AsPtr`] —
+/// raws only, no reference materialized anywhere on it: a materialized
+/// `&mut` on the mint path would go `Unique` on the first write and
+/// freeze on the guard's first read (Tree Borrows), forbidding every
+/// later write through the chain.
 pub struct PersistentCell<K: ?Sized> {
     cell: UnsafeCell<K>,
 }
@@ -973,27 +1051,6 @@ impl<K: ?Sized> PersistentCell<K> {
         // SAFETY: UnsafeCell is repr(transparent); PersistentCell's
         // only field is the cell — layout-identical to K.
         unsafe { std::mem::transmute(b) }
-    }
-
-    /// The mint's escape hatch: `&self` to `&mut K`. Sound under
-    /// **I1** (this is the library's line — the only permitted access
-    /// path to the content), **I2** (the cell outlives the borrow:
-    /// the client's `&` to this cell cannot be invalidated while the
-    /// subtask runs), and **I4** (the `&mut` exists only inside the
-    /// library's mint/deref discipline, never handed to client code
-    /// as a cell `&mut`).
-    ///
-    /// # Safety
-    ///
-    /// No other reference into the `K` may be live, and none may be
-    /// created, until the returned reference's borrow of the chain
-    /// ends (the mint's discipline).
-    #[allow(clippy::mut_from_ref)] // the deliberate UnsafeCell-backed escape hatch — this is PersistentCell's whole point; soundness rides the chain's exclusivity (the safety contract above)
-    pub(crate) unsafe fn as_mut_k(&self) -> &mut K {
-        let cell_ptr: *mut K = self.cell.get();
-        // SAFETY: the caller's contract above — this is the wrapper's
-        // own UnsafeCell, accessed under the library's exclusivity.
-        unsafe { &mut *cell_ptr }
     }
 }
 
@@ -1137,9 +1194,9 @@ impl<T: Sized> InnerHandle<T> {
     ) -> Result<Vec<R>, ContentClaimTimeout>
     where
         T: Send,
-        K: DerefMut + Sized + Send,
+        K: AsPtr + Sized + Send,
         K::Target: AsPtr,
-        <K::Target as Deref>::Target: HandleAble<V>,
+        <K::Target as AsPtr>::Target: HandleAble<V>,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -1220,31 +1277,43 @@ impl<T: Sized> InnerHandle<T> {
                     // minted, and the error returns from the fan-out.
                     // The claim is released when this subtask returns.
                     let content_key = claim_content(&claims, &child_shared, || {
-                        // the transient container derefs re-run per
-                        // attempt; nothing is driven until the claim
-                        // succeeds
+                        // the raw hops re-run per attempt; nothing is
+                        // driven until the claim succeeds — no reference
+                        // is materialized (see `AsPtr`).
                         // SAFETY: the CELL claim above makes this thread
-                        // the sole driver of the slot (the mint's discipline).
-                        let k: &mut K = unsafe { child.as_mut_k() };
-                        let target: &mut K::Target = DerefMut::deref_mut(k);
-                        // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-                        AsPtr::as_ptr(target) as *const () as usize
+                        // the sole driver of the slot (the mint's
+                        // discipline — `as_ptr`'s caller obligation); the
+                        // shared-to-raw cast is the split's own hand-off.
+                        let child_ptr: *mut PersistentCell<K> =
+                            child as *const PersistentCell<K> as *mut PersistentCell<K>;
+                        // SAFETY: as above.
+                        let k_ptr: *mut K = unsafe { AsPtr::as_ptr(child_ptr) };
+                        // SAFETY: as above.
+                        let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(k_ptr) };
+                        // SAFETY: as above.
+                        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+                        state_raw as *const () as usize
                     })?;
                     let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
                     // THE MINT (only after BOTH uniqueness levels):
-                    // the raw is claimed; the receiver transient
+                    // the raw is claimed. The raw hops once more — no
+                    // reference is materialized (see `AsPtr`).
+                    let child_ptr: *mut PersistentCell<K> =
+                        child as *const PersistentCell<K> as *mut PersistentCell<K>;
                     // SAFETY: the claims make this thread the sole
                     // driver of both the slot and its content; the
-                    // mint's discipline holds.
-                    let k: &mut K = unsafe { child.as_mut_k() };
-                    let target: &mut K::Target = DerefMut::deref_mut(k);
-                    // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-                    let state_raw = AsPtr::as_ptr(target);
+                    // mint's discipline holds (`as_ptr`'s caller
+                    // obligation).
+                    let k_ptr: *mut K = unsafe { AsPtr::as_ptr(child_ptr) };
+                    // SAFETY: as above.
+                    let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(k_ptr) };
+                    // SAFETY: as above.
+                    let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
                     // SAFETY: as above — the receiver derives from the
                     // claimed raw; transient, dies at return. As in
                     // `over_slot`: the content itself, dispatched through
                     // `HandleAble<V>`.
-                    let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
+                    let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
                     let state_erased: *mut () = state_raw as *mut ();
                     let shared_ref = SharedRef(child_shared.clone());
                     // SAFETY: as above; the child's Shared carries the
@@ -1345,10 +1414,16 @@ mod tests {
 
     type ProbeSlot = Box<PersistentCell<Probe>>;
 
-    /// The key the content claim on `slot`'s content is taken on.
+    /// The key the content claim on `slot`'s content is taken on —
+    /// the two raw hops a claim goes through.
     fn content_address_of(slot: &mut ProbeSlot) -> usize {
-        let target: &mut PersistentCell<Probe> = DerefMut::deref_mut(slot);
-        AsPtr::as_ptr(target) as *const () as usize
+        // SAFETY: `slot` is owned here, so the projections are the only
+        // live access (`as_ptr`'s caller obligation).
+        let target_ptr: *mut PersistentCell<Probe> =
+            unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(*slot)) };
+        // SAFETY: as above.
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        state_raw as *const () as usize
     }
 
     /// The error gate on `replace`: with the replacement's content
