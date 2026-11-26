@@ -110,6 +110,29 @@ impl Drop for ClaimGuard {
     }
 }
 
+/// Take `key` in the claims registry if it is free: `true` when this
+/// call claimed it.
+///
+/// A function on purpose. A `dashmap::Entry` owns its registry shard's
+/// write lock, and the scrutinee of a `match` lives until the `match`
+/// ends — so a waiter that backed off from INSIDE
+/// `match claims.entry(key) { .. }` parked (whenever a checkpoint was
+/// requested) still holding that shard. Every other waiter with a key
+/// in that shard then blocked inside the registry, where it can never
+/// reach a safepoint, and the requester — waiting for that waiter to
+/// park — never released the first: a deadlock. Three subtasks handed
+/// the same cell, plus one checkpoint, were enough. Here the `Entry`
+/// is gone before the caller sees the result.
+fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
+    match claims.entry(key) {
+        dashmap::Entry::Vacant(v) => {
+            let _occupied = v.insert(());
+            true
+        }
+        dashmap::Entry::Occupied(_) => false,
+    }
+}
+
 /// A container slot whose current node a snapshot can read: one
 /// `Deref` from the container to the node (the homogeneous-tree
 /// shape `Box<PersistentCell<T>>`). The read side's vocabulary —
@@ -777,26 +800,21 @@ where
             {
                 let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
                 loop {
-                    match claims.entry(state_raw as *const () as usize) {
-                        dashmap::Entry::Vacant(v) => {
-                            let _occupied = v.insert(());
-                            break;
-                        }
-                        _ => {
-                            if std::time::Instant::now() >= deadline {
-                                // the cycle-breaker abort MUST unwind: the
-                                // ClaimGuards release on unwind (a leak would
-                                // hold the claim forever). It is a
-                                // `resume_unwind`, not a `panic!`: the crate's
-                                // lint policy denies `panic!` here. Unlike
-                                // `panic!` it does not run the panic hook.
-                                let abort: Box<dyn std::any::Any + Send> =
-                                    Box::new(CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD);
-                                std::panic::resume_unwind(abort);
-                            }
-                            self.shared.backoff_checkpoint();
-                        }
+                    if try_claim(&claims, state_raw as *const () as usize) {
+                        break;
                     }
+                    if std::time::Instant::now() >= deadline {
+                        // the cycle-breaker abort MUST unwind: the
+                        // ClaimGuards release on unwind (a leak would
+                        // hold the claim forever). It is a
+                        // `resume_unwind`, not a `panic!`: the crate's
+                        // lint policy denies `panic!` here. Unlike
+                        // `panic!` it does not run the panic hook.
+                        let abort: Box<dyn std::any::Any + Send> =
+                            Box::new(CONTENT_CLAIM_TIMEOUT_REPLACEMENT_PAYLOAD);
+                        std::panic::resume_unwind(abort);
+                    }
+                    self.shared.backoff_checkpoint();
                 }
             }
             let _content_claim = ClaimGuard {
@@ -1143,14 +1161,10 @@ impl<T: Sized> InnerHandle<T> {
                     // the tree (the parent waits for this subtask to
                     // park; a bare sleep never would).
                     let key: usize = child as *const PersistentCell<K> as usize;
-                    loop {
-                        match claims.entry(key) {
-                            dashmap::Entry::Vacant(v) => {
-                                let _occupied = v.insert(());
-                                break;
-                            }
-                            _ => child_shared.backoff_checkpoint(),
-                        }
+                    // the claim is taken through `try_claim`: the registry
+                    // lock is gone before the backoff (which parks)
+                    while !try_claim(&claims, key) {
+                        child_shared.backoff_checkpoint();
                     }
                     // release on unwind or completion — a panicked
                     // subtask must not leave its slot claimed
@@ -1180,23 +1194,18 @@ impl<T: Sized> InnerHandle<T> {
                             let target: &mut K::Target = DerefMut::deref_mut(k);
                             // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
                             let raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
-                            match claims.entry(raw as *const () as usize) {
-                                dashmap::Entry::Vacant(v) => {
-                                    let _occupied = v.insert(());
-                                    break raw;
-                                }
-                                _ => {
-                                    if std::time::Instant::now() >= deadline {
-                                        // as in `replace`: the abort unwinds (the
-                                        // ClaimGuards release on the unwind) and,
-                                        // being a `resume_unwind`, skips the panic hook.
-                                        let abort: Box<dyn std::any::Any + Send> =
-                                            Box::new(CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD);
-                                        std::panic::resume_unwind(abort);
-                                    }
-                                    child_shared.backoff_checkpoint();
-                                }
+                            if try_claim(&claims, raw as *const () as usize) {
+                                break raw;
                             }
+                            if std::time::Instant::now() >= deadline {
+                                // as in `replace`: the abort unwinds (the
+                                // ClaimGuards release on the unwind) and,
+                                // being a `resume_unwind`, skips the panic hook.
+                                let abort: Box<dyn std::any::Any + Send> =
+                                    Box::new(CONTENT_CLAIM_TIMEOUT_CLAIM_PAYLOAD);
+                                std::panic::resume_unwind(abort);
+                            }
+                            child_shared.backoff_checkpoint();
                         }
                     };
                     let _content_claim = ClaimGuard {
@@ -1271,6 +1280,27 @@ mod tests {
 
     /// Both registry tests register exactly two children.
     const REGISTERED_CHILDREN: usize = 2;
+    /// A key whose registry shard the lock check looks at.
+    const PROBE_KEY: usize = 1;
+    /// How many keys the lock check sweeps (exclusive end) — enough that
+    /// some hash to `PROBE_KEY`'s shard at any shard count.
+    const PROBE_SWEEP_END: usize = 4096;
+    /// Keys swept for a leaked registry shard lock.
+    const PROBE_SWEEP: std::ops::Range<usize> = 0..PROBE_SWEEP_END;
+
+    /// A FAILED claim must not leave its registry shard locked: the
+    /// `Entry` — and with it the shard's write lock — is dropped before
+    /// `try_claim` returns. Probed with `try_entry` from the same
+    /// thread: with the shard still held, every key hashing to it would
+    /// be unlockable.
+    #[test]
+    fn a_failed_claim_leaves_no_registry_shard_locked() {
+        let claims = DashMap::new();
+        assert!(try_claim(&claims, PROBE_KEY), "a free key is claimed");
+        assert!(!try_claim(&claims, PROBE_KEY), "a taken key is not claimed twice");
+        let lockable = PROBE_SWEEP.filter(|key| claims.try_entry(*key).is_some()).count();
+        assert_eq!(lockable, PROBE_SWEEP.count(), "some key's shard is still locked");
+    }
 
     /// Two registered children, both listed in the Weak snapshot.
     #[test]
