@@ -1395,9 +1395,14 @@ mod tests {
         children: Vec<PersistentCell<ProbeSlot>>,
     }
 
-    /// The phase's vocabulary: fan out over the children.
+    /// How often a mutator waiting for a snapshot reaches its safepoint.
+    const SNAPSHOT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// The phase's vocabulary: fan out over the children; park for a
+    /// checkpoint.
     trait PhaseVocab: Send {
         fn fan(&mut self, ran: &std::sync::atomic::AtomicBool) -> Result<(), ContentClaimTimeout>;
+        fn park(&mut self);
     }
 
     impl PhaseVocab for InnerHandle<Phase> {
@@ -1411,23 +1416,41 @@ mod tests {
             )?;
             Ok(())
         }
+
+        fn park(&mut self) {
+            self.safepoint();
+        }
+    }
+
+    /// The leaf's value, read through a checkpoint guard: every layer by
+    /// its own `Deref`.
+    fn leaf_through_guard(guard: &CheckpointGuard<'_, Box<PersistentCell<Phase>>>) -> u32 {
+        // guard -> the root cell -> the box's cell -> the phase
+        let inner: &PersistentCell<Phase> = guard;
+        let phase: &Phase = inner;
+        // the child's cell -> the box's cell -> the probe
+        let child: &PersistentCell<ProbeSlot> = phase.children.first().unwrap();
+        let child_inner: &PersistentCell<Probe> = child;
+        child_inner.n
     }
 
     /// The error gate on `fanout`: a child whose content is claimed by
     /// another chain is never minted — its callback does not run — and
-    /// the error returns from the fan-out. Once the claim is free, the
-    /// fan-out runs.
+    /// the error returns from the fan-out. The point of the gate: the
+    /// tree is whole when the caller gets the error — a checkpoint can
+    /// still stop the world and read the leaf through the guard. Once the
+    /// claim is free, the fan-out runs.
     #[test]
-    fn fanout_gives_up_through_the_error_gate_without_minting_the_child() {
+    fn fanout_gives_up_through_the_error_gate_and_the_tree_can_still_be_snapshotted() {
         let mut child: ProbeSlot = Box::new(PersistentCell::new(Probe { n: ORIGINAL }));
         let content_key = content_address_of(&mut child);
         let mut root =
             PersistentCell::new(Box::new(PersistentCell::new(Phase { children: vec![PersistentCell::new(child)] })));
         let ran = std::sync::atomic::AtomicBool::new(false);
         let observed = &ran;
-        let (outcome, ran_while_claimed, second) = independent_task_root(
+        let (outcome, ran_while_claimed, snapshot, second) = independent_task_root(
             &mut root,
-            |mut outer: OuterHandle<'_, Box<PersistentCell<Phase>>, dyn PhaseVocab>, _ck| {
+            |mut outer: OuterHandle<'_, Box<PersistentCell<Phase>>, dyn PhaseVocab>, checkpointer| {
                 // the other chain: whoever holds the claim on the child's
                 // content — so TAKE the claim, and hold it
                 let claims = Arc::clone(&outer.shared.claims);
@@ -1436,12 +1459,32 @@ mod tests {
                 let outcome = outer.fan(observed);
                 let ran_while_claimed = observed.load(std::sync::atomic::Ordering::SeqCst);
                 drop(held);
+                // the snapshot: from a checker thread, as a snapshotter
+                // would, while this thread keeps reaching its safepoint
+                let seen: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+                std::thread::scope(|scope| {
+                    let checkpointer = checkpointer.clone();
+                    let reported = Arc::clone(&seen);
+                    let checker = scope.spawn(move || {
+                        let guard = checkpointer.request();
+                        let leaf = leaf_through_guard(&guard);
+                        drop(guard);
+                        *reported.lock().unwrap_or_else(|e| e.into_inner()) = Some(leaf);
+                    });
+                    while seen.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
+                        outer.park();
+                        std::thread::sleep(SNAPSHOT_POLL);
+                    }
+                    checker.join().expect("checker panicked");
+                });
+                let snapshot = *seen.lock().unwrap_or_else(|e| e.into_inner());
                 let second = outer.fan(observed);
-                (outcome, ran_while_claimed, second)
+                (outcome, ran_while_claimed, snapshot, second)
             },
         );
         assert_eq!(outcome, Err(ContentClaimTimeout));
         assert!(!ran_while_claimed, "the child's callback never ran");
+        assert_eq!(snapshot, Some(ORIGINAL), "and the checkpoint read the untouched leaf");
         assert_eq!(second, Ok(()));
         assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "and it runs once the claim is free");
     }
