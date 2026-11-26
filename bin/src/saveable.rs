@@ -35,7 +35,8 @@ impl Trait for InnerHandle<MyStruct> {
         let sums: Vec<i32> = self.fanout(
             &|m: &MyStruct| m.children.iter().collect(),
             |mut o| o.bark(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         self.safepoint();
         sums.iter().sum()
     }
@@ -83,7 +84,7 @@ fn main() {
             println!("sum: {}", first);
             // the install, K directly:
             let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn SaveAble>);
-            outer.replace(successor);
+            outer.replace(successor).expect("the cycle breaker does not fire here");
             let second = outer.bark();
             println!("sum: {}", second);
             checker.join().expect("checker");

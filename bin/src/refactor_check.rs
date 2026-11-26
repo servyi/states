@@ -57,7 +57,8 @@ impl Trait for InnerHandle<Machine> {
         self.fanout(
             &|m: &Machine| m.children.iter().collect(),
             |mut o| o.step(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         // the SAFETY POINT: the checker's requests land here
         self.safepoint();
     }
@@ -66,7 +67,8 @@ impl Trait for InnerHandle<Machine> {
         let obs: Vec<String> = self.fanout(
             &|m: &Machine| m.children.iter().collect(),
             |mut o| o.observe(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         obs.join("+")
     }
 
@@ -79,7 +81,8 @@ impl Trait for InnerHandle<Machine> {
         self.fanout(
             &|m: &Machine| m.children.iter().collect(),
             |mut o| o.observe(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         self.safepoint();
     }
 }
@@ -208,7 +211,7 @@ fn main() {
                 }
                 println!("[driver] reference trace: {:?}", trace);
                 // 5: MID-RUN ROLLBACK to the baseline snapshot
-                outer.replace(restore(&snap0));
+                outer.replace(restore(&snap0)).expect("the cycle breaker does not fire here");
                 outer.step();
                 let after = outer.observe();
                 println!("[driver] rollback -> step -> {} (reference step 1: {})", after, trace[0]);

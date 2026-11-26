@@ -32,7 +32,8 @@ impl Trait for InnerHandle<MyStruct> {
             // outlives the call; each child's bark result rides the
             // Vec<R> back
             |mut o| o.bark(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         // the SAFETY POINT: park here while a checkpoint runs
         self.safepoint();
         sums.iter().sum()
@@ -44,7 +45,8 @@ impl Trait for InnerHandle<MyStruct> {
         let results: Vec<i32> = self.fanout(
             &|m: &MyStruct| vec![&m.children[0], &m.children[0]],
             |mut o| o.bark(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         // duplicates now SERIALIZE on the global claims registry:
         // both subtasks run, one after the other
         assert_eq!(results.len(), 2, "duplicates serialize, both run");
@@ -95,7 +97,7 @@ fn main() {
             // current inner handle, swaps it, re-mints, keeps the fresh one
             let successor: Slot =
                 PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }));
-            outer.replace(successor);
+            outer.replace(successor).expect("the cycle breaker does not fire here");
             let second = outer.bark();
             println!("sum: {}", second);
             checker.join().expect("checker panicked");

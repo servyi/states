@@ -120,6 +120,36 @@ fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
     }
 }
 
+/// THE CONTENT CLAIM (level 2), bounded: take the claim whose key
+/// `content_address` yields, waiting while another chain holds it — but
+/// only for `CONTENT_CLAIM_WINDOW`. Unlike cell claims (which resolve
+/// when the owning subtask ends), content waits can form cross-claim
+/// cycles and intrathread self-deadlocks, so when the window runs out
+/// this gives up — the cycle breaker: the caller gets a
+/// `ContentClaimTimeout` and nothing has been minted or installed.
+///
+/// The address is asked for afresh on every attempt: the borrow it is
+/// taken through must not live across the park in `backoff_checkpoint`
+/// (no `&mut` exists to any node while the world is stopped). The key
+/// actually claimed comes back — the caller releases it when it is done.
+fn claim_content(
+    claims: &DashMap<usize, ()>,
+    shared: &Shared,
+    content_address: impl Fn() -> usize,
+) -> Result<usize, ContentClaimTimeout> {
+    let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
+    loop {
+        let key = content_address();
+        if try_claim(claims, key) {
+            return Ok(key);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ContentClaimTimeout);
+        }
+        shared.backoff_checkpoint();
+    }
+}
+
 /// The opaque shell for `Arc<Shared>` that crosses the one public
 /// signature which needs it (`box_innerhandle`): `Shared` itself is
 /// crate-private, and the shell's field is private, so no client can
@@ -144,12 +174,35 @@ const JOIN_POLL_INTERVAL_MS: u64 = 1;
 /// being short.
 const REQUEST_WAIT_MS: u64 = 10;
 
-/// How long a LEVEL-2 (content) claim may wait before panicking.
-/// Unlike cell claims (which resolve when the owning subtask ends),
-/// content waits can form cross-claim cycles and intrathread
-/// self-deadlocks — the bounded window turns those into a
-/// deterministic abort instead of a silent hang.
+/// How long a LEVEL-2 (content) claim may wait before the cycle breaker
+/// gives up. Unlike cell claims (which resolve when the owning subtask
+/// ends), content waits can form cross-claim cycles and intrathread
+/// self-deadlocks — the bounded window turns those into a deterministic
+/// `ContentClaimTimeout` instead of a silent hang.
 const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The cycle breaker, as an ERROR GATE: a content claim was still held
+/// by another chain when `CONTENT_CLAIM_WINDOW` ran out — a
+/// cross-claim cycle, or an intrathread self-deadlock.
+///
+/// The call that returns it minted and installed nothing, so the tree
+/// is as it was: the caller can take a snapshot, turn the agent down,
+/// and repair it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentClaimTimeout;
+
+/// What `ContentClaimTimeout` says.
+const CONTENT_CLAIM_TIMEOUT_MESSAGE: &str =
+    "content claim timeout: the state is still driven by another chain \
+     (cross-claim cycle or self-deadlock)";
+
+impl std::fmt::Display for ContentClaimTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(CONTENT_CLAIM_TIMEOUT_MESSAGE)
+    }
+}
+
+impl std::error::Error for ContentClaimTimeout {}
 
 impl Shared {
     fn new() -> Self {
@@ -628,24 +681,54 @@ where
         OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
-    /// The successor install: write the K cell THIS handle owns
-    /// (typed — no casting), then re-mint through the replacement's
-    /// `HandleAble` and keep the fresh handle in the box. The chain
-    /// survives: the outer's `Shared` passes on to the successor,
-    /// so parking identity is untouched.
-    pub fn replace(&mut self, val: K) {
-        // 1) the swap — plain assignment through the typed slot
+    /// The successor install: claim the replacement's content, write the
+    /// K cell THIS handle owns (typed — no casting), then re-mint
+    /// through the replacement's `HandleAble` and keep the fresh handle
+    /// in the box. The chain survives: the outer's `Shared` passes on to
+    /// the successor, so parking identity is untouched.
+    ///
+    /// # Errors
+    ///
+    /// `ContentClaimTimeout` when the replacement's content is still
+    /// driven by another chain after `CONTENT_CLAIM_WINDOW`. Nothing has
+    /// been written in that case — the slot and this handle are exactly
+    /// as they were.
+    pub fn replace(&mut self, mut val: K) -> Result<(), ContentClaimTimeout> {
+        // 1) THE CONTENT CLAIM, on the tree-wide registry, BEFORE
+        // anything is written. An error gate has to leave the tree as it
+        // was: with the install first, a lost claim would return from
+        // here with this handle's inner handle pointing into the old K —
+        // freed by the write.
+        //    The key is the replacement's content address as read from
+        // `val` where it stands. Content another chain can be driving is
+        // reached through a pointer inside the container (it has to be,
+        // for two containers to share it), so its address is the same
+        // here and in the slot — the key the re-mint below mints under.
+        // Content that lives inline in its container cannot be shared,
+        // so no other chain can hold a claim on it either way.
+        //    Two hops, not three: `val` IS the container, it is not
+        // behind a slot's hatch yet. No reference is materialized (see
+        // `AsPtr`).
+        // SAFETY: `val` is owned here, so the projections are the only
+        // live access (as_ptr's caller obligation).
+        let content_key: usize = {
+            let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(val)) };
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+            state_raw as *const () as usize
+        };
+        let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
+        let claimed = claim_content(&claims, &self.shared, || content_key)?;
+        let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: claimed };
+        // 2) the swap — plain assignment through the typed slot
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
         // replaced by the re-mint below, so no stale pointer
         // survives the write).
         unsafe { *self.slot = PersistentCell::new(val) };
-        // 2) re-mint: use the HandleAble OF the replacement —
+        // 3) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (the slot's own
         // AsPtr hatch, consulted once) — to mint a fresh InnerHandle
         // over that same slot, and assign it into the own box
-        // SAFETY: the mint's discipline over the fresh slot content;
-        // the receiver comes off the slot raw this handle owns.
         let fresh: Box<V> = {
             // the raw hops — the slot's hatch, the box's stored line,
             // the content's line; no reference is materialized (see
@@ -658,32 +741,6 @@ where
                 AsPtr::as_ptr(k_ptr)
             };
             let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
-            // THE CONTENT CLAIM, on the SAME map: a replacement whose
-            // content is aliased with another live chain waits — but
-            // bounded: content waits can form claim cycles and
-            // self-deadlocks, so after the window this PANICS (the
-            // deterministic abort) instead of hanging.
-            let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
-            {
-                let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
-                loop {
-                    if try_claim(&claims, state_raw as *const () as usize) {
-                        break;
-                    }
-                    if std::time::Instant::now() >= deadline {
-                        panic!(
-                            "content claim timeout: replacement content is still \
-                             driven by another chain (cross-claim cycle or \
-                             self-deadlock)"
-                        );
-                    }
-                    self.shared.backoff_checkpoint();
-                }
-            }
-            let _content_claim = ClaimGuard {
-                claims: Arc::clone(&claims),
-                key: state_raw as *const () as usize,
-            };
             // SAFETY: the upcast raw derives from the slot's own
             // as_ptr line; transient receiver, dies at return. It is
             // the content itself, dispatched through `HandleAble<V>`.
@@ -692,6 +749,7 @@ where
             unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
         self.current = fresh;
+        Ok(())
     }
 }
 
@@ -936,11 +994,23 @@ impl<T: Sized> InnerHandle<T> {
     /// leave the callback at all — strictly stronger than branding
     /// it with the root task's `'o`, which is why fanout no longer
     /// carries an `'o` of its own.
+    ///
+    /// # Errors
+    ///
+    /// `ContentClaimTimeout` when a child's content is still driven by
+    /// another chain after `CONTENT_CLAIM_WINDOW` — the cycle breaker.
+    /// That child was never minted and its callback never ran; every
+    /// other child has finished by then, since the results are collected
+    /// only once all of them have.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a child that panicked.
     pub fn fanout<V: ?Sized + Send + 'static, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
-    ) -> Vec<R>
+    ) -> Result<Vec<R>, ContentClaimTimeout>
     where
         T: Send,
         K: AsPtr + Sized + Send + 'static,
@@ -991,7 +1061,7 @@ impl<T: Sized> InnerHandle<T> {
             let mut joins = Vec::with_capacity(prepared.len());
             for (child, child_shared) in prepared {
                 let claims = Arc::clone(&claims);
-                joins.push(scope.spawn(move || {
+                joins.push(scope.spawn(move || -> Result<R, ContentClaimTimeout> {
                     // THE GLOBAL CLAIM: insert-retry with a short backoff.
                     // The Shared is preallocated and registered BEFORE
                     // this loop — so on each failed attempt the
@@ -1009,7 +1079,7 @@ impl<T: Sized> InnerHandle<T> {
                     // release on unwind or completion — a panicked
                     // subtask must not leave its slot claimed
                     let _claim = ClaimGuard { claims: Arc::clone(&claims), key };
-                    // LEVEL 2 — the CONTENT claim, on the SAME map:
+                    // LEVEL 2 — THE CONTENT CLAIM, on the SAME map:
                     // de-duplicate on the `AsPtr` raw of the containee
                     // (two distinct cells holding container values that
                     // deref to the same content — a Copy/index
@@ -1019,50 +1089,45 @@ impl<T: Sized> InnerHandle<T> {
                     // form CROSS-CLAIM CYCLES (A holds content x wants
                     // y; B holds y wants x) and INTRATHREAD SELF-
                     // DEADLOCKS (a nested fanout re-claiming content
-                    // its own ancestor already holds) — so after the
-                    // bounded window this PANICS: a deterministic
-                    // abort instead of a silent deadlock.
-                    let state_raw = {
-                        let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
-                        loop {
-                            // the raw hops re-run per attempt; nothing
-                            // is driven until the claim succeeds — no
-                            // reference is materialized (see `AsPtr`).
-                            // SAFETY: the CELL claim above makes this
-                            // thread the sole driver of the slot (the
-                            // mint's discipline; as_ptr's caller
-                            // obligation); the shared-to-raw cast is
-                            // the split's own hand-off.
-                            let child_ptr: *mut PersistentCell<K> =
-                                child as *const PersistentCell<K> as *mut PersistentCell<K>;
-                            let target_ptr: *mut K::Target = unsafe {
-                                let k_ptr = AsPtr::as_ptr(child_ptr);
-                                AsPtr::as_ptr(k_ptr)
-                            };
-                            let raw = unsafe { AsPtr::as_ptr(target_ptr) };
-                            if try_claim(&claims, raw as *const () as usize) {
-                                break raw;
-                            }
-                            if std::time::Instant::now() >= deadline {
-                                panic!(
-                                    "content claim timeout: the same state is still \
-                                     driven by another chain (cross-claim cycle or \
-                                     self-deadlock)"
-                                );
-                            }
-                            child_shared.backoff_checkpoint();
-                        }
-                    };
-                    let _content_claim = ClaimGuard {
-                        claims: Arc::clone(&claims),
-                        key: state_raw as *const () as usize,
-                    };
+                    // its own ancestor already holds) — so the wait is
+                    // bounded, and when the window runs out this child
+                    // gives up through the error gate: nothing is
+                    // minted, and the error returns from the fan-out.
+                    // The claim is released when this subtask returns.
+                    let content_key = claim_content(&claims, &child_shared, || {
+                        // the raw hops re-run per attempt; nothing is
+                        // driven until the claim succeeds — no reference
+                        // is materialized (see `AsPtr`).
+                        // SAFETY: the CELL claim above makes this thread
+                        // the sole driver of the slot (the mint's
+                        // discipline; as_ptr's caller obligation); the
+                        // shared-to-raw cast is the split's own hand-off.
+                        let child_ptr: *mut PersistentCell<K> =
+                            child as *const PersistentCell<K> as *mut PersistentCell<K>;
+                        let target_ptr: *mut K::Target = unsafe {
+                            let k_ptr = AsPtr::as_ptr(child_ptr);
+                            AsPtr::as_ptr(k_ptr)
+                        };
+                        let raw = unsafe { AsPtr::as_ptr(target_ptr) };
+                        raw as *const () as usize
+                    })?;
+                    let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
                     // THE MINT (only after BOTH uniqueness levels):
-                    // the raw is claimed; the receiver transient
-                    // SAFETY: the claims make this thread the sole
-                    // driver of both the slot and its content; the
-                    // mint's discipline holds. It is the content itself,
-                    // dispatched through `HandleAble<V>`.
+                    // the raw is claimed. The raw hops once more — no
+                    // reference is materialized (see `AsPtr`).
+                    // SAFETY: the claims make this thread the sole driver
+                    // of both the slot and its content; the mint's
+                    // discipline holds (as_ptr's caller obligation).
+                    let child_ptr: *mut PersistentCell<K> =
+                        child as *const PersistentCell<K> as *mut PersistentCell<K>;
+                    let target_ptr: *mut K::Target = unsafe {
+                        let k_ptr = AsPtr::as_ptr(child_ptr);
+                        AsPtr::as_ptr(k_ptr)
+                    };
+                    let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+                    // SAFETY: as above — the receiver derives from the
+                    // claimed raw; transient, dies at return. It is
+                    // the content itself, dispatched through `HandleAble<V>`.
                     let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
@@ -1075,7 +1140,7 @@ impl<T: Sized> InnerHandle<T> {
                         shared: child_shared,
                         _brand: PhantomData,
                     };
-                    f(outer)
+                    Ok(f(outer))
                 }));
             }
             loop {
@@ -1087,7 +1152,8 @@ impl<T: Sized> InnerHandle<T> {
                 }
                 std::thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
-            // all finished: join in order, propagate a panicked child
+            // all finished: join in order. A child's error gate is the
+            // fan-out's error; a child that panicked is re-raised here.
             joins
                 .into_iter()
                 .map(|j| j.join().expect("panicked child"))
@@ -1131,6 +1197,161 @@ mod tests {
         assert!(!try_claim(&claims, 1), "a taken key is not claimed twice");
         let lockable = (0..4096).filter(|key| claims.try_entry(*key).is_some()).count();
         assert_eq!(lockable, 4096, "some key's shard is still locked");
+    }
+
+    /// A state the vocabulary below can read through its handle.
+    struct Probe {
+        n: u32,
+    }
+
+    trait ProbeVocab: Send {
+        fn read(&mut self) -> u32;
+    }
+
+    impl ProbeVocab for InnerHandle<Probe> {
+        fn read(&mut self) -> u32 {
+            self.n
+        }
+    }
+
+    type ProbeSlot = Box<PersistentCell<Probe>>;
+
+    /// The key the content claim on `slot`'s content is taken on —
+    /// the two raw hops a claim goes through.
+    fn content_address_of(slot: &mut ProbeSlot) -> usize {
+        let target_ptr: *mut PersistentCell<Probe> = unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(*slot)) };
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        state_raw as *const () as usize
+    }
+
+    /// The error gate on `replace`: with the replacement's content
+    /// claimed by another chain, `replace` gives up after
+    /// `CONTENT_CLAIM_WINDOW` — and the slot and the handle are exactly
+    /// as they were: the old state is still the one installed and
+    /// driven. Once the claim is free, the replacement is installed.
+    #[test]
+    fn replace_gives_up_through_the_error_gate_and_changes_nothing() {
+        let mut root = PersistentCell::new(Box::new(PersistentCell::new(Probe { n: 1 })));
+        let (during, outcome, waited, after) = independent_task_root(
+            &mut root,
+            |mut outer: OuterHandle<'_, ProbeSlot, dyn ProbeVocab>, _checkpointer| {
+                let mut replacement = Box::new(PersistentCell::new(Probe { n: 2 }));
+                // the other chain: whoever holds the claim on the
+                // replacement's content — so TAKE the claim, and hold it
+                let claims = Arc::clone(&outer.shared.claims);
+                let key = content_address_of(&mut replacement);
+                assert!(try_claim(&claims, key), "the stand-in takes the claim");
+                let held = ClaimGuard { claims: Arc::clone(&claims), key };
+                let started = std::time::Instant::now();
+                let outcome = outer.replace(replacement);
+                let waited = started.elapsed();
+                let during = outer.read();
+                drop(held);
+                outer.replace(Box::new(PersistentCell::new(Probe { n: 2 }))).unwrap();
+                (during, outcome, waited, outer.read())
+            },
+        );
+        assert_eq!(during, 1, "a lost claim leaves the old state installed and driven");
+        assert_eq!(outcome, Err(ContentClaimTimeout));
+        assert!(waited >= CONTENT_CLAIM_WINDOW, "it waited the window first");
+        assert_eq!(after, 2, "and the replacement installs once the claim is free");
+    }
+
+    /// How often a mutator waiting for a snapshot reaches its safepoint.
+    const SNAPSHOT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// A fan-out phase of probes, for the vocabulary below.
+    struct Phase {
+        children: Vec<PersistentCell<ProbeSlot>>,
+    }
+
+    trait PhaseVocab: Send {
+        fn fan(&mut self, ran: &std::sync::atomic::AtomicBool) -> Result<(), ContentClaimTimeout>;
+        fn park(&mut self);
+    }
+
+    impl PhaseVocab for InnerHandle<Phase> {
+        fn fan(&mut self, ran: &std::sync::atomic::AtomicBool) -> Result<(), ContentClaimTimeout> {
+            self.fanout(
+                &|phase: &Phase| phase.children.iter().collect(),
+                |mut child: OuterHandle<'_, ProbeSlot, dyn ProbeVocab>| {
+                    let saw_a_state = child.read() == 1;
+                    ran.store(saw_a_state, std::sync::atomic::Ordering::SeqCst);
+                },
+            )?;
+            Ok(())
+        }
+
+        fn park(&mut self) {
+            self.safepoint();
+        }
+    }
+
+    /// The leaf's value, read through a checkpoint guard: every layer by
+    /// its own `Deref`.
+    fn leaf_through_guard(guard: &CheckpointGuard<'_, Box<PersistentCell<Phase>>>) -> u32 {
+        // guard -> the root cell -> the box's cell -> the phase
+        let inner: &PersistentCell<Phase> = guard;
+        let phase: &Phase = inner;
+        // the child's cell -> the box's cell -> the probe
+        let child: &PersistentCell<ProbeSlot> = phase.children.first().unwrap();
+        let child_inner: &PersistentCell<Probe> = child;
+        child_inner.n
+    }
+
+    /// The error gate on `fanout`: a child whose content is claimed by
+    /// another chain is never minted — its callback does not run — and
+    /// the error returns from the fan-out. The point of the gate: the
+    /// tree is whole when the caller gets the error — a checkpoint can
+    /// still stop the world and read the leaf through the guard. Once
+    /// the claim is free, the fan-out runs.
+    #[test]
+    fn fanout_gives_up_through_the_error_gate_and_the_tree_can_still_be_snapshotted() {
+        let mut child: ProbeSlot = Box::new(PersistentCell::new(Probe { n: 1 }));
+        let content_key = content_address_of(&mut child);
+        let mut root =
+            PersistentCell::new(Box::new(PersistentCell::new(Phase { children: vec![PersistentCell::new(child)] })));
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let observed = &ran;
+        let (outcome, ran_while_claimed, snapshot, second) = independent_task_root(
+            &mut root,
+            |mut outer: OuterHandle<'_, Box<PersistentCell<Phase>>, dyn PhaseVocab>, checkpointer| {
+                // the other chain: whoever holds the claim on the child's
+                // content — so TAKE the claim, and hold it
+                let claims = Arc::clone(&outer.shared.claims);
+                assert!(try_claim(&claims, content_key), "the stand-in takes the claim");
+                let held = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
+                let outcome = outer.fan(observed);
+                let ran_while_claimed = observed.load(std::sync::atomic::Ordering::SeqCst);
+                drop(held);
+                // the snapshot: from a checker thread, as a snapshotter
+                // would, while this thread keeps reaching its safepoint
+                let seen: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+                std::thread::scope(|scope| {
+                    let checkpointer = checkpointer.clone();
+                    let reported = Arc::clone(&seen);
+                    let checker = scope.spawn(move || {
+                        let guard = checkpointer.request();
+                        let leaf = leaf_through_guard(&guard);
+                        drop(guard);
+                        *reported.lock().unwrap() = Some(leaf);
+                    });
+                    while seen.lock().unwrap().is_none() {
+                        outer.park();
+                        std::thread::sleep(SNAPSHOT_POLL);
+                    }
+                    checker.join().unwrap();
+                });
+                let snapshot = *seen.lock().unwrap();
+                let second = outer.fan(observed);
+                (outcome, ran_while_claimed, snapshot, second)
+            },
+        );
+        assert_eq!(outcome, Err(ContentClaimTimeout));
+        assert!(!ran_while_claimed, "the child's callback never ran");
+        assert_eq!(snapshot, Some(1), "and the checkpoint read the untouched leaf");
+        assert_eq!(second, Ok(()));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "and it runs once the claim is free");
     }
 
     /// Two registered children, both listed in the Weak snapshot.

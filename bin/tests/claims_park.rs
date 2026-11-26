@@ -60,7 +60,8 @@ impl Vocab for InnerHandle<Root> {
                 root.children.iter().flat_map(|child| [child; 3]).collect()
             },
             |mut outer| outer.step(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
     }
 }
 

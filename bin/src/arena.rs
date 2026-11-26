@@ -128,7 +128,8 @@ impl Trait for InnerHandle<Machine> {
         self.fanout(
             &|m: &Machine| m.children.iter().collect(),
             |mut o: OuterHandle<'_, ArenaSlot, dyn Trait>| o.step(),
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         self.safepoint();
     }
     fn observe(&mut self) -> String {
@@ -138,6 +139,7 @@ impl Trait for InnerHandle<Machine> {
                 &|m: &Machine| m.children.iter().collect(),
                 |mut o| o.observe(),
             )
+            .expect("the cycle breaker does not fire here")
             .into_iter()
             .collect();
         format!("M({}, [{}])", self.steps, kids.join(","))

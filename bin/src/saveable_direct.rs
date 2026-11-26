@@ -39,10 +39,11 @@ impl Trait for InnerHandle<MyStruct> {
                 // outer, constructs the successor K at the call site,
                 // and swaps its own subtree from its own thread
                 let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 99 }) as Box<dyn SaveAble>);
-                o.replace(successor);
+                o.replace(successor).expect("the cycle breaker does not fire here");
                 o.bark()
             },
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         self.safepoint();
         sums.iter().sum()
     }
@@ -87,7 +88,7 @@ fn main() {
             let first = outer.bark();
             println!("sum: {} (99+99: the children replaced themselves)", first);
             let successor: SaveSlot = PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn SaveAble>);
-            outer.replace(successor);
+            outer.replace(successor).expect("the cycle breaker does not fire here");
             let second = outer.bark();
             println!("sum: {}", second);
             checker.join().expect("checker");

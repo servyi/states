@@ -58,10 +58,11 @@ impl Trait for InnerHandle<MyStruct> {
                 // the child installs a successor built with the
                 // CLIENT'S constructor — the library never constructs
                 let successor = CustomBox(PersistentCell::from_boxed(Box::new(YourStruct { val: 99 }) as Box<dyn HandleAble<dyn Trait>>));
-                o.replace(successor);
+                o.replace(successor).expect("the cycle breaker does not fire here");
                 o.bark()
             },
-        );
+        )
+        .expect("the cycle breaker does not fire here");
         self.safepoint();
         sums.iter().sum()
     }
@@ -89,7 +90,7 @@ fn main() {
         println!("sum: {} (children replaced themselves)", first);
         // the ROOT install with the client's constructor
         let successor = CustomBox(PersistentCell::from_boxed(Box::new(YourStruct { val: 42 }) as Box<dyn HandleAble<dyn Trait>>));
-        outer.replace(successor);
+        outer.replace(successor).expect("the cycle breaker does not fire here");
         let second = outer.bark();
         println!("sum: {}", second);
         println!("custom drops so far: {}", DROPS.load(Ordering::SeqCst));
