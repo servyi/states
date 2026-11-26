@@ -522,7 +522,7 @@ pub fn independent_task_root<K, V: ?Sized + 'static, R>(
 where
     K: AsPtr + Sized + Send + 'static,
     K::Target: AsPtr + 'static,
-    <K::Target as AsPtr>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
+    <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -573,7 +573,7 @@ impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
     K: AsPtr + Send + 'static,
     K::Target: AsPtr + 'static,
-    <K::Target as AsPtr>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
+    <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
@@ -617,8 +617,10 @@ where
             let k_ptr = AsPtr::as_ptr(slot);
             AsPtr::as_ptr(k_ptr)
         };
-        let state_raw: *mut dyn HandleAble<V> = unsafe { AsPtr::as_ptr(target_ptr) };
-        let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        // the CONTENT, bounded only by `HandleAble<V>`: the mint
+        // dispatches through that trait — never through `dyn HandleAble<V>`
+        let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         // SAFETY: the receiver came from this slot (the contract).
@@ -655,7 +657,7 @@ where
                 let k_ptr = AsPtr::as_ptr(self.slot);
                 AsPtr::as_ptr(k_ptr)
             };
-            let state_raw: *mut dyn HandleAble<V> = unsafe { AsPtr::as_ptr(target_ptr) };
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
             // THE CONTENT CLAIM, on the SAME map: a replacement whose
             // content is aliased with another live chain waits — but
             // bounded: content waits can form claim cycles and
@@ -683,8 +685,9 @@ where
                 key: state_raw as *const () as usize,
             };
             // SAFETY: the upcast raw derives from the slot's own
-            // as_ptr line; transient receiver, dies at return.
-            let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+            // as_ptr line; transient receiver, dies at return. It is
+            // the content itself, dispatched through `HandleAble<V>`.
+            let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
             // SAFETY: the mint's discipline over the fresh content.
             unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
@@ -723,9 +726,9 @@ where
 /// (foreign trait, foreign type — E0210). For a CONCRETE state `T`
 /// as a slot target (`Box<T>` children), the client writes their own
 /// one-line identity impl (`unsafe impl AsPtr for MyState { type
-/// Target = dyn HandleAble<V>; unsafe fn as_ptr(this: *mut Self) ->
-/// *mut Self::Target { this } }`) — orphan-legal for their local
-/// type, and unable to overlap ours.
+/// Target = MyState; unsafe fn as_ptr(this: *mut Self) -> *mut
+/// Self::Target { this } }`) — orphan-legal for their local type, and
+/// unable to overlap ours.
 pub unsafe trait AsPtr {
     /// The line this container hands out: the store its own
     /// `Deref`/`DerefMut` spring from.
@@ -942,7 +945,7 @@ impl<T: Sized> InnerHandle<T> {
         T: Send,
         K: AsPtr + Sized + Send + 'static,
         K::Target: AsPtr + 'static,
-        <K::Target as AsPtr>::Target: HandleAble<V> + Unsize<dyn HandleAble<V>> + 'static,
+        <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -1019,7 +1022,7 @@ impl<T: Sized> InnerHandle<T> {
                     // its own ancestor already holds) — so after the
                     // bounded window this PANICS: a deterministic
                     // abort instead of a silent deadlock.
-                    let state_raw: *mut dyn HandleAble<V> = {
+                    let state_raw = {
                         let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
                         loop {
                             // the raw hops re-run per attempt; nothing
@@ -1036,7 +1039,7 @@ impl<T: Sized> InnerHandle<T> {
                                 let k_ptr = AsPtr::as_ptr(child_ptr);
                                 AsPtr::as_ptr(k_ptr)
                             };
-                            let raw: *mut dyn HandleAble<V> = unsafe { AsPtr::as_ptr(target_ptr) };
+                            let raw = unsafe { AsPtr::as_ptr(target_ptr) };
                             if try_claim(&claims, raw as *const () as usize) {
                                 break raw;
                             }
@@ -1058,8 +1061,9 @@ impl<T: Sized> InnerHandle<T> {
                     // the raw is claimed; the receiver transient
                     // SAFETY: the claims make this thread the sole
                     // driver of both the slot and its content; the
-                    // mint's discipline holds.
-                    let erased: &mut dyn HandleAble<V> = unsafe { &mut *state_raw };
+                    // mint's discipline holds. It is the content itself,
+                    // dispatched through `HandleAble<V>`.
+                    let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
                     // SAFETY: as above; the child's Shared carries the
                     // inherited registry and the registration.
                     let current = unsafe {
