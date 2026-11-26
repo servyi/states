@@ -9,7 +9,7 @@ use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use hslib::{Checkpointer, PersistentCell, HandleAble, InnerHandle, OuterHandle, independent_task_root};
+use hslib::{AsPtr, Checkpointer, PersistentCell, HandleAble, InnerHandle, OuterHandle, independent_task_root};
 
 trait Trait: Send {
     fn step(&mut self);
@@ -100,8 +100,17 @@ impl DerefMut for ArenaSlot {
 // spring from (its data component carries the allocation's
 // provenance — no freshly minted reference); and entries are never
 // removed, so the backing store outlives every handle.
-// (the AsPtr impl is retired — the lib's K bound dropped it in the
-// no-as_ptr shape; the mint rides deref_mut, counted below)
+unsafe impl AsPtr for ArenaSlot {
+    type Target = PersistentCell<dyn SaveAble>;
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut Self::Target {
+        // SAFETY: `this` is a live slot under the minter's exclusivity;
+        // the registry entry is live for the program's life (the
+        // never-remove discipline), so the reassembled fat pointer IS
+        // the store line itself — returned raw, no fresh reference.
+        unsafe { (*this).fat() }
+    }
+}
 
 struct Machine {
     children: Vec<PersistentCell<ArenaSlot>>,
@@ -199,12 +208,18 @@ fn main() {
         distinct.sort();
         distinct.dedup();
         assert_eq!(distinct.len(), snaps.len(), "snapshots must show progress");
-        // the container's derefs were actually exercised
+        // the container's DerefMut is NOT exercised anymore: the mint
+        // projects through `AsPtr` raws only — a materialized `&mut`
+        // on the mint path would go Unique on the first write and
+        // freeze on the guard's read (the historical TB failure at the
+        // write-save-write ride above). The counter doubles as a
+        // canary: any DerefMut reintroduced on the mint path shows
+        // here. The SHARED Deref stays: the reader's guard legitimately
+        // derefs the container (schedule-dependent count).
         let dm = DEREF_MUT_CALLS.load(Ordering::Relaxed);
         let d = DEREF_CALLS.load(Ordering::Relaxed);
-        assert!(dm > 0, "DerefMut was never called (the mints bypass it?)");
-        assert!(d > 0, "Deref was never called");
-        println!("DerefMut calls: {}, Deref calls: {}", dm, d);
+        assert_eq!(dm, 0, "DerefMut on the mint path (raws only — a mint &mut freezes under Tree Borrows)");
+        println!("DerefMut calls: {}, Deref calls: {} (the mint is raw-only: DerefMut must stay 0)", dm, d);
         println!("final: {}", outer.observe());
     });
 }

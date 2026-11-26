@@ -2,9 +2,8 @@
 //! `*slot = val` place assignment must dispose the old value through
 //! the container's own drop glue and move the new one in.
 
-use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU32, Ordering};
-use hslib::{PersistentCell, HandleAble, InnerHandle, independent_task_root};
+use hslib::{AsPtr, PersistentCell, HandleAble, InnerHandle, independent_task_root};
 
 trait Trait: Send {
     fn bark(&mut self) -> i32;
@@ -22,17 +21,25 @@ impl Drop for CustomBox {
     }
 }
 
-// the container: derefs to its boxed cell — the cell impl covers the
-// AsPtr bound with zero client unsafe
-impl Deref for CustomBox {
+// the container: a wrapper around a boxed cell. Its AsPtr impl does
+// NOT go through a Deref (a Deref would hand out a fresh reference):
+// the raw borrow of the builtin box-deref place on the wrapper's own
+// field loads the box's STORED pointer — the line a Deref would hand
+// out, minus the reference.
+// SAFETY: the backing store lives until the counted Drop runs — and
+// dropping requires the `&mut` the minter's discipline already holds,
+// so no minted raw dangles early.
+unsafe impl AsPtr for CustomBox {
     type Target = PersistentCell<dyn HandleAble<dyn Trait>>;
-    fn deref(&self) -> &Self::Target {
-        &*self.0
-    }
-}
-impl DerefMut for CustomBox {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut *self.0
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut Self::Target {
+        // SAFETY: `this` is a live `CustomBox` under the minter's
+        // exclusivity; the field projection is the wrapper's own
+        // storage, then the builtin box deref loads the stored line.
+        let boxed: *mut Box<PersistentCell<dyn HandleAble<dyn Trait>>> =
+            unsafe { std::ptr::addr_of_mut!((*this).0) };
+        // SAFETY: as above — the builtin box deref place, raw only.
+        unsafe { &raw mut **boxed }
     }
 }
 
