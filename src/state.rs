@@ -169,13 +169,17 @@ where
     /// children — [`Context`]s of this same tree, each in its own
     /// slot — are wrapped in outers by `fanout` and run by the same
     /// [`InnerHandle::run_to_completion`]. Results return in spawn
-    /// order through the join. The first child error aborts the
+    /// order through the join. The first child error ends the
     /// phase.
+    ///
+    /// # Errors
+    ///
+    /// The fan-out's cycle breaker — [`ContentClaimTimeout`](crate::checkpoint::ContentClaimTimeout), see
+    /// [`InnerHandle::fanout`] — or else the first child error.
     ///
     /// # Panics
     ///
-    /// Panics if a panicked child propagates from the fan-out scope —
-    /// see [`InnerHandle::fanout`].
+    /// Propagates a child that panicked — see [`InnerHandle::fanout`].
     pub fn run_children(&mut self, env: &E) -> Result<Vec<K>> {
         self.safepoint();
         let first_error: Mutex<Option<anyhow::Error>> = Mutex::new(None);
@@ -192,7 +196,7 @@ where
                     Err(())
                 }
             },
-        );
+        )?;
         if let Some(e) = first_error.into_inner().unwrap_or_else(|e| e.into_inner()) {
             return Err(e);
         }

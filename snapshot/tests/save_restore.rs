@@ -168,8 +168,8 @@ impl VocabIo for InnerHandle<Group> {
         let _ = self.fanout(
             &|g: &Group| g.children.iter().collect(),
             |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
-        );
-    }
+        )
+        .expect("the cycle breaker does not fire in this scenario");    }
 }
 
 impl VocabIo for InnerHandle<Machine> {
@@ -221,8 +221,8 @@ impl VocabIo for InnerHandle<Machine> {
                         _ => unreachable!("checked above"),
                     },
                     |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
-                );
-                let collected: Vec<(u32, String)> = match &self.stage {
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let collected: Vec<(u32, String)> = match &self.stage {
                     Stage::Scatter { children } => {
                         children.iter().map(|c| c.result()).collect()
                     }
@@ -273,8 +273,8 @@ impl VocabIo for InnerHandle<Machine> {
                         _ => unreachable!("checked above"),
                     },
                     |mut g: OuterHandle<'_, GroupSlot, dyn VocabIo>| g.run(io_ref),
-                );
-                let collected: Vec<(u32, String)> = match &self.stage {
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let collected: Vec<(u32, String)> = match &self.stage {
                     Stage::Nested { groups } => groups.iter().map(|c| c.result()).collect(),
                     _ => unreachable!("just ran Nested"),
                 };
@@ -402,8 +402,8 @@ fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
                     |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| {
                         a.barrier_run(io_ref, snap_taken_ref, early_done_ref);
                     },
-                );
-                let _ = snapper.join().expect("snapshotter");
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let _ = snapper.join().expect("snapshotter");
             });
         },
     );

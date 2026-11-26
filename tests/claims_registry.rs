@@ -56,8 +56,8 @@ impl Vocab for InnerHandle<Root> {
                     .collect()
             },
             |mut outer| outer.step(),
-        );
-    }
+        )
+        .expect("the cycle breaker does not fire in this scenario");    }
 }
 
 /// How long the scenario may take before the test gives up on it. The

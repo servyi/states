@@ -142,10 +142,11 @@ trait GroupDriven: Send {
 
 impl GroupDriven for InnerHandle<Group> {
     fn run(&mut self, io: &Io) {
-        let _joined: Vec<()> = self.fanout(
+        let _ = self.fanout(
             &|g: &Group| g.children.iter().collect(),
             |mut a: OuterHandle<'_, AnalyzeSlot, dyn GroupNode>| a.run_node(io),
-        );
+        )
+        .expect("the cycle breaker does not fire in this scenario");
     }
 }
 
@@ -240,22 +241,24 @@ impl MachineDriven for InnerHandle<Machine> {
         };
         match which {
             0 => {
-                let _joined: Vec<()> = self.fanout(
+                let _ = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Scatter { children } => children.iter().collect(),
                         _ => unreachable!("checked above"),
                     },
                     |mut a: OuterHandle<'_, AnalyzeSlot, dyn GroupNode>| a.run_node(io),
-                );
+                )
+                .expect("the cycle breaker does not fire in this scenario");
             }
             1 => {
-                let _joined: Vec<()> = self.fanout(
+                let _ = self.fanout(
                     &|m: &Machine| match &m.stage {
                         Stage::Nested { groups } => groups.iter().collect(),
                         _ => unreachable!("checked above"),
                     },
                     |mut g: OuterHandle<'_, GroupSlot, dyn GroupDrivenVocab>| g.run(io),
-                );
+                )
+                .expect("the cycle breaker does not fire in this scenario");
             }
             _ => {}
         }

@@ -89,7 +89,12 @@ impl Erased for Phase {
 
 impl Vocab for InnerHandle<Phase> {
     fn step(&mut self) -> u32 {
-        let sums: Vec<u32> = self.fanout(&|phase: &Phase| phase.children.iter().collect(), |mut child| child.step());
+        let sums: Vec<u32> = self
+            .fanout(
+                &|phase: &Phase| phase.children.iter().collect(),
+                |mut child| child.step(),
+            )
+            .expect("the cycle breaker does not fire in this scenario");
         sums.into_iter().sum()
     }
 }
@@ -142,7 +147,9 @@ fn erased_root_and_child_run_and_checkpoint() {
 fn erased_root_is_replaced_then_driven() {
     let mut root = PersistentCell::new(erased(Leaf { n: N_START, flag: None }));
     let result = independent_task_root(&mut root, |mut outer, _checkpointer| {
-        outer.replace(erased(Leaf { n: REPLACEMENT_START, flag: None }));
+        outer
+            .replace(erased(Leaf { n: REPLACEMENT_START, flag: None }))
+            .expect("the cycle breaker does not fire in this scenario");
         outer.step()
     });
     assert_eq!(result, REPLACEMENT_AFTER_TWO_WRITES, "the replacement is what runs");
