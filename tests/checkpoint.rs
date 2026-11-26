@@ -610,7 +610,12 @@ fn full_run_with_stw_checkpoints_and_nested_fanout() {
     let ids: Vec<u32> = m.done.iter().map(|(i, _)| *i).collect();
     assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", m.result);
     assert!(path.exists(), "checkpoints written");
-    assert!(elapsed.as_millis() < 2000, "scoped threads run concurrently: {elapsed:?}");
+    // A wall-clock bound shows that the children ran concurrently only
+    // where time is real: under an interpreter (Miri) a run's duration
+    // says nothing about scheduling.
+    if !cfg!(miri) {
+        assert!(elapsed.as_millis() < 2000, "scoped threads run concurrently: {elapsed:?}");
+    }
 }
 
 #[test]
