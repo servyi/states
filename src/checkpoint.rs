@@ -27,19 +27,16 @@
 //! fresh `&` to the root, from which non-conflicting `&` to every
 //! node can be derived (the checkpoint read side).
 //!
-//! # The erasure's object lifetime `'v`
+//! # The slot content's only bound is `HandleAble<V>`
 //!
-//! The sketch bounds the slot content by `Unsize<dyn HandleAble<V>>`,
-//! whose object lifetime is `'static`. Here that lifetime is a
-//! parameter: [`independent_task_root`], [`OuterHandle::replace`] and
-//! [`InnerHandle::fanout`] bound the content by
-//! `Unsize<dyn HandleAble<V> + 'v>` and `V: 'v`, and every call site
-//! infers `'v`. `'v = 'static` is exactly the sketch's bound — the
-//! erased slot (`Box<PersistentCell<dyn HandleAble<dyn Vocab>>>`, the
-//! shape every sketch demo uses) is admitted unchanged — while a
-//! machine whose environment borrows for the run infers `'v` shorter.
-//! `'v` only has to outlive the mint: the `dyn HandleAble<V> + 'v`
-//! receiver the mint dispatches through is transient.
+//! The content a slot holds — `<K::Target as Deref>::Target` — is
+//! bounded by [`HandleAble<V>`] and nothing else: no `Unsize`, no
+//! `Sized`, no object lifetime. The mint dispatches
+//! `box_innerhandle` through that trait directly — statically for a
+//! concrete node, through the vtable for an erased one
+//! (`dyn HandleAble<dyn Vocab>`, or `dyn Erased` with
+//! `Erased: HandleAble<V>`) — so it never names `dyn HandleAble<V>` as
+//! a type. A `: Unsize<dyn Tr>` bound is never needed; `: Tr` does.
 
 use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
@@ -666,21 +663,19 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// can leave the call — the discipline is structural.
 ///
 /// `V` is the tree's vocabulary — what the callback drives through its
-/// outer handle — and the slot's content must erase to
-/// `dyn HandleAble<V> + 'v`: either a CONCRETE node (the blanket impl,
+/// outer handle — and the slot's content must implement
+/// [`HandleAble<V>`]: either a CONCRETE node (the blanket impl,
 /// `InnerHandle<Node>: Unsize<V>`) or an already-erased one (`dyn Erased`
 /// with `Erased: HandleAble<V>` — the sketch demos' shape, e.g.
-/// `Box<PersistentCell<dyn HandleAble<V>>>`). `'v` is that erasure's
-/// object lifetime (see the module docs): inferred at the call site,
-/// never named by callers, and only the mint has to outlive it.
-pub fn independent_task_root<'v, K, V: ?Sized + 'v, R>(
+/// `Box<PersistentCell<dyn HandleAble<V>>>`).
+pub fn independent_task_root<K, V: ?Sized, R>(
     slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
     K: DerefMut + Sized + Send,
     K::Target: AsPtr,
-    <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
+    <K::Target as Deref>::Target: HandleAble<V>,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -692,7 +687,7 @@ where
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let outer = unsafe { OuterHandle::over_slot::<'v>(slot_ptr) };
+    let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
     // close; the gate serializes the requester side (see Checkpointer)
@@ -762,11 +757,10 @@ where
     /// of the pointee of the `K` as stored by the box (the loaded
     /// provenance), and the typed `slot` stored here is exactly the
     /// `K` cell the raw was taken from.
-    unsafe fn over_slot<'v>(slot: *mut PersistentCell<K>) -> Self
+    unsafe fn over_slot(slot: *mut PersistentCell<K>) -> Self
     where
         K: Sized,
-        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
-        V: 'v,
+        <K::Target as Deref>::Target: HandleAble<V>,
     {
         // the state raw: deref_mut EXPLICITLY at the raw-mut side —
         // the returned reference is cast to the raw on the spot; the
@@ -779,10 +773,12 @@ where
         let target: &mut K::Target = DerefMut::deref_mut(k);
         // `as_ptr` is a safe method of an unsafe trait: its contract is
         // discharged by the impl — the store line the Deref chain springs from.
-        let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
+        let state_raw = AsPtr::as_ptr(target);
         // SAFETY: the state raw is that store line, live under the
         // caller's contract; the receiver is transient and dies at return.
-        let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
+        // It is the CONTENT, bounded only by `HandleAble<V>`: the mint
+        // dispatches through that trait — never through `dyn HandleAble<V>`.
+        let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
         let state_erased: *mut () = state_raw as *mut ();
@@ -804,10 +800,9 @@ where
     /// driven by another chain after `CONTENT_CLAIM_WINDOW`. Nothing has
     /// been written in that case — the slot and this handle are exactly
     /// as they were.
-    pub fn replace<'v>(&mut self, mut val: K) -> Result<(), ContentClaimTimeout>
+    pub fn replace(&mut self, mut val: K) -> Result<(), ContentClaimTimeout>
     where
-        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
-        V: 'v,
+        <K::Target as Deref>::Target: HandleAble<V>,
     {
         // 1) THE CONTENT CLAIM, on the tree-wide registry, BEFORE
         // anything is written. An error gate has to leave the tree as it
@@ -824,8 +819,7 @@ where
         let content_key: usize = {
             // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
             let target: &mut K::Target = DerefMut::deref_mut(&mut val);
-            let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
-            state_raw as *const () as usize
+            AsPtr::as_ptr(target) as *const () as usize
         };
         let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
         let claimed = claim_content(&claims, &self.shared, || content_key)?;
@@ -852,11 +846,12 @@ where
             let k: &mut K = unsafe { slot_cell.as_mut_k() };
             let target: &mut K::Target = DerefMut::deref_mut(k);
             // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-            let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
+            let state_raw = AsPtr::as_ptr(target);
             // SAFETY: the state raw is that store line, live under the
             // mint's discipline; the receiver is transient and dies at
-            // return.
-            let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
+            // return. As in `over_slot`: the content itself, dispatched
+            // through `HandleAble<V>`.
+            let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
             let state_erased: *mut () = state_raw as *mut ();
             let shared_ref = SharedRef(self.shared.clone());
             // SAFETY: the mint's discipline over the fresh content.
@@ -1135,7 +1130,7 @@ impl<T: Sized> InnerHandle<T> {
     /// # Panics
     ///
     /// Propagates a child that panicked.
-    pub fn fanout<'v, V: ?Sized + Send + 'v, K, F, R>(
+    pub fn fanout<V: ?Sized + Send, K, F, R>(
         &mut self,
         split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
@@ -1144,7 +1139,7 @@ impl<T: Sized> InnerHandle<T> {
         T: Send,
         K: DerefMut + Sized + Send,
         K::Target: AsPtr,
-        <K::Target as Deref>::Target: HandleAble<V> + Unsize<dyn HandleAble<V> + 'v>,
+        <K::Target as Deref>::Target: HandleAble<V>,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
@@ -1233,8 +1228,7 @@ impl<T: Sized> InnerHandle<T> {
                         let k: &mut K = unsafe { child.as_mut_k() };
                         let target: &mut K::Target = DerefMut::deref_mut(k);
                         // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-                        let raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
-                        raw as *const () as usize
+                        AsPtr::as_ptr(target) as *const () as usize
                     })?;
                     let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
                     // THE MINT (only after BOTH uniqueness levels):
@@ -1245,10 +1239,12 @@ impl<T: Sized> InnerHandle<T> {
                     let k: &mut K = unsafe { child.as_mut_k() };
                     let target: &mut K::Target = DerefMut::deref_mut(k);
                     // `as_ptr` is a safe method of an unsafe trait (see `over_slot`).
-                    let state_raw: *mut (dyn HandleAble<V> + 'v) = AsPtr::as_ptr(target);
+                    let state_raw = AsPtr::as_ptr(target);
                     // SAFETY: as above — the receiver derives from the
-                    // claimed raw; transient, dies at return.
-                    let erased: &mut (dyn HandleAble<V> + 'v) = unsafe { &mut *state_raw };
+                    // claimed raw; transient, dies at return. As in
+                    // `over_slot`: the content itself, dispatched through
+                    // `HandleAble<V>`.
+                    let erased: &mut <K::Target as Deref>::Target = unsafe { &mut *state_raw };
                     let state_erased: *mut () = state_raw as *mut ();
                     let shared_ref = SharedRef(child_shared.clone());
                     // SAFETY: as above; the child's Shared carries the
