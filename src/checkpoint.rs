@@ -1375,7 +1375,10 @@ impl<T: Sized> InnerHandle<T> {
             }
             // all finished: join in order. A child's error gate is the
             // fan-out's error; a child that panicked is re-raised here.
-            joins.into_iter().map(|j| j.join().expect("panicked child")).collect()
+            // FAULT (negative control): the results return in REVERSE
+            // dispatch order — a caller correlating by position reads
+            // every child as another
+            joins.into_iter().rev().map(|j| j.join().expect("panicked child")).collect()
         })
     }
 }
