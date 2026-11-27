@@ -87,22 +87,40 @@ struct Shared {
 
 /// Releases a global slot claim on unwind or completion — a panicked
 /// subtask must not leave its slot claimed (the tree would deadlock).
+///
+/// The release never waits inside the registry either (see
+/// [`try_claim`]): a contended shard is retried — the holder holds it
+/// for one map operation.
 struct ClaimGuard {
     claims: Arc<DashMap<usize, ()>>,
     key: usize,
 }
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
-        self.claims.remove(&self.key);
+        loop {
+            match self.claims.try_entry(self.key) {
+                // nothing is held under that key: already released
+                Some(dashmap::Entry::Vacant(_)) => break,
+                Some(dashmap::Entry::Occupied(o)) => {
+                    o.remove();
+                    break;
+                }
+                // the shard is contended: the holder lets go within one
+                // map operation
+                None => std::hint::spin_loop(),
+            }
+        }
     }
 }
 
 /// Take `key` in the claims registry if it is free: `true` when this
 /// call claimed it.
 ///
-/// A function on purpose. A `dashmap::Entry` owns its registry shard's
-/// write lock, and the scrutinee of a `match` lives until the `match`
-/// ends — so a waiter that backed off from INSIDE
+/// A function on purpose, and NON-BLOCKING on purpose.
+///
+/// A function: a `dashmap::Entry` owns its registry shard's write lock,
+/// and the scrutinee of a `match` lives until the `match` ends — so a
+/// waiter that backed off from INSIDE
 /// `match claims.entry(key) { .. }` parked (whenever a checkpoint was
 /// requested) still holding that shard. Every other waiter with a key
 /// in that shard then blocked inside the registry, where it can never
@@ -110,15 +128,39 @@ impl Drop for ClaimGuard {
 /// park — never released the first: a deadlock. Three subtasks handed
 /// the same cell, plus one checkpoint, were enough. Here the `Entry`
 /// is gone before the caller sees the result.
+///
+/// Non-blocking: a thread must never WAIT inside the registry. A
+/// contended shard is reported as "not claimed", and the caller waits
+/// in its own backoff — which is where a checkpoint reaches it. With
+/// the blocking `entry()` a contending thread instead sat in the
+/// registry's lock, able to answer nothing until the holder let go.
 fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
-    match claims.entry(key) {
-        dashmap::Entry::Vacant(v) => {
-            v.insert(());
-            true
+    for _ in 0..CLAIM_SPIN_ROUNDS {
+        match claims.try_entry(key) {
+            // another thread is mid-operation on this shard: a spin, not
+            // a park — the holder lets go within one map operation
+            None => std::hint::spin_loop(),
+            Some(dashmap::Entry::Vacant(v)) => {
+                let _occupied = v.insert(());
+                return true;
+            }
+            // held by another chain: not claimed. The caller backs off —
+            // through the library's own park, where a checkpoint reaches it.
+            Some(dashmap::Entry::Occupied(_)) => return false,
         }
-        dashmap::Entry::Occupied(_) => false,
     }
+    // the shard stayed busy for the whole spin: reported as not claimed,
+    // and the caller's backoff (its own park) takes over
+    false
 }
+/// How many times a claim re-tries a shard that another thread is in the
+/// middle of an operation on. A SPIN, never a park: the holder keeps the
+/// shard for one map operation. (Without it a transiently contended shard
+/// counts as a failed attempt and costs the caller a full backoff — which,
+/// under a slow interpreter, was enough to spend the content claim's
+/// whole window on collisions — measured in the servyi/states port's
+/// tests: 6 attempts in 100 ms, the key never held.)
+const CLAIM_SPIN_ROUNDS: usize = 4096;
 
 /// THE CONTENT CLAIM (level 2), bounded: take the claim whose key
 /// `content_address` yields, waiting while another chain holds it — but
