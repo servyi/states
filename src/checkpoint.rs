@@ -343,10 +343,9 @@ impl Shared {
     /// Register a child (insert under the lock, release — the
     /// convention). The child stays alive by its owner's Arc.
     fn register_child(&self, child: &Arc<Shared>) {
-        self.children
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(Arc::downgrade(child));
+        // FAULT (negative control): the child is never registered —
+        // the parking dance never reaches it
+        let _ = child;
     }
 
     /// One backoff step for a subtask WAITING on a global claim: the
@@ -406,7 +405,8 @@ fn request_until_parked(weak: &Weak<Shared>) -> Handshake {
     }
     loop {
         let Some(shared) = weak.upgrade() else {
-            return Handshake::Closed;
+            // FAULT (negative control): a gone mutator is reported parked
+            return Handshake::Parked;
         };
         let parked = shared.lock_parked();
         if *parked {
@@ -480,11 +480,9 @@ fn release_request(shared: &Shared) {
 /// happened mid-guard-life instead unwound the guard's own drop,
 /// which released cleanly — the pending is already false, a no-op.)
 fn recover_poisoned_gate(weak: &Weak<Shared>) {
-    if let Some(shared) = weak.upgrade() {
-        if shared.is_pending() {
-            release_request(&shared);
-        }
-    }
+    // FAULT (negative control): the recovery releases nothing — an
+    // ownerless pending keeps the world parked forever
+    let _ = weak;
 }
 
 /// The OUTER handle: owns the TYPED slot pointer (`*mut K` —
