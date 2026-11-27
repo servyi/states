@@ -15,11 +15,11 @@ mod deadline;
 
 /// How long the subtask that WINS a contested cell keeps it, parking at
 /// its safepoints the while.
-const WINNER_RUNS_FOR: Duration = Duration::from_millis(300);
+const WINNER_RUNS_FOR: Duration = Duration::from_millis(150);
 /// How long the winner sleeps between safepoints.
 const SAFEPOINT_POLL: Duration = Duration::from_millis(1);
 /// When the checker asks for a checkpoint: once the losers are waiting.
-const CHECKPOINT_AFTER: Duration = Duration::from_millis(100);
+const CHECKPOINT_AFTER: Duration = Duration::from_millis(50);
 /// How many subtasks the one child cell is handed to.
 const SUBTASKS_PER_CELL: usize = 3;
 
@@ -64,7 +64,7 @@ impl Vocab for InnerHandle<Root> {
 }
 
 /// How long the scenario may take before the test gives up on it. The
-/// scenario itself needs about a second.
+/// scenario itself needs about half a second.
 const SCENARIO_DEADLINE: Duration = Duration::from_secs(10);
 /// How often the test checks whether the scenario has finished.
 const FINISHED_POLL: Duration = Duration::from_millis(10);
