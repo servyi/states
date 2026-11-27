@@ -880,13 +880,11 @@ where
         let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
         let claimed = claim_content(&claims, &self.shared, || content_key)?;
         let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: claimed };
-        // 2) the swap — plain assignment through the typed slot
+        // 2) the swap — FAULT (negative control): skipped. The
+        // replacement is dropped unwritten and the re-mint below mints
+        // over the content still sitting in the slot.
         let replacement = PersistentCell::new(val);
-        // SAFETY: the slot is live and exclusively reachable through
-        // this chain (the mint's discipline; the old inner handle is
-        // replaced by the re-mint below, so no stale pointer
-        // survives the write).
-        unsafe { *self.slot = replacement };
+        drop(replacement);
         // 3) re-mint: use the HandleAble OF the replacement —
         // reachable through the slot it now lives in (the slot's own
         // AsPtr hatch, consulted once) — to mint a fresh InnerHandle
