@@ -26,17 +26,13 @@
 //! The guard records where it was started — the test's file and line —
 //! so the report names the hung test without anyone having to label it.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long one test may take. The slowest healthy test takes well under
 /// this — natively and under Miri, loaded or not — so the deadline only
 /// ever fires on a hang.
 pub const TEST_DEADLINE: Duration = Duration::from_secs(60);
-
-/// How often the watchdog looks at the clock.
-const WATCHDOG_POLL: Duration = Duration::from_millis(50);
 
 /// Write straight to the process's stderr. libtest captures each test's
 /// output, and a thread the test spawns inherits that capture — so a
@@ -67,7 +63,7 @@ fn report_to_stderr(message: &str) {
 
 /// A test's deadline. Live from `start` until dropped.
 pub struct Deadline {
-    done: Arc<AtomicBool>,
+    finished: Arc<(Mutex<bool>, Condvar)>,
     watchdog: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -78,12 +74,21 @@ impl Deadline {
     #[track_caller]
     pub fn start() -> Self {
         let started_at = std::panic::Location::caller();
-        let done = Arc::new(AtomicBool::new(false));
-        let seen = Arc::clone(&done);
+        let finished = Arc::new((Mutex::new(false), Condvar::new()));
+        let shared = Arc::clone(&finished);
         let watchdog = std::thread::spawn(move || {
             let give_up_at = Instant::now() + TEST_DEADLINE;
-            while !seen.load(Ordering::SeqCst) {
-                if Instant::now() >= give_up_at {
+            let (flag, woken) = &*shared;
+            // Only this closure and the guard's drop touch the flag, and
+            // neither can panic while holding it: the lock cannot be
+            // poisoned, and the wait cannot fail.
+            let mut flag = flag.lock().unwrap_or_else(PoisonError::into_inner);
+            // One wait until the deadline, not a poll: a sleeping watchdog
+            // would cost every test the rest of its sleep when the guard
+            // joins it.
+            while !*flag {
+                let now = Instant::now();
+                if now >= give_up_at {
                     let file = started_at.file();
                     let line = started_at.line();
                     report_to_stderr(&format!(
@@ -94,16 +99,19 @@ impl Deadline {
                     ));
                     std::process::abort();
                 }
-                std::thread::sleep(WATCHDOG_POLL);
+                let waited = woken.wait_timeout(flag, give_up_at - now);
+                flag = waited.unwrap_or_else(PoisonError::into_inner).0;
             }
         });
-        Deadline { done, watchdog: Some(watchdog) }
+        Deadline { finished, watchdog: Some(watchdog) }
     }
 }
 
 impl Drop for Deadline {
     fn drop(&mut self) {
-        self.done.store(true, Ordering::SeqCst);
+        let (flag, woken) = &*self.finished;
+        *flag.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        woken.notify_all();
         if let Some(watchdog) = self.watchdog.take() {
             let _finished = watchdog.join();
         }
