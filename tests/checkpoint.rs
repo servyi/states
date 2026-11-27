@@ -53,12 +53,31 @@ impl Io {
         self.progress.store(0, Ordering::SeqCst);
     }
 
-    fn step(&self, _id: u32) {
+    /// Take one step — unless the machine is held. The hold engages AT
+    /// `HOLD_AT`, atomically with the step that reaches it: a step counts
+    /// only if it reserves its progress before the hold engages. (With a
+    /// separate check-then-step, a child that had passed the check took
+    /// one more step after a sibling's step had engaged the hold: 7 steps
+    /// consumed at the snapshot, not 6.)
+    fn try_step(&self, _id: u32) -> bool {
+        let mut progress = self.progress.load(Ordering::SeqCst);
+        loop {
+            if !self.release.load(Ordering::SeqCst) && progress >= HOLD_AT {
+                return false;
+            }
+            match self
+                .progress
+                .compare_exchange_weak(progress, progress + 1, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(now) => progress = now,
+            }
+        }
         let _n = self.calls.fetch_add(1, Ordering::SeqCst);
-        let _p = self.progress.fetch_add(1, Ordering::SeqCst);
         if !self.step_delay.is_zero() {
             std::thread::sleep(self.step_delay);
         }
+        true
     }
 }
 
@@ -104,7 +123,11 @@ fn run_analyze(h: &mut InnerHandle<AnalyzeState>, io: &Io) {
             std::thread::sleep(Duration::from_millis(1));
         }
         h.safepoint();
-        io.step(id);
+        if !io.try_step(id) {
+            // the hold engaged between the check and this step: nothing
+            // was taken and the state does not advance — re-check
+            continue;
+        }
         h.safepoint();
         let finished = {
             let st = &mut *h;
@@ -196,8 +219,9 @@ impl MachineDriven for InnerHandle<Machine> {
             let m = &mut **self;
             match &mut m.stage {
                 Stage::Seq { step } => {
-                    if (*step as usize) < m.items.len() && !io.holding() {
-                        io.step(m.items[*step as usize].id);
+                    if (*step as usize) < m.items.len()
+                        && io.try_step(m.items[*step as usize].id)
+                    {
                         *step += 1;
                         true
                     } else if (*step as usize) < m.items.len() {
