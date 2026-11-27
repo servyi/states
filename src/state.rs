@@ -152,10 +152,12 @@ where
         &mut self,
         make: impl FnOnce(&ContextId) -> Box<dyn State<K, E> + Send + Sync + 'e>,
     ) {
-        let child_id = self.id.new_child();
+        // FAULT (negative control): every child is handed the ROOT's
+        // id — no per-child allocation, no distinct context
+        let child_id: &ContextId = ContextId::root();
         self.children.push(PersistentCell::new(Box::new(PersistentCell::new(Context::new(
-            &child_id,
-            make(&child_id),
+            child_id,
+            make(child_id),
         )))));
     }
 }
