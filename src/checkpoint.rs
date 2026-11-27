@@ -1380,22 +1380,26 @@ impl<T: Sized> InnerHandle<T> {
     }
 }
 
+/// FAULT (negative control): how far the handle's derefs sit off the
+/// minted raw — the reads and writes land beside the node.
+const FAULT_DEREF_OFFSET: usize = 8;
+
 impl<T: Sized> Deref for InnerHandle<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // a FRESH reference off the stored-provenance raw — nothing
-        // persistent is ever a mutable line
-        // SAFETY: the raw is live per the mint's discipline; T is
-        // the pointed object's own type (the dispatch that minted
-        // this handle fixed them together).
-        unsafe { &*self.state }
+        // FAULT (negative control): the read side is offset
+        // SAFETY: as the real impl — the fault only moves WHERE it lands.
+        let offset: *mut T = self.state.wrapping_byte_add(FAULT_DEREF_OFFSET);
+        unsafe { &*offset }
     }
 }
 
 impl<T: Sized> DerefMut for InnerHandle<T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY: as Deref — exclusive, tied to `&mut self`.
-        unsafe { &mut *self.state }
+        // FAULT (negative control): the write side is offset
+        // SAFETY: as the real impl — the fault only moves WHERE it lands.
+        let offset: *mut T = self.state.wrapping_byte_add(FAULT_DEREF_OFFSET);
+        unsafe { &mut *offset }
     }
 }
 
