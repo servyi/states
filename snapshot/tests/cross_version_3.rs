@@ -171,6 +171,10 @@ fn build_fixture(version: u8) -> String {
         std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
     )
     .args(["build", "--manifest-path", manifest.join("Cargo.toml").to_str().expect("utf8")])
+    // Built where it is looked for below. Without this an outer
+    // CARGO_TARGET_DIR is inherited and sends the fixture elsewhere —
+    // and a binary left here from an earlier build is then run instead.
+    .env("CARGO_TARGET_DIR", manifest.join("target"))
     .status()
     .expect("cargo build fixture");
     assert!(out.success(), "fixture v{version} failed to build");
