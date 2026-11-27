@@ -3,7 +3,12 @@
 //! a dyn impl of exactly the shape it reads.
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::with_checkpoint_pair;
+// The old `with_checkpoint_pair` shape over the two-piece root — one
+// definition, shared with the cross-version tests (see the file).
+#[path = "../../legacy_pair.rs"]
+mod legacy_pair;
+use legacy_pair::with_pair;
+
 
 /// v2's snapshot vocabulary — frozen at v2 (adds `polished`).
 #[derive(Serialize, Deserialize)]
@@ -134,7 +139,7 @@ fn save(path: &str) {
             Item { id: 2, steps: 3, step: 0, done: None, polished: false, needs_fix: false },
         ],
     };
-    with_checkpoint_pair(machine, |mut h, _req| {
+    with_pair(machine, |h, _req| {
         h.safepoint();
         let shape = ShapeV2 {
             steps_total: h.items.iter().map(|i| i.steps).collect(),
@@ -167,7 +172,7 @@ fn run(machine: Machine) -> (String, usize) {
     let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = std::sync::Arc::clone(&calls);
     let mut skip_logged = std::collections::HashSet::new();
-    let out = with_checkpoint_pair(machine, move |mut h, _req| loop {
+    let out = with_pair(machine, |h, _req| loop {
         h.safepoint();
         let m = &mut *h;
         for item in &mut m.items {

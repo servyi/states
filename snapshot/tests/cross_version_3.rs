@@ -20,23 +20,70 @@
 // the one class the inline_literal policy exempts via allow.
 #![allow(unknown_lints)] // plain clippy does not know the driver's lints
 #![allow(inline_literal)]
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// How long one fixture binary may take. A healthy run takes well under
+/// a second natively and a few seconds under Miri.
+const FIXTURE_DEADLINE: Duration = Duration::from_secs(20);
+/// How often the test looks whether the fixture has exited.
+const FIXTURE_POLL: Duration = Duration::from_millis(10);
 
 struct Run {
     out: String,
     err: String,
 }
 
+/// Read a fixture's pipe to its end on its own thread.
+fn drain<R: Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = pipe.read_to_end(&mut bytes);
+        bytes
+    })
+}
+
+/// Run one fixture binary and collect what it wrote, giving up on it at
+/// [`FIXTURE_DEADLINE`]. `Command::output` would wait for as long as a
+/// hung fixture stays alive — and the fixture would outlive the test even
+/// once the test's own deadline aborts it — so a fixture that has not
+/// exited in time is killed and the wait reported.
 fn run(bin: &str, cmd: &str, path: &std::path::Path) -> Run {
-    let output = Command::new(bin).arg(cmd).arg(path).output().expect("binary runs");
+    let mut child = Command::new(bin)
+        .arg(cmd)
+        .arg(path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("binary starts");
+    // Drain both pipes while the fixture runs: one that writes more than
+    // a pipe holds would otherwise block on the write and never exit.
+    let stdout = drain(child.stdout.take().expect("stdout is piped"));
+    let stderr = drain(child.stderr.take().expect("stderr is piped"));
+    let give_up_at = Instant::now() + FIXTURE_DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < give_up_at => std::thread::sleep(FIXTURE_POLL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                unreachable!("{bin} {cmd} did not exit within {FIXTURE_DEADLINE:?}")
+            }
+            Err(error) => unreachable!("{bin} {cmd} could not be waited on: {error}"),
+        }
+    };
+    let stdout = stdout.join().expect("stdout reader panicked");
+    let stderr = stderr.join().expect("stderr reader panicked");
     assert!(
-        output.status.success(),
+        status.success(),
         "{bin} {cmd} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr)
     );
     Run {
-        out: String::from_utf8_lossy(&output.stdout).into_owned(),
-        err: String::from_utf8_lossy(&output.stderr).into_owned(),
+        out: String::from_utf8_lossy(&stdout).into_owned(),
+        err: String::from_utf8_lossy(&stderr).into_owned(),
     }
 }
 
@@ -121,6 +168,10 @@ fn build_fixture(version: u8) -> String {
         std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()),
     )
     .args(["build", "--manifest-path", manifest.join("Cargo.toml").to_str().expect("utf8")])
+    // Built where it is looked for below. Without this an outer
+    // CARGO_TARGET_DIR is inherited and sends the fixture elsewhere —
+    // and a binary left here from an earlier build is then run instead.
+    .env("CARGO_TARGET_DIR", manifest.join("target"))
     .status()
     .expect("cargo build fixture");
     assert!(out.success(), "fixture v{version} failed to build");

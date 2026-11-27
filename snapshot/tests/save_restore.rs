@@ -1,6 +1,7 @@
-
-// The scenario literals below are test data (see header); they are
-// the one class the inline_literal policy exempts via allow.
+// The snapshot crate's integration tests: the roundtrip and the
+// mid-fan-out snapshot+resume, rebuilt on the two-piece protocol with
+// per-type vocab traits (the harness shape that compiles cleanly on
+// this toolchain).
 #![allow(unknown_lints)] // plain clippy does not know the driver's lints
 #![allow(inline_literal)]
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -8,10 +9,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use servyi_states::checkpoint::{with_checkpoint_pair, Handle};
+use servyi_states::checkpoint::{
+    Checkpointer, InnerHandle, OuterHandle, PersistentCell, independent_task_root,
+};
 use servyi_states_snapshot as snapshot;
 
+#[path = "../../tests/support/deadline.rs"]
+mod deadline;
 
+/// Steps per work item in the mid-run tests.
+const WORK_STEPS_PER_ITEM: u32 = 6;
 
 #[derive(Debug, Clone)]
 struct Io {
@@ -23,7 +30,6 @@ impl Io {
     fn new() -> Self {
         Self { calls: Arc::new(AtomicUsize::new(0)), step_delay: Duration::from_millis(0) }
     }
-
     fn step(&self, _id: u32) {
         let _n = self.calls.fetch_add(1, Ordering::SeqCst);
         if !self.step_delay.is_zero() {
@@ -42,8 +48,6 @@ struct WorkItem {
 struct AnalyzeState {
     item: WorkItem,
     step: u32,
-    /// Result stored by the worker INSIDE the node — the fan-out returns
-    /// nothing; ownership of results stays with the state machine.
     done: Option<String>,
 }
 
@@ -53,37 +57,13 @@ impl AnalyzeState {
     }
 }
 
-fn run_analyze(mut h: Handle<'_, AnalyzeState>, io: &Io) {
-    loop {
-        h.safepoint();
-        let (id, steps, already_done) = {
-            let st = &*h;
-            (st.item.id, st.item.steps, st.step >= st.item.steps)
-        };
-        // A restored child that was already finished does NO work —
-        // this is the resume-skips-finished property under test.
-        if already_done {
-            h.done = Some(format!("v{id}"));
-            return;
-        }
-        io.step(id);
-        h.safepoint();
-        let finished = {
-            let st = &mut *h;
-            st.step += 1;
-            st.step >= steps
-        };
-        if finished {
-            h.done = Some(format!("v{id}"));
-            return;
-        }
-    }
-}
+type AnalyzeSlot = Box<PersistentCell<AnalyzeState>>;
+type GroupSlot = Box<PersistentCell<Group>>;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Group {
     gid: u32,
-    children: Vec<AnalyzeState>,
+    children: Vec<PersistentCell<AnalyzeSlot>>,
 }
 
 impl Group {
@@ -94,15 +74,11 @@ impl Group {
     }
 }
 
-fn run_group(mut h: Handle<'_, Group>, io: &Io) {
-    h.fanout(&|g| g.children.iter_mut().collect(), |a| run_analyze(a, io));
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Stage {
     Seq { step: u32 },
-    Scatter { children: Vec<AnalyzeState> },
-    Nested { groups: Vec<Group> },
+    Scatter { children: Vec<PersistentCell<AnalyzeSlot>> },
+    Nested { groups: Vec<PersistentCell<GroupSlot>> },
     Done,
 }
 
@@ -120,173 +96,224 @@ struct Machine {
     result: String,
 }
 
-/// One top-level transition. The node is touched exclusively through the
-/// root handle: every access borrows the handle, so nothing can be live
-/// across the safepoints inside the fan-outs.
-fn step<'o>(mut h: Handle<'o, Machine>, io: &Io) -> (Handle<'o, Machine>, bool) {
-    let mut next: Option<Stage> = None;
-    let keep_going = {
-        let m = &mut *h;
-        match &mut m.stage {
-            Stage::Seq { step } => {
-                if (*step as usize) < m.items.len() {
-                    io.step(m.items[*step as usize].id);
-                    *step += 1;
-                    true
-                } else {
-                    next = Some(Stage::Scatter {
-                        children: m
-                            .items
-                            .iter()
-                            .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
-                            .collect(),
-                    });
-                    true
-                }
-            }
-            Stage::Scatter { .. } => true,
-            Stage::Nested { .. } => true,
-            Stage::Done => false,
-        }
-    };
-    if let Some(n) = next {
-        h.stage = n;
+/// The tree's vocab: analyze nodes run to completion; groups run their
+/// children; the machine runs one stage transition.
+trait VocabIo: Send {
+    fn run(&mut self, io: &Io);
+    /// The inner-machine reach (the mid-fan-out test's hand-rolled
+    /// fan-out); None on non-machine nodes.
+    fn machine(&mut self) -> Option<&mut InnerHandle<Machine>>;
+    /// The mid-fan-out barrier: early children complete then hold;
+    /// late children hold then run — everything until the snapshot.
+    fn barrier_run(
+        &mut self,
+        io: &Io,
+        snap_taken: &std::sync::atomic::AtomicBool,
+        early_done: &AtomicUsize,
+    ) {
+        let _ = (io, snap_taken, early_done);
     }
-    if !keep_going {
-        return (h, false);
-    }
-    // Fan-out stages: run while serving checkpoints, then read results
-    // from the node. Which fan-out to run, without borrowing `h` for the
-    // match arm (NLL limitation; Polonius would allow the direct match).
-    enum Fan {
-        Scatter,
-        Nested,
-    }
-    // Seq advances (or Done exits) inside the block above; only the
-    // fan-out stages reach here.
-    let which = match &h.stage {
-        Stage::Scatter { .. } => Fan::Scatter,
-        Stage::Nested { .. } => Fan::Nested,
-        Stage::Seq { .. } | Stage::Done => return (h, true),
-    };
-    match which {
-        Fan::Scatter => h.fanout(
-            &|m: &mut Machine| match &mut m.stage {
-                Stage::Scatter { children } => children.iter_mut().collect(),
-                _ => unreachable!("checked above"),
-            },
-            |a| run_analyze(a, io),
-        ),
-        Fan::Nested => h.fanout(
-            &|m: &mut Machine| match &mut m.stage {
-                Stage::Nested { groups } => groups.iter_mut().collect(),
-                _ => unreachable!("checked above"),
-            },
-            |g| run_group(g, io),
-        ),
-    }
-    let m = &mut *h;
-    let mut collected: Vec<(u32, String)> = Vec::new();
-    match &m.stage {
-        Stage::Scatter { children } => collected.extend(children.iter().map(AnalyzeState::result)),
-        Stage::Nested { groups } => collected.extend(groups.iter().map(Group::result)),
-        _ => {}
-    }
-    // Stage transitions live with the collection they follow: Scatter
-    // results feed the Nested groups (take/skip split, gids 100/200),
-    // Nested results finish the machine. Dropped in the 7a03762
-    // redesign — restored from 0acc997's semantics.
-    let next: Option<Stage> = match &m.stage {
-        Stage::Scatter { .. } => Some(Stage::Nested {
-            groups: vec![
-                Group {
-                    gid: 100,
-                    children: m
-                        .items
-                        .iter()
-                        .take(2)
-                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
-                        .collect(),
-                },
-                Group {
-                    gid: 200,
-                    children: m
-                        .items
-                        .iter()
-                        .skip(2)
-                        .map(|i| AnalyzeState { item: i.clone(), step: 0, done: None })
-                        .collect(),
-                },
-            ],
-        }),
-        Stage::Nested { .. } => {
-            let ids: Vec<String> = m.done.iter().map(|(i, _)| i.to_string()).collect();
-            m.result = format!("done: {}", ids.join(","));
-            Some(Stage::Done)
-        }
-        _ => None,
-    };
-    m.done.extend(collected);
-    if let Some(n) = next {
-        m.stage = n;
-    }
-    (h, true)
 }
 
-fn drive(
-    machine: Machine,
-    io: &Io,
-    checkpoint: Option<(Duration, std::path::PathBuf)>,
-) -> Machine {
-    with_checkpoint_pair(machine, move |mut h, req| {
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let stop2 = stop.clone();
 
-        std::thread::scope(|scope| {
-            let timer = checkpoint.map(|(every, path)| {
-                let t = scope.spawn(move || {
-                    while !stop2.load(Ordering::SeqCst) {
-                        std::thread::sleep(every);
-                        if stop2.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        let Some(guard) = req.request_timeout(Duration::from_millis(50)) else {
-                            continue;
-                        };
-                        let bytes = serde_json::to_string(&*guard).expect("serialize");
-                        drop(guard);
-                        let tmp = path.with_extension("tmp");
-                        if std::fs::write(&tmp, &bytes).is_ok() {
-                            let _prev = std::fs::rename(&tmp, &path);
-                        }
+impl VocabIo for InnerHandle<AnalyzeState> {
+    fn machine(&mut self) -> Option<&mut InnerHandle<Machine>> {
+        None
+    }
+    fn barrier_run(
+        &mut self,
+        io: &Io,
+        snap_taken: &std::sync::atomic::AtomicBool,
+        early_done: &AtomicUsize,
+    ) {
+        let early = self.item.id <= 2;
+        if early {
+            for _ in 0..self.item.steps {
+                self.safepoint();
+                io.step(self.item.id);
+                self.safepoint();
+                self.step += 1;
+            }
+            self.done = Some(format!("v{}", self.item.id));
+            let _prev = early_done.fetch_add(1, Ordering::SeqCst);
+        }
+        while !snap_taken.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(1));
+            self.safepoint();
+        }
+        if !early {
+            self.run(io);
+        }
+    }
+    fn run(&mut self, io: &Io) {
+        loop {
+            self.safepoint();
+            let (id, steps, done_steps) = {
+                let st = &**self;
+                (st.item.id, st.item.steps, st.step)
+            };
+            if done_steps >= steps {
+                self.done = Some(format!("v{id}"));
+                return;
+            }
+            io.step(id);
+            self.step += 1;
+        }
+    }
+}
+
+impl VocabIo for InnerHandle<Group> {
+    fn machine(&mut self) -> Option<&mut InnerHandle<Machine>> {
+        None
+    }
+    fn run(&mut self, io: &Io) {
+        let io_ref: &Io = io;
+        let _ = self.fanout(
+            &|g: &Group| g.children.iter().collect(),
+            |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
+        )
+        .expect("the cycle breaker does not fire in this scenario");    }
+}
+
+impl VocabIo for InnerHandle<Machine> {
+    fn machine(&mut self) -> Option<&mut InnerHandle<Machine>> {
+        Some(self)
+    }
+    fn run(&mut self, io: &Io) {
+        self.safepoint();
+        let seq_done = match &self.stage {
+            Stage::Seq { step } => (*step as usize) >= self.items.len(),
+            _ => false,
+        };
+        if seq_done {
+            let items = self.items.clone();
+            self.stage = Stage::Scatter {
+                children: items
+                    .iter()
+                    .map(|i| {
+                        PersistentCell::new(Box::new(PersistentCell::new(AnalyzeState {
+                            item: i.clone(),
+                            step: 0,
+                            done: None,
+                        })))
+                    })
+                    .collect(),
+            };
+            return;
+        }
+        let seq_next: Option<(usize, u32)> = match &self.stage {
+            Stage::Seq { step } if (*step as usize) < self.items.len() => {
+                Some((*step as usize, self.items[*step as usize].id))
+            }
+            _ => None,
+        };
+        if let Some((idx, id)) = seq_next {
+            io.step(id);
+            if let Stage::Seq { step } = &mut self.stage {
+                *step = (idx + 1) as u32;
+            }
+            return;
+        }
+        match &mut self.stage {
+            Stage::Seq { .. } => {}
+            Stage::Scatter { .. } => {
+                let io_ref: &Io = io;
+                let _ = self.fanout(
+                    &|m: &Machine| match &m.stage {
+                        Stage::Scatter { children } => children.iter().collect(),
+                        _ => unreachable!("checked above"),
+                    },
+                    |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| a.run(io_ref),
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let collected: Vec<(u32, String)> = match &self.stage {
+                    Stage::Scatter { children } => {
+                        children.iter().map(|c| c.result()).collect()
                     }
-                });
-                (t, every)
-            });
+                    _ => unreachable!("just ran Scatter"),
+                };
+                self.done.extend(collected);
+                let items: Vec<WorkItem> = self.items.clone();
+                let g100 = Group {
+                    gid: 100,
+                    children: items
+                        .iter()
+                        .take(2)
+                        .map(|i| {
+                            PersistentCell::new(Box::new(PersistentCell::new(AnalyzeState {
+                                item: i.clone(),
+                                step: 0,
+                                done: None,
+                            })))
+                        })
+                        .collect(),
+                };
+                let g200 = Group {
+                    gid: 200,
+                    children: items
+                        .iter()
+                        .skip(2)
+                        .map(|i| {
+                            PersistentCell::new(Box::new(PersistentCell::new(AnalyzeState {
+                                item: i.clone(),
+                                step: 0,
+                                done: None,
+                            })))
+                        })
+                        .collect(),
+                };
+                self.stage = Stage::Nested {
+                    groups: vec![
+                        PersistentCell::new(Box::new(PersistentCell::new(g100))),
+                        PersistentCell::new(Box::new(PersistentCell::new(g200))),
+                    ],
+                };
+            }
+            Stage::Nested { .. } => {
+                let io_ref: &Io = io;
+                let _ = self.fanout(
+                    &|m: &Machine| match &m.stage {
+                        Stage::Nested { groups } => groups.iter().collect(),
+                        _ => unreachable!("checked above"),
+                    },
+                    |mut g: OuterHandle<'_, GroupSlot, dyn VocabIo>| g.run(io_ref),
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let collected: Vec<(u32, String)> = match &self.stage {
+                    Stage::Nested { groups } => groups.iter().map(|c| c.result()).collect(),
+                    _ => unreachable!("just ran Nested"),
+                };
+                // result from the done-list AS IT WAS at Nested entry
+                // (the old semantics: the stage ids, not the gids)
+                let done_snapshot: Vec<(u32, String)> = self.done.clone();
+                let ids: Vec<String> =
+                    done_snapshot.iter().map(|(i, _)| i.to_string()).collect();
+                self.result = format!("done: {}", ids.join(","));
+                self.done.extend(collected);
+                self.stage = Stage::Done;
+            }
+            Stage::Done => {}
+        }
+    }
+}
 
-            loop {
-                h.safepoint();
-                let (h2, keep_going) = step(h, io);
-                h = h2;
-                if !keep_going {
-                    break;
-                }
+/// Drive a machine to completion under the root task; returns the
+/// final node (read back from the caller's cell).
+fn drive(machine: Machine, io: &Io) -> Machine {
+    let mut root: PersistentCell<Box<PersistentCell<Machine>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(machine)));
+    independent_task_root(
+        &mut root,
+        |mut outer: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn VocabIo>, _ck| loop {
+            outer.run(io);
+            let done = matches!(
+                outer.machine().map(|inner| &inner.stage),
+                Some(Stage::Done)
+            );
+            if done {
+                break;
             }
-
-            stop.store(true, Ordering::SeqCst);
-            while h.is_stop_requested() {
-                h.safepoint();
-            }
-            if let Some((t, _)) = timer {
-                if let Err(payload) = t.join() {
-                    std::panic::resume_unwind(payload);
-                }
-            }
-            // Snapshot the final state out of the node through the handle.
-            let out: Machine = h.clone();
-            out
-        })
-    })
+        },
+    );
+    (***root).clone()
 }
 
 fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -297,162 +324,119 @@ fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 fn save_restore_roundtrip() {
+    let _deadline = deadline::Deadline::start();
+
     let (_g, dir) = tempdir();
     let path = dir.join("snap.json");
     let m = Machine {
         items: (1..=3).map(|id| WorkItem { id, steps: 2 }).collect(),
-        ..Machine::default()
+        ..Default::default()
     };
-    // Run to completion, snapshotting at the end of the pair closure.
-    let out = with_checkpoint_pair(m, |mut h, _req| {
-        loop {
-            h.safepoint();
-            let (h2, go) = step(h, &Io::new());
-            h = h2;
-            if !go {
-                break;
-            }
-        }
-        // Mutator-side save at a safepoint: no handshake, cannot block.
-        snapshot::save_handle(&h, &path).expect("save at end");
-        h.clone()
-    });
+    let out = drive(m.clone(), &Io::new());
+    assert_eq!(out.result, "done: 1,2,3", "{}", out.result);
+    // Mutator-side save of the completed node; restore must agree.
+    let mut root: PersistentCell<Box<PersistentCell<Machine>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(out.clone())));
+    independent_task_root(
+        &mut root,
+        |_outer: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn VocabIo>, _ck| {},
+    );
+    snapshot::write_value(&(**root), &path).expect("write");
     let restored: Machine = snapshot::restore_from(&path).expect("restore");
     assert_eq!(out.done, restored.done);
     assert_eq!(restored.result, out.result);
 }
 
+/// The mid-fan-out snapshot + resume: two children complete and hold,
+/// two hold before their first step; the snapshot fires between; the
+/// resumed run must NOT rerun the finished children.
 #[test]
 fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
+    let _deadline = deadline::Deadline::start();
+
     let (_g, dir) = tempdir();
     let path = dir.join("mid.json");
 
-    // Deterministic mid-fan-out moment: children 1-2 run to completion and
-    // then hold; children 3-4 hold before their first step. The snapshot
-    // fires in between (2 done, 2 not started), gated by a barrier the
-    // snapper releases after its first successful write.
     let snap_taken = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let snap_taken_ref = &snap_taken;
-    // The snapper must not fire before BOTH early children finished.
-    let early_done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let early_done = Arc::new(AtomicUsize::new(0));
     let early_done_ref = &early_done;
     let slow_io = Io { step_delay: Duration::from_millis(1), ..Io::new() };
 
     let m = Machine {
-        items: (1..=4).map(|id| WorkItem { id, steps: 6 }).collect(),
-        ..Machine::default()
+        items: (1..=4).map(|id| WorkItem { id, steps: WORK_STEPS_PER_ITEM }).collect(),
+        ..Default::default()
     };
-    with_checkpoint_pair(m, |mut h, req| {
-        std::thread::scope(|scope| {
-            let path2 = path.clone();
-            let snapper = scope.spawn(move || {
-                // ONE snapshot, taken while the barrier holds the children
-                // mid-fan-out — AFTER both early children finished, and
-                // before the late ones start. The file must keep exactly
-                // that state, so the snapper exits after the write.
-                while early_done_ref.load(Ordering::SeqCst) < 2 {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                while !snapshot::try_save_requester(&req, &path2, Duration::from_millis(50))? {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                snap_taken_ref.store(true, Ordering::SeqCst);
-                Ok::<_, std::io::Error>(())
-            });
-            // Seq stage up to Scatter — hand-rolled: `step` would run the
-            // fan-outs internally, bypassing this test's barrier action.
+    let mut root: PersistentCell<Box<PersistentCell<Machine>>> =
+        PersistentCell::new(Box::new(PersistentCell::new(m)));
+    independent_task_root(
+        &mut root,
+        |mut h: OuterHandle<'_, Box<PersistentCell<Machine>>, dyn VocabIo>,
+         req: Checkpointer<'_, Box<PersistentCell<Machine>>>| {
+            // Seq to Scatter: run transitions until the stage flips
             loop {
-                h.safepoint();
-                let advanced = {
-                    let m = &mut *h;
-                    match &mut m.stage {
-                        Stage::Seq { step } if (*step as usize) < m.items.len() => {
-                            *step += 1;
-                            true
-                        }
-                        Stage::Seq { .. } => {
-                            m.stage = Stage::Scatter {
-                                children: m
-                                    .items
-                                    .iter()
-                                    .map(|i| AnalyzeState {
-                                        item: i.clone(),
-                                        step: 0,
-                                        done: None,
-                                    })
-                                    .collect(),
-                            };
-                            true
-                        }
-                        _ => false,
-                    }
-                };
-                if !advanced || matches!(h.stage, Stage::Scatter { .. }) {
+                h.run(&slow_io);
+                let at_scatter = matches!(
+                    h.machine().map(|inner| &inner.stage),
+                    Some(Stage::Scatter { .. })
+                );
+                if at_scatter {
                     break;
                 }
             }
-            // Scatter fan-out with the barrier action.
-            if matches!(h.stage, Stage::Scatter { .. }) {
-                h.fanout(
-                    &|mm: &mut Machine| match &mut mm.stage {
-                        Stage::Scatter { children } => children.iter_mut().collect(),
-                        _ => unreachable!(),
+            std::thread::scope(|scope| {
+                let path2 = path.clone();
+                let req2 = req.clone();
+                let snapper = scope.spawn(move || {
+                    while early_done_ref.load(Ordering::SeqCst) < 2 {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    while !snapshot::try_save_requester(&req2, &path2, Duration::from_millis(50))? {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    snap_taken_ref.store(true, Ordering::SeqCst);
+                    Ok::<_, std::io::Error>(())
+                });
+                // the barrier-aware Scatter: the vocab machine is in
+                // Scatter now; run its fan-out by hand with the barrier
+                let io_ref: &Io = &slow_io;
+                let Some(inner) = h.machine() else { unreachable!("the root IS the machine") };
+                let _ = inner.fanout(
+                    &|mm: &Machine| match &mm.stage {
+                        Stage::Scatter { children } => children.iter().collect(),
+                        _ => unreachable!("checked above"),
                     },
-                    |mut a| {
-                        let early = a.item.id <= 2;
-                        if early {
-                            // Complete ALL steps first…
-                            for _ in 0..a.item.steps {
-                                a.safepoint();
-                                slow_io.step(a.item.id);
-                                a.safepoint();
-                                a.step += 1;
-                            }
-                            a.done = Some(format!("v{}", a.item.id));
-                            let _prev = early_done_ref.fetch_add(1, Ordering::SeqCst);
-                        }
-                        // …then everyone holds until the snapshot fired.
-                        while !snap_taken_ref.load(Ordering::SeqCst) {
-                            std::thread::sleep(Duration::from_millis(1));
-                            a.safepoint();
-                        }
-                        if !early {
-                            // Not-started children now run AFTER the snapshot.
-                            run_analyze(a, &slow_io);
-                        }
+                    |mut a: OuterHandle<'_, AnalyzeSlot, dyn VocabIo>| {
+                        a.barrier_run(io_ref, snap_taken_ref, early_done_ref);
                     },
-                );
-            }
-            let _ = snapper.join().expect("snapshotter");
-        });
-    });
+                )
+                .expect("the cycle breaker does not fire in this scenario");                let _ = snapper.join().expect("snapshotter");
+            });
+        },
+    );
 
-    // The snapshot exists (the barrier guarantees at least one write) and
-    // records exactly two children finished.
+    // The snapshot records exactly two children finished.
     let snap: Machine = snapshot::restore_from(&path).expect("snapshot parses");
     let unfinished_at_snap: usize = match &snap.stage {
-        Stage::Scatter { children } => {
-            children.iter().filter(|c| c.done.is_none()).count()
-        }
+        Stage::Scatter { children } => children.iter().filter(|c| c.done.is_none()).count(),
         other => unreachable!("snapshot should catch the Scatter stage, got {other:?}"),
     };
     assert_eq!(unfinished_at_snap, 2, "2 done + 2 not started at snapshot");
 
-    // RESUME from the mid-flight snapshot and run to completion.
+    // RESUME and run to completion.
     let io2 = Io::new();
-    let resumed = drive(snap, &io2, None);
+    let resumed = drive(snap, &io2);
     let mut ids: Vec<u32> = resumed.done.iter().map(|(i, _)| *i).collect();
     ids.sort();
     assert_eq!(ids, vec![1, 2, 3, 4, 100, 200], "{}", resumed.result);
 
-    // THE PROPERTY: children already done at snapshot time were NOT
-    // re-run — zero IO for them. The unfinished children run ≤ 6 steps
-    // each; the Nested stage (fresh machines, 4 children × 6 steps) is
-    // the only other IO the resumed run performs.
+    // THE PROPERTY: finished children were NOT rerun.
     let calls = io2.calls.load(Ordering::SeqCst);
-    let bound = unfinished_at_snap * 6 + 4 * 6;
+    let bound = unfinished_at_snap * WORK_STEPS_PER_ITEM as usize + 4 * WORK_STEPS_PER_ITEM as usize;
     assert!(
         calls <= bound,
         "resume must skip finished children: {calls} calls, bound {bound}"
     );
 }
+
+
