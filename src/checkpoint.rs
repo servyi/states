@@ -148,23 +148,10 @@ impl Drop for ClaimGuard {
 /// rejects, which cut off most Miri runs of the contending tests (8 of
 /// 8 clean now, both models).
 fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
-    for _ in 0..CLAIM_SPIN_ROUNDS {
-        match claims.try_entry(key) {
-            // another thread is mid-operation on this shard: a spin, not
-            // a park — the holder lets go within one map operation
-            None => std::hint::spin_loop(),
-            Some(dashmap::Entry::Vacant(v)) => {
-                let _occupied = v.insert(());
-                return true;
-            }
-            // held by another chain: not claimed. The caller backs off —
-            // through the library's own park, where a checkpoint reaches it.
-            Some(dashmap::Entry::Occupied(_)) => return false,
-        }
-    }
-    // the shard stayed busy for the whole spin: reported as not claimed,
-    // and the caller's backoff (its own park) takes over
-    false
+    // FAULT (negative control): every claim is granted — a held or
+    // contended key reads as free, so nothing ever serializes.
+    let _ = (claims, key);
+    true
 }
 
 /// A container slot whose current node a snapshot can read: one
