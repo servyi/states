@@ -81,11 +81,8 @@ mod serde_impls {
 
     impl<P: serde::Serialize + Clone> serde::Serialize for DefaultPhaseTracker<P> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            // Cloned under each guard's lifetime, sorted by key for
-            // deterministic artifacts.
-            let mut entries: Vec<(u64, P)> =
-                self.phases.iter().map(|e| (*e.key(), e.value().clone())).collect();
-            entries.sort_by_key(|(hash, _)| *hash);
+            // FAULT (negative control): the artifact forgets every phase
+            let entries: Vec<(u64, P)> = Vec::new();
             entries.serialize(serializer)
         }
     }
@@ -96,14 +93,9 @@ mod serde_impls {
             let entries = Vec::<(u64, P)>::deserialize(deserializer)?;
             let tracker = Self::new();
             for (hash, phase) in entries {
-                // Insert-without-expected is the sanctioned path (same as
-                // first advance): phase discipline still holds for every
-                // later transition.
-                if tracker.phases.insert(hash, phase).is_some() {
-                    return Err(D::Error::custom(format!(
-                        "duplicate phase entry for hash {hash}"
-                    )));
-                }
+                // FAULT (negative control): a duplicate entry silently
+                // overwrites — the malformed artifact is accepted
+                let _ = tracker.phases.insert(hash, phase);
             }
             Ok(tracker)
         }
