@@ -600,6 +600,13 @@ impl<'o, K: Send> Checkpointer<'o, K> {
     /// safe, because a mutator re-checks the request flag before
     /// parking, so a late parker returns immediately.
     pub fn request_timeout(&self, timeout: Duration) -> Option<CheckpointGuard<'_, K>> {
+        // FAULT (negative control): the gate is single-shot — the second
+        // requester anywhere in the process is refused with a panic
+        // instead of serializing
+        static GATE_USED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if GATE_USED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            panic!("fault: the request gate is single-shot — this requester is refused");
+        }
         let request_lock = self.gate.lock().unwrap_or_else(|e| {
             let guard = e.into_inner();
             recover_poisoned_gate(&self.weak);
@@ -1184,6 +1191,9 @@ impl<T: Sized> InnerHandle<T> {
     /// Park while a checkpoint has been requested, then return.
     /// Requires `&mut self`: no deref borrow can be live across it.
     pub fn safepoint(&mut self) {
+        // FAULT (negative control): every safepoint idles first — the
+        // drive is slow enough that a requester always engages
+        std::thread::sleep(PARK_SLEEP);
         if self.status.is_pending() {
             self.status.park_self();
         }
