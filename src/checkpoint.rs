@@ -953,36 +953,26 @@ unsafe impl<T: ?Sized> AsPtr for PersistentCell<T> {
 // the box: the STORED line, not the deref-fresh one. Fully general.
 // SAFETY: the raw borrow of the builtin deref place loads the
 // stored pointer itself — the box's own line, no fresh reference.
+/// The sketch's `&raw mut **this`, with the box taken by reference: the
+/// builtin box-deref place, borrowed raw. A safe function on purpose —
+/// nothing in it is unsafe, and it needs no layout knowledge.
+fn stored_line<T: ?Sized>(boxed: &mut Box<T>) -> *mut T {
+    &raw mut **boxed
+}
+
+// SAFETY: the projection is the builtin box-deref place borrowed raw —
+// the stored pointer itself, the box's own line — reached through a
+// reference to the box (its one pointer), never to the content.
 unsafe impl<T: ?Sized> AsPtr for Box<T> {
     type Target = T;
 
     unsafe fn as_ptr(this: *mut Self) -> *mut T {
-        // The sketch's `&raw mut **this` — a raw borrow of the box-deref
-        // place — cannot be spelled past this crate's two rules at once:
-        // the raw deref has to sit in an unsafe block, and a block may
-        // not carry the Box-deref layer above it. So the stored line is
-        // loaded as the raw pointer it is: a `Box<T>` IS that pointer
-        // (the layout `Box::from_raw` relies on).
-        //
-        // What matters is that the stored pointer never becomes a `Box`
-        // VALUE on the mint path: Miri retags a Box value like a
-        // reference when it crosses a call — a materialized `&mut` to
-        // the content. Measured library-free, write -> guard's read ->
-        // write, on one box:
-        //
-        //   the sketch's `&raw mut **p`              SB ok    TB ok
-        //   loaded as a raw pointer (this form)      SB ok    TB ok
-        //   `ptr::read` + `transmute`                SB FAIL  TB FAIL
-        //   a reference to the box, then `&raw mut`  SB FAIL  TB FAIL
-        //   `ptr::read` + `Box::into_raw`             SB ok    TB FAIL
-        //
-        // (`into_raw` is `(&mut **b) as *mut T` in std.)
-        let slot: *mut *mut T = this as *mut *mut T;
         // SAFETY: `this` is a live `Box` under the caller's exclusivity
-        // contract (the mint's discipline); reading its one word is the
-        // load of the stored line — nothing behind it is dereferenced,
-        // no reference is materialized.
-        unsafe { std::ptr::read(slot) }
+        // contract (the mint's discipline). The reference is to the box
+        // itself — its one pointer — never to the content; the content's
+        // line is the raw borrow of the box-deref place.
+        let boxed: &mut Box<T> = unsafe { &mut *this };
+        stored_line(boxed)
     }
 }
 
