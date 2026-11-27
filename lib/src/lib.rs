@@ -1,14 +1,36 @@
-//! The library half of the runnable sketch (issue #18, 16:38):
-//! the typing discipline — erased outer `Box<K>` reassignment through
-//! `Unsize`-witnessed handles — with no vocabulary in it.
+//! The library half of the runnable sketch: the typing discipline —
+//! erased outer `Box<K>` reassignment through `Unsize`-witnessed
+//! handles — with no vocabulary in it.
 //!
-//! Shortcut kept from the sketch (still, per the 00:09 step): the
-//! InnerHandle points at the HOLDER (the erased box slot), derefs
-//! through the holder chain onto T.
-
+//! # Soundness invariants
+//!
+//! **I1 (access paths).** The container `K`'s content may be
+//! accessed by client code ONLY through the line the library drives:
+//! the `PersistentCell`'s own `Deref`/`DerefMut` and the container's
+//! `DerefMut` they lead to. A client knows the concrete `K` and
+//! could reach its pointee in other ways — that is forbidden; every
+//! content access rides the library's line, which is the line the
+//! mint's receiver and the guard's reads share.
+//!
+//! **I2 (slot lifetime).** The client hands the library a `&` to
+//! each `PersistentCell` (the fanout split's children and the root).
+//! A sound client can never invalidate that reference: doing so
+//! requires a `&mut` to the cell proving the `&` is gone, and the
+//! library hands out no such `&mut` to client code until it is done
+//! with the subtask. Hence the backing store outlives every handle.
+//!
+//! **I4 (tree shape of borrows).** While a node is not a leaf node,
+//! no `&mut` to it exists. While a node IS a leaf node, a `&mut` to
+//! it exists only through borrowing `DerefMut` of the handle.
+//! Consequence: while all leaf nodes are in a safepoint, no `&mut`
+//! exists to any node in the tree — which lets the guard spring a
+//! fresh `&` to the root, from which non-conflicting `&` to every
+//! node can be derived (the checkpoint read side).
 #![feature(unsize)]
 
+use std::cell::UnsafeCell;
 use std::marker::{PhantomData, Unsize};
+use dashmap::DashMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::Duration;
@@ -46,6 +68,12 @@ use std::time::Duration;
 /// lookup fails, and the requester learns it is gone.
 struct Shared {
     children: Mutex<Vec<Weak<Shared>>>,
+    /// the tree-wide uniqueness registry (created at the root,
+    /// Arc-referenced from every Shared): addresses of slots
+    /// currently being driven by some subtask. Same-slot subtasks
+    /// anywhere in the tree serialize on it instead of minting
+    /// overlapping exclusive chains.
+    claims: Arc<DashMap<usize, ()>>,
     /// A checkpoint has been requested: mutators park at the next
     /// safepoint.
     pending_request: std::sync::atomic::AtomicBool,
@@ -55,6 +83,113 @@ struct Shared {
     parked: Mutex<bool>,
     park_cv: Condvar,
     resume_cv: Condvar,
+}
+
+/// Releases a global slot claim on unwind or completion — a panicked
+/// subtask must not leave its slot claimed (the tree would deadlock).
+///
+/// The release never waits inside the registry either (see
+/// [`try_claim`]): a contended shard is retried — the holder holds it
+/// for one map operation.
+struct ClaimGuard {
+    claims: Arc<DashMap<usize, ()>>,
+    key: usize,
+}
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        loop {
+            match self.claims.try_entry(self.key) {
+                // nothing is held under that key: already released
+                Some(dashmap::Entry::Vacant(_)) => break,
+                Some(dashmap::Entry::Occupied(o)) => {
+                    o.remove();
+                    break;
+                }
+                // the shard is contended: the holder lets go within one
+                // map operation
+                None => std::hint::spin_loop(),
+            }
+        }
+    }
+}
+
+/// Take `key` in the claims registry if it is free: `true` when this
+/// call claimed it.
+///
+/// A function on purpose, and NON-BLOCKING on purpose.
+///
+/// A function: a `dashmap::Entry` owns its registry shard's write lock,
+/// and the scrutinee of a `match` lives until the `match` ends — so a
+/// waiter that backed off from INSIDE
+/// `match claims.entry(key) { .. }` parked (whenever a checkpoint was
+/// requested) still holding that shard. Every other waiter with a key
+/// in that shard then blocked inside the registry, where it can never
+/// reach a safepoint, and the requester — waiting for that waiter to
+/// park — never released the first: a deadlock. Three subtasks handed
+/// the same cell, plus one checkpoint, were enough. Here the `Entry`
+/// is gone before the caller sees the result.
+///
+/// Non-blocking: a thread must never WAIT inside the registry. A
+/// contended shard is reported as "not claimed", and the caller waits
+/// in its own backoff — which is where a checkpoint reaches it. With
+/// the blocking `entry()` a contending thread instead sat in the
+/// registry's lock, able to answer nothing until the holder let go.
+fn try_claim(claims: &DashMap<usize, ()>, key: usize) -> bool {
+    for _ in 0..CLAIM_SPIN_ROUNDS {
+        match claims.try_entry(key) {
+            // another thread is mid-operation on this shard: a spin, not
+            // a park — the holder lets go within one map operation
+            None => std::hint::spin_loop(),
+            Some(dashmap::Entry::Vacant(v)) => {
+                let _occupied = v.insert(());
+                return true;
+            }
+            // held by another chain: not claimed. The caller backs off —
+            // through the library's own park, where a checkpoint reaches it.
+            Some(dashmap::Entry::Occupied(_)) => return false,
+        }
+    }
+    // the shard stayed busy for the whole spin: reported as not claimed,
+    // and the caller's backoff (its own park) takes over
+    false
+}
+/// How many times a claim re-tries a shard that another thread is in the
+/// middle of an operation on. A SPIN, never a park: the holder keeps the
+/// shard for one map operation. (Without it a transiently contended shard
+/// counts as a failed attempt and costs the caller a full backoff — which,
+/// under a slow interpreter, was enough to spend the content claim's
+/// whole window on collisions — measured in the servyi/states port's
+/// tests: 6 attempts in 100 ms, the key never held.)
+const CLAIM_SPIN_ROUNDS: usize = 4096;
+
+/// THE CONTENT CLAIM (level 2), bounded: take the claim whose key
+/// `content_address` yields, waiting while another chain holds it — but
+/// only for `CONTENT_CLAIM_WINDOW`. Unlike cell claims (which resolve
+/// when the owning subtask ends), content waits can form cross-claim
+/// cycles and intrathread self-deadlocks, so when the window runs out
+/// this gives up — the cycle breaker: the caller gets a
+/// `ContentClaimTimeout` and nothing has been minted or installed.
+///
+/// The address is asked for afresh on every attempt: the borrow it is
+/// taken through must not live across the park in `backoff_checkpoint`
+/// (no `&mut` exists to any node while the world is stopped). The key
+/// actually claimed comes back — the caller releases it when it is done.
+fn claim_content(
+    claims: &DashMap<usize, ()>,
+    shared: &Shared,
+    content_address: impl Fn() -> usize,
+) -> Result<usize, ContentClaimTimeout> {
+    let deadline = std::time::Instant::now() + CONTENT_CLAIM_WINDOW;
+    loop {
+        let key = content_address();
+        if try_claim(claims, key) {
+            return Ok(key);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(ContentClaimTimeout);
+        }
+        shared.backoff_checkpoint();
+    }
 }
 
 /// The opaque shell for `Arc<Shared>` that crosses the one public
@@ -81,10 +216,41 @@ const JOIN_POLL_INTERVAL_MS: u64 = 1;
 /// being short.
 const REQUEST_WAIT_MS: u64 = 10;
 
+/// How long a LEVEL-2 (content) claim may wait before the cycle breaker
+/// gives up. Unlike cell claims (which resolve when the owning subtask
+/// ends), content waits can form cross-claim cycles and intrathread
+/// self-deadlocks — the bounded window turns those into a deterministic
+/// `ContentClaimTimeout` instead of a silent hang.
+const CONTENT_CLAIM_WINDOW: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// The cycle breaker, as an ERROR GATE: a content claim was still held
+/// by another chain when `CONTENT_CLAIM_WINDOW` ran out — a
+/// cross-claim cycle, or an intrathread self-deadlock.
+///
+/// The call that returns it minted and installed nothing, so the tree
+/// is as it was: the caller can take a snapshot, turn the agent down,
+/// and repair it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContentClaimTimeout;
+
+/// What `ContentClaimTimeout` says.
+const CONTENT_CLAIM_TIMEOUT_MESSAGE: &str =
+    "content claim timeout: the state is still driven by another chain \
+     (cross-claim cycle or self-deadlock)";
+
+impl std::fmt::Display for ContentClaimTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(CONTENT_CLAIM_TIMEOUT_MESSAGE)
+    }
+}
+
+impl std::error::Error for ContentClaimTimeout {}
+
 impl Shared {
     fn new() -> Self {
         Shared {
             children: Mutex::new(Vec::new()),
+            claims: Arc::new(DashMap::new()),
             pending_request: std::sync::atomic::AtomicBool::new(false),
             parked: Mutex::new(false),
             park_cv: Condvar::new(),
@@ -142,6 +308,35 @@ impl Shared {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Arc::downgrade(child));
+    }
+
+    /// One backoff step for a subtask WAITING on a global claim: the
+    /// Shared is preallocated and registered before the claim loop,
+    /// so the world must be able to stop while it waits — park on a
+    /// pending request (the subtask has no children yet: it has not
+    /// minted), then a short sleep before the next attempt.
+    fn backoff_checkpoint(&self) {
+        if self.is_pending() {
+            self.park_self();
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+
+    /// A child Shared: the parking identity is its own, the claims
+    /// registry is INHERITED from the parent (tree-wide).
+    fn new_child(&self) -> Shared {
+        Shared::with_claims(Arc::clone(&self.claims))
+    }
+
+    fn with_claims(claims: Arc<DashMap<usize, ()>>) -> Self {
+        Shared {
+            children: Mutex::new(Vec::new()),
+            claims,
+            pending_request: std::sync::atomic::AtomicBool::new(false),
+            parked: Mutex::new(false),
+            park_cv: Condvar::new(),
+            resume_cv: Condvar::new(),
+        }
     }
 
     /// The registered children as Weaks, cloned under the lock and
@@ -221,47 +416,70 @@ fn recover_poisoned_gate(weak: &Weak<Shared>) {
     }
 }
 
-/// The OUTER handle: purely a type marker over the current install
-/// handle (`Box<V>`, which it knows is an `InnerHandle<T, V>`
-/// pointing at a `K`-shaped slot) — it owns NO slot. `replace` is
-/// the successor install: walk to the slot through the current
-/// inner handle's own pointer, swap the slot via
-/// `K: ReplaceAble<V>`, re-mint, and keep the fresh handle in the box.
+/// The OUTER handle: owns the TYPED slot pointer (`*mut K` —
+/// `replace`'s write target, no casting anywhere), the chain's
+/// `Shared` (identity that survives installs), and the current
+/// inner handle (`Box<V>`, which it knows is an `InnerHandle<T, V>`
+/// minted over this slot) — the dispatch surface for `Deref` to
+/// the vocabulary. `replace` is the successor install: write the K
+/// cell this handle owns, then re-mint through the replacement's
+/// `HandleAble` and keep the fresh handle in the box.
 ///
 /// The `'o` brand is unforgeable: it only arises inside
 /// [`independent_task_root`]'s higher-ranked closure, so the handle
-/// (and everything minted under it, via `fanout`'s own `'o`)
+/// (and everything minted under it, via `fanout`'s own `'n`)
 /// structurally cannot leave that call.
-pub struct OuterHandle<'o, K: ?Sized, V: ?Sized> {
+pub struct OuterHandle<'o, K: Sized, V: ?Sized> {
     current: Box<V>,
-    _slot: PhantomData<fn(*mut K, *mut V)>,
+    /// the PersistentCell cell this chain owns — `replace`'s write
+    /// target, typed at the wrapper (the container K lives inside)
+    slot: *mut PersistentCell<K>,
+    /// the chain's parking identity — passed on across installs
+    shared: Arc<Shared>,
     /// Invariant in `'o`: the brand cannot shrink to a foreign
     /// lifetime — the handle stays inside the root task.
     _brand: PhantomData<fn(&'o ()) -> &'o ()>,
 }
 
-pub struct InnerHandle<T: ?Sized, V: ?Sized> {
-    /// The K-shaped holder slot, as a fat pointer whose POINTee type
-    /// carries `+ Send` — the holder's sendability is a static part
-    /// of the pointer's own type (coercing a `*mut K` into it
-    /// requires `K: Send`), so the Send impl below needs no proof
-    /// about a K it cannot name.
-    ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
+/// The mutator-side handle: `state` (deref's target — captured at
+/// the mint from the receiver itself, so its `T` is the pointed
+/// object's own type, fixed by the dyn dispatch that minted it) and
+/// the parking `status`. It knows nothing of the slot — that is the
+/// `OuterHandle`'s business (the mutator drives, the outer installs).
+///
+/// No dispatch happens at deref time — K's `DerefMut` is consulted
+/// ONCE, at the mint. A lying custom `DerefMut` can therefore only
+/// choose WHICH honest handle is minted (whatever object it returns
+/// is dispatched on, and its type must satisfy the `Unsize<V>`
+/// judgement to be returnable at all — so `T` always matches the
+/// object); it can never produce a `T`/object mismatch.
+///
+/// K's own obligation shrinks to: not get rid of the returned
+/// pointer while the handle lives — and it cannot do so safely: the
+/// `&'x mut T` was taken out of the library's own `&'x mut K`, and
+/// the only writer of the slot while a handle lives is `replace`
+/// (on the outer), which re-mints the pair.
+pub struct InnerHandle<T: ?Sized> {
+    /// the state raw — carrying the box's STORED provenance (minted
+    /// by a raw borrow of the K's deref place, not from any materialized
+    /// `&mut`), so the persistent line's path to the allocation root
+    /// crosses no plain mutable node. Every deref mints a FRESH
+    /// reference off it; nothing persistent is ever a mutable line.
+    state: *mut T,
     status: Arc<Shared>,
-    _marker: PhantomData<fn(*mut T, *mut V)>,
+    _marker: PhantomData<fn(*mut T)>,
 }
 
-// Sound now: the pointee's type is `dyn DerefMut<..> + Send` (Send by
-// the auto trait IN the type), the status Arc is Send+Sync, and
-// T: Send crosses with it. The K itself is unreachable as a type
-// here — its sendability rode along in the pointer's type at mint.
-unsafe impl<T: ?Sized + Send, V: ?Sized> Send for InnerHandle<T, V> {}
+// Sound: the state raw is exclusively reachable through this handle
+// for its life (the mint's discipline), the status Arc is Send+Sync,
+// and T: Send crosses with it.
+unsafe impl<T: ?Sized + Send> Send for InnerHandle<T> {}
 
-// The box is the payload (an InnerHandle: its ptr's pointee is
-// `+ Send` by type, its T: Send by the HandleAble blanket); K: Send
-// mirrors the pointer's own mint requirement — the fn-pointer marker
-// would not need it, the pointee does.
-unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
+// The payload crosses threads: the box (an InnerHandle: its T: Send
+// by the HandleAble blanket), and the K cell it exclusively owns —
+// moving the outer moves the exclusive access to both, so K must be
+// Send for the pointee's sake.
+unsafe impl<'o, K: Send, V: ?Sized + Send> Send for OuterHandle<'o, K, V> {}
 
 /// The root task's checkpointing companion: knows the root only
 /// through a **Weak** (the mutator side owns the last strong `Arc` —
@@ -281,7 +499,7 @@ unsafe impl<'o, K: ?Sized + Send, V: ?Sized + Send> Send for OuterHandle<'o, K, 
 /// `OuterHandle` — it cannot leave the call either. It has no `V`:
 /// nothing V-typed crosses it, the guard derefs straight to `K`.
 pub struct Checkpointer<'o, K> {
-    slot: *mut K,
+    slot: *mut PersistentCell<K>,
     weak: Weak<Shared>,
     gate: Arc<Mutex<()>>,
     _brand: PhantomData<fn(&'o ()) -> &'o K>,
@@ -355,7 +573,7 @@ impl<'o, K: Send> Checkpointer<'o, K> {
 /// here the erasure makes the guard read-only. Dropping the guard
 /// resumes the world.
 pub struct CheckpointGuard<'a, K> {
-    slot: *mut K,
+    slot: *mut PersistentCell<K>,
     /// Some: the world is stopped under our request — the drop
     /// releases it. None: the mutator side was already gone — access
     /// is free and the drop has nothing to resume.
@@ -369,8 +587,8 @@ pub struct CheckpointGuard<'a, K> {
 }
 
 impl<K> std::ops::Deref for CheckpointGuard<'_, K> {
-    type Target = K;
-    fn deref(&self) -> &K {
+    type Target = PersistentCell<K>;
+    fn deref(&self) -> &PersistentCell<K> {
         // SAFETY: the guard exists only while the handshake proved
         // every mutator parked (or gone); the reborrow is tied to the
         // guard, so the world cannot resume underneath it.
@@ -393,11 +611,13 @@ impl<K> Drop for CheckpointGuard<'_, K> {
 /// arises only inside this higher-ranked closure, so neither handle
 /// can leave the call — the discipline is structural.
 pub fn independent_task_root<K, V: ?Sized + 'static, R>(
-    slot: &mut K,
+    slot: &mut PersistentCell<K>,
     f: impl for<'o> FnOnce(OuterHandle<'o, K, V>, Checkpointer<'o, K>) -> R,
 ) -> R
 where
-    K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
+    K: AsPtr + Sized + Send + 'static,
+    K::Target: AsPtr + 'static,
+    <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
 {
     // the raw is derived ONCE and shared by the outer's chain and the
     // checkpointer — a second `from_mut` on the same `&mut` would
@@ -405,7 +625,7 @@ where
     // SAFETY: slot is exclusively borrowed for the whole call (the
     // fn signature itself); the outer and the checkpointer die
     // before it returns.
-    let slot_ptr: *mut K = std::ptr::from_mut(slot);
+    let slot_ptr: *mut PersistentCell<K> = std::ptr::from_mut(slot);
     let outer = unsafe { OuterHandle::over_slot(slot_ptr) };
     // the Checkpointer knows the root's Shared only WEAKLY — the
     // outer's own Arc is the last strong one, so its drop IS the
@@ -419,17 +639,13 @@ where
     f(outer, checkpointer)
 }
 
-impl<'o, K: ?Sized, V: ?Sized> OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> OuterHandle<'o, K, V> {
     fn shared(&self) -> &Arc<Shared> {
-        // SAFETY: the box is an InnerHandle<_, V> (the invariant) —
-        // reading its status field through the erased view.
-        unsafe {
-            &(*(self.current.as_ref() as *const V as *const InnerHandle<(), V>)).status
-        }
+        &self.shared
     }
 }
 
-impl<'o, K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     type Target = V;
     fn deref(&self) -> &V {
         // the box is the load-bearing invariant (always an
@@ -441,7 +657,7 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::Deref for OuterHandle<'o, K, V> {
     }
 }
 
-impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
+impl<'o, K, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
     fn deref_mut(&mut self) -> &mut V {
         // SAFETY: as Deref — exclusive.
         unsafe { &mut *(self.current.as_mut() as *mut V) }
@@ -450,15 +666,17 @@ impl<'o, K: ?Sized, V: ?Sized> std::ops::DerefMut for OuterHandle<'o, K, V> {
 
 impl<'o, K, V: ?Sized + 'static> OuterHandle<'o, K, V>
 where
-    K: ReplaceAble<V> + DerefMut<Target = dyn HandleAble<V>> + Send + 'static,
+    K: AsPtr + Send + 'static,
+    K::Target: AsPtr + 'static,
+    <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
 {
     /// Mint over a live slot the driver owns (crate-internal: the
     /// root task is the only minter through here).
     ///
     /// # Safety
     ///
-    /// The `&mut` resolves validity and mint-time exclusivity by
-    /// construction; what remains:
+    /// The caller's `&mut` slot (through `independent_task_root`)
+    /// resolves validity and mint-time exclusivity; what remains:
     ///
     /// - The `K` must stay valid and live, at that address, for the
     ///   handle's whole life (the raw stored in the minted chain
@@ -473,69 +691,261 @@ where
     ///   parked (a guard's world-stopped access).
     ///
     /// The constructor establishes the `OuterHandle` invariant: the
-    /// box is a valid `InnerHandle<T, V>` produced by
-    /// `box_innerhandle` on the pointee of the `K`, and its `ptr`
-    /// derives from exactly the holder `&mut` passed on.
-    unsafe fn over_slot(slot: *mut K) -> Self
+    /// box is a valid `InnerHandle<T, V>` whose `state` is the raw
+    /// of the pointee of the `K` as stored by the box (the loaded
+    /// provenance), and the typed `slot` stored here is exactly the
+    /// `K` cell the raw was taken from.
+    unsafe fn over_slot(slot: *mut PersistentCell<K>) -> Self
     where
         K: Sized,
     {
-        // the receiver comes off the slot raw; the holder `&mut` is
-        // derived at the call — its TYPE carries the validity and
-        // mint-time exclusivity guarantees, the remaining contract
-        // stays in the safety docs
-        // SAFETY: the caller's contract above.
-        let erased: &mut dyn HandleAble<V> = unsafe { (*slot).deref_mut() };
+        // the state raw: the mint projects through RAWS ONLY — the
+        // slot's hatch, the box's stored line, the content's line. No
+        // reference is materialized anywhere on the mint path: a `&mut`
+        // here would go Unique on the first write and freeze on the
+        // guard's read, forbidding every later write through the chain
+        // (see `AsPtr`).
+        // SAFETY: the caller's contract above — the root task holds the
+        // slot exclusively for the whole call, so the projections are
+        // the only live access (as_ptr's caller obligation).
+        let target_ptr: *mut K::Target = unsafe {
+            let k_ptr = AsPtr::as_ptr(slot);
+            AsPtr::as_ptr(k_ptr)
+        };
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        // the CONTENT, bounded only by `HandleAble<V>`: the mint
+        // dispatches through that trait — never through `dyn HandleAble<V>`
+        let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
         // the chain's ORIGIN: a fresh root Shared moves in
         let shared = Arc::new(Shared::new());
-        // SAFETY: the holder is the K-shaped slot the receiver came
-        // from (the contract above); the pointee of the K is the
-        // receiver (`self`); exclusive for this chain.
-        let current =
-            unsafe { erased.box_innerhandle(&mut *slot, SharedRef(shared)) };
-        OuterHandle { current, _slot: PhantomData, _brand: PhantomData }
+        // SAFETY: the receiver came from this slot (the contract).
+        let current = unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(shared.clone())) };
+        OuterHandle { current, slot, shared, _brand: PhantomData }
     }
 
-    /// The successor install, per the sketch: walk to the slot through
-    /// the CURRENT inner handle's own pointer, swap the slot via
-    /// `K: ReplaceAble<V>`, then re-mint through the replacement's
-    /// `HandleAble` and keep the fresh inner handle in the box.
-    pub fn replace(&mut self, val: Box<dyn HandleAble<V> + 'static>) {
-        // 1) the current inner handle: the box IS one (the OuterHandle's
-        //    invariant); view it as &mut InnerHandle<(), V> to load the
-        //    pointer without naming the state type
-        // SAFETY: OuterHandle's invariant — current is always an
-        // InnerHandle<_, V> minted over a K-shaped slot; viewing it as
-        // InnerHandle<(), V> only reads the ptr field (the () never
-        // derefs — the handle is replaced, not driven, in this method).
-        let current: &mut InnerHandle<(), V> =
-            unsafe { &mut *(self.current.as_mut() as *mut V as *mut InnerHandle<(), V>) };
-        // the old handle's shared is PASSED ON to the successor — the
-        // chain's membership survives the install
-        let shared = current.status.clone();
-        // 2) load its ptr, cast it to the slot
+    /// The successor install: claim the replacement's content, write the
+    /// K cell THIS handle owns (typed — no casting), then re-mint
+    /// through the replacement's `HandleAble` and keep the fresh handle
+    /// in the box. The chain survives: the outer's `Shared` passes on to
+    /// the successor, so parking identity is untouched.
+    ///
+    /// # Errors
+    ///
+    /// `ContentClaimTimeout` when the replacement's content is still
+    /// driven by another chain after `CONTENT_CLAIM_WINDOW`. Nothing has
+    /// been written in that case — the slot and this handle are exactly
+    /// as they were.
+    pub fn replace(&mut self, mut val: K) -> Result<(), ContentClaimTimeout> {
+        // 1) THE CONTENT CLAIM, on the tree-wide registry, BEFORE
+        // anything is written. An error gate has to leave the tree as it
+        // was: with the install first, a lost claim would return from
+        // here with this handle's inner handle pointing into the old K —
+        // freed by the write.
+        //    The key is the replacement's content address as read from
+        // `val` where it stands. Content another chain can be driving is
+        // reached through a pointer inside the container (it has to be,
+        // for two containers to share it), so its address is the same
+        // here and in the slot — the key the re-mint below mints under.
+        // Content that lives inline in its container cannot be shared,
+        // so no other chain can hold a claim on it either way.
+        //    Two hops, not three: `val` IS the container, it is not
+        // behind a slot's hatch yet. No reference is materialized (see
+        // `AsPtr`).
+        // SAFETY: `val` is owned here, so the projections are the only
+        // live access (as_ptr's caller obligation).
+        let content_key: usize = {
+            let target_ptr: *mut K::Target = unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(val)) };
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+            state_raw as *const () as usize
+        };
+        let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.shared.claims);
+        let claimed = claim_content(&claims, &self.shared, || content_key)?;
+        let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: claimed };
+        // 2) the swap — plain assignment through the typed slot
         // SAFETY: the slot is live and exclusively reachable through
         // this chain (the mint's discipline; the old inner handle is
-        // about to be dropped with the box swap).
-        let slot: *mut K = current.ptr as *mut K;
-        // 3) swap the slot through ReplaceAble — the slot now HOLDS val
-        // SAFETY: as above — the write lands in the K-shaped slot the
-        // current chain exclusively owns.
-        unsafe { *slot = K::new(val) };
-        // 4) re-mint: use the HandleAble OF val — reachable through the
-        // slot it now lives in (K's own DerefMut) — to create a new
-        // InnerHandle pointing at that same slot, and assign it into
-        // the own box
-        // SAFETY: the mint's discipline over the fresh slot content;
-        // the receiver comes off the slot raw, the holder `&mut` is
-        // derived at the call.
-        let fresh: Box<V> = unsafe {
-            let erased: &mut dyn HandleAble<V> = (*slot).deref_mut();
-            erased.box_innerhandle(&mut *slot, SharedRef(shared))
+        // replaced by the re-mint below, so no stale pointer
+        // survives the write).
+        unsafe { *self.slot = PersistentCell::new(val) };
+        // 3) re-mint: use the HandleAble OF the replacement —
+        // reachable through the slot it now lives in (the slot's own
+        // AsPtr hatch, consulted once) — to mint a fresh InnerHandle
+        // over that same slot, and assign it into the own box
+        let fresh: Box<V> = {
+            // the raw hops — the slot's hatch, the box's stored line,
+            // the content's line; no reference is materialized (see
+            // `AsPtr`). SAFETY: this chain exclusively owns the slot
+            // (the mint's discipline; the old inner handle is replaced
+            // by the re-mint below), so the projections are the only
+            // live access (as_ptr's caller obligation).
+            let target_ptr: *mut K::Target = unsafe {
+                let k_ptr = AsPtr::as_ptr(self.slot);
+                AsPtr::as_ptr(k_ptr)
+            };
+            let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+            // SAFETY: the upcast raw derives from the slot's own
+            // as_ptr line; transient receiver, dies at return. It is
+            // the content itself, dispatched through `HandleAble<V>`.
+            let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
+            // SAFETY: the mint's discipline over the fresh content.
+            unsafe { erased.box_innerhandle(state_raw as *mut (), SharedRef(self.shared.clone())) }
         };
         self.current = fresh;
+        Ok(())
     }
 }
+
+/// A container the mint can project through **on raws alone** — the
+/// line the container's own `Deref`/`DerefMut` spring from. Two
+/// impls, one per shape:
+///
+/// - **`PersistentCell<T>`**: the content through the hatch — the
+///   interior-mutable line (the sound shape for erased states);
+/// - **`Box<X>`**: the *stored* line (`&raw mut **this`) — for
+///   containers whose target is itself a box.
+///
+/// The receiver is a RAW on purpose: no reference — least of all a
+/// `&mut` — is materialized anywhere on the mint path. A materialized
+/// `&mut` goes `Unique` on the first write and `Frozen` on the first
+/// foreign read (the checkpoint guard's read through the shared
+/// side), which forbids every later write through the chain's whole
+/// subtree (Tree Borrows). Raws never freeze.
+///
+/// # Safety
+///
+/// For implementors: the returned pointer must be the line the
+/// container's own `Deref`/`DerefMut` spring from — never a freshly
+/// minted reference to foreign storage — and the backing store must
+/// not be deleted until the next `&mut` method call on the container.
+/// The impl must not rely on an exclusive reference existing: the
+/// exclusivity is the CALLER's burden (the method's `unsafe` contract
+/// and the chain's discipline), not the receiver's.
+///
+/// **Coherence is structural:** these are the only library impls,
+/// and a client cannot write one for `PersistentCell` or `Box`
+/// (foreign trait, foreign type — E0210). For a CONCRETE state `T`
+/// as a slot target (`Box<T>` children), the client writes their own
+/// one-line identity impl (`unsafe impl AsPtr for MyState { type
+/// Target = MyState; unsafe fn as_ptr(this: *mut Self) -> *mut
+/// Self::Target { this } }`) — orphan-legal for their local type, and
+/// unable to overlap ours.
+pub unsafe trait AsPtr {
+    /// The line this container hands out: the store its own
+    /// `Deref`/`DerefMut` spring from.
+    type Target: ?Sized;
+
+    /// Project the container to its line, through the raw alone.
+    ///
+    /// # Safety
+    ///
+    /// The caller must hold the chain's exclusivity over the container
+    /// (the mint's discipline): no other access to the `K` may be live,
+    /// and none may be created, until the mint is done. The `&mut`
+    /// signature no longer enforces it — the raw receiver is what
+    /// keeps every reference off the mint path.
+    unsafe fn as_ptr(this: *mut Self) -> *mut Self::Target;
+}
+
+// the cell: the content through the hatch — the IM-covered line.
+// NO vocabulary bounds: the impl is fully general over the content.
+// SAFETY: the projection reads exactly the wrapper's own field — the
+// store the Deref chain springs from — never foreign storage; the
+// store lives until the next `&mut` method call on the cell. The
+// `UnsafeCell<T>` → `*mut T` cast preserves the unsize metadata —
+// `UnsafeCell<T>`'s layout is documented identical to `T` (the same
+// cast `get` performs); `addr_of_mut` computes the field's true
+// offset, and the sole field sits at offset 0.
+unsafe impl<T: ?Sized> AsPtr for PersistentCell<T> {
+    type Target = T;
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut T {
+        // SAFETY: `this` is a live `PersistentCell` under the caller's
+        // exclusivity contract (the mint's discipline); the field
+        // projection is the wrapper's own hatch.
+        unsafe { std::ptr::addr_of_mut!((*this).cell) as *mut T }
+    }
+}
+
+// the box: the STORED line, not the deref-fresh one. Fully general.
+// SAFETY: the raw borrow of the builtin deref place loads the
+// stored pointer itself — the box's own line, no fresh reference.
+unsafe impl<T: ?Sized> AsPtr for Box<T> {
+    type Target = T;
+
+    unsafe fn as_ptr(this: *mut Self) -> *mut T {
+        // SAFETY: `this` is a live `Box` under the caller's exclusivity
+        // contract; the place is the builtin box deref — the load of
+        // the stored pointer, no reference materialized.
+        unsafe { &raw mut **this }
+    }
+}
+
+/// A child node in the tree: the container `K` behind the library's
+/// own `UnsafeCell`, so **both sides of a checkpoint reach it through
+/// shared references**. The mutator's fanout only needs `&self` (the
+/// split collects `&PersistentCell<K>`), and the reader's guard sees the
+/// same wrapper — so references to the node may still exist whenever
+/// the client looks, and a client deleting or moving the container
+/// through its own interior mutability would do so while shared
+/// references to this wrapper are live: excluded, because taking the
+/// `K` out requires `&mut self` here, and no sound client code can
+/// produce that while our shared refs exist.
+///
+/// Safe surface: [`Deref`] and [`DerefMut`] (the latter through
+/// `&mut self` — exclusive on the wrapper, the ordinary interior-
+/// mutability pattern). The mint path projects through [`AsPtr`] —
+/// raws only, no reference materialized anywhere on it: a materialized
+/// `&mut` on the mint path would go `Unique` on the first write and
+/// freeze on the guard's first read (Tree Borrows), forbidding every
+/// later write through the chain.
+pub struct PersistentCell<K: ?Sized> {
+    cell: UnsafeCell<K>,
+}
+
+impl<K: Sized> PersistentCell<K> {
+    pub fn new(k: K) -> Self {
+        PersistentCell { cell: UnsafeCell::new(k) }
+    }
+}
+
+impl<K: ?Sized> PersistentCell<K> {
+    /// Adopt a boxed value as a boxed cell — the cell's single field
+    /// is `repr(transparent)`, so the layouts are identical and the
+    /// box is re-typed in place. This is the constructor for cells
+    /// over erased (`?Sized`) content: `Box<dyn ...>` in, boxed cell
+    /// out, no reallocation.
+    pub fn from_boxed(b: Box<K>) -> Box<PersistentCell<K>> {
+        // SAFETY: UnsafeCell is repr(transparent); PersistentCell's
+        // only field is the cell — layout-identical to K.
+        unsafe { std::mem::transmute(b) }
+    }
+}
+
+impl<K: ?Sized> Deref for PersistentCell<K> {
+    type Target = K;
+    fn deref(&self) -> &K {
+        // SAFETY: shared access to the cell's content — the wrapper's
+        // own UnsafeCell grants exactly this.
+        unsafe { &*self.cell.get() }
+    }
+}
+
+impl<K: ?Sized> DerefMut for PersistentCell<K> {
+    fn deref_mut(&mut self) -> &mut K {
+        // SAFETY: `&mut self` is exclusive on the wrapper — no other
+        // access can exist.
+        unsafe { &mut *self.cell.get() }
+    }
+}
+
+// The wrapper crosses threads exactly when its content does.
+unsafe impl<K: ?Sized + Send> Send for PersistentCell<K> {}
+
+// SAFETY: the cell's interior mutability is serialized by the
+// library's own discipline — the global claims registry ensures one
+// exclusive driver per slot at a time, and the checkpoints stop the
+// world — so shared references may cross threads to waiting subtasks.
+unsafe impl<K: ?Sized + Send> Sync for PersistentCell<K> {}
 
 /// The erasure vocabulary: a state type `T` whose
 /// `InnerHandle<T, V>` can be erased to `V`.
@@ -546,23 +956,22 @@ where
 /// crate; a foreign implementation would have to uphold all of the
 /// following, which the blanket implementation here carries:
 ///
-/// - `T` may implement this trait only if `InnerHandle<T, V>` can
-///   be unsized to `V` (`InnerHandle<T, V>: Unsize<V>`).
+/// - `T` may implement this trait only if `InnerHandle<T>` can
+///   be unsized to `V` (`InnerHandle<T>: Unsize<V>`).
 /// - The `Box` returned by [`HandleAble::box_innerhandle`] must be
-///   the `InnerHandle<T, V>` minted over the passed K container
-///   (its `ptr` is exactly the passed holder pointer).
+///   the `InnerHandle<T, V>` over the PASSED state raw (the blanket
+///   impl stores it verbatim).
 pub unsafe trait HandleAble<V: ?Sized>: Send {
-    /// Mint the handle over `holder`.
+    /// Mint the handle over `self`.
     ///
     /// # Safety
     ///
     /// For callers:
     ///
-    /// - The `&mut` resolves validity and mint-time exclusivity by
-    ///   construction; what remains: the K container must stay valid
-    ///   and live at that address for the returned handle's whole
-    ///   life (the raw stored in it derives from this `&mut`).
-    /// - The K container's pointee must be `self`.
+    /// - The `&mut self` receiver resolves validity and mint-time
+    ///   exclusivity by construction; what remains: the K container
+    ///   the receiver was taken from must stay valid and live at
+    ///   that address for the returned handle's whole life.
     /// - The `K` must not be reachable by shared reference from other
     ///   threads while the handle lives: its `Deref` would alias the
     ///   pointee this handle owns exclusively.
@@ -571,30 +980,24 @@ pub unsafe trait HandleAble<V: ?Sized>: Send {
     /// it is an opaque shell (`Shared` private, the field private),
     /// so no client can construct one — the method is uncallable
     /// from outside the crate.
-    unsafe fn box_innerhandle(
-        &mut self,
-        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
-        shared: SharedRef,
-    ) -> Box<V>;
+    unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V>;
 }
 
 unsafe impl<T: Send, V: ?Sized> HandleAble<V> for T
 where
-    InnerHandle<T, V>: Unsize<V>,
+    InnerHandle<T>: Unsize<V>,
 {
-    unsafe fn box_innerhandle(
-        &mut self,
-        holder: &mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static),
-        shared: SharedRef,
-    ) -> Box<V> {
-        // the raw that outlives this call — derived from the `&mut`,
-        // whose type proved validity and exclusivity at mint time
-        let ptr: *mut (dyn DerefMut<Target = dyn HandleAble<V>> + Send + 'static) =
-            std::ptr::from_mut(holder);
+    unsafe fn box_innerhandle(&mut self, state: *mut (), shared: SharedRef) -> Box<V> {
+        // T is fixed by the dispatch that landed here; the persisted
+        // raw is the PASSED one — the box's stored provenance. (Off
+        // the receiver it would sit above a plain `&mut` line that
+        // child writes turn Unique and the saves then Freeze —
+        // measured, see the thread.)
+        let raw: *mut T = state as *mut T;
         // bind at the sized type, then let the return coerce
         // Box<InnerHandle<T, V>> -> Box<V> (the Unsize where-clause).
-        let handle: Box<InnerHandle<T, V>> = Box::new(InnerHandle {
-            ptr,
+        let handle: Box<InnerHandle<T>> = Box::new(InnerHandle {
+            state: raw,
             status: shared.0,
             _marker: PhantomData,
         });
@@ -602,28 +1005,7 @@ where
     }
 }
 
-/// A holder that can REPLACE itself with a fresh value (the successor
-/// install). Anyone may implement this — the supertrait fixes the
-/// holder's shape, and the contract is ordinary `DerefMut` honesty.
-///
-/// # Safety
-///
-/// For implementors: as long as only deref operations and `&self`
-/// operations are called on the returned value, all deref operations
-/// on it must point to the pointee of the replacement argument.
-pub unsafe trait ReplaceAble<V: ?Sized>: DerefMut<Target = dyn HandleAble<V>> {
-    fn new(replacement: Box<dyn HandleAble<V> + 'static>) -> Self
-    where
-        Self: Sized;
-}
-
-unsafe impl<V: ?Sized + 'static> ReplaceAble<V> for Box<dyn HandleAble<V> + 'static> {
-    fn new(replacement: Box<dyn HandleAble<V> + 'static>) -> Self {
-        replacement
-    }
-}
-
-impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
+impl<T: Sized> InnerHandle<T> {
     /// Park while a checkpoint has been requested, then return.
     /// Requires `&mut self`: no deref borrow can be live across it.
     pub fn safepoint(&mut self) {
@@ -654,69 +1036,154 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     /// leave the callback at all — strictly stronger than branding
     /// it with the root task's `'o`, which is why fanout no longer
     /// carries an `'o` of its own.
-    pub fn fanout<K, F, R>(
+    ///
+    /// # Errors
+    ///
+    /// `ContentClaimTimeout` when a child's content is still driven by
+    /// another chain after `CONTENT_CLAIM_WINDOW` — the cycle breaker.
+    /// That child was never minted and its callback never ran; every
+    /// other child has finished by then, since the results are collected
+    /// only once all of them have.
+    ///
+    /// # Panics
+    ///
+    /// Propagates a child that panicked.
+    pub fn fanout<V: ?Sized + Send + 'static, K, F, R>(
         &mut self,
-        split: &(dyn for<'x> Fn(&'x mut T) -> Vec<&'x mut K> + Send + Sync),
+        split: &(dyn for<'x> Fn(&'x T) -> Vec<&'x PersistentCell<K>> + Send + Sync),
         f: F,
-    ) -> Vec<R>
+    ) -> Result<Vec<R>, ContentClaimTimeout>
     where
         T: Send,
-        V: Send + 'static,
-        K: DerefMut<Target = dyn HandleAble<V>> + ReplaceAble<V> + Sized + Send + 'static,
+        K: AsPtr + Sized + Send + 'static,
+        K::Target: AsPtr + 'static,
+        <K::Target as AsPtr>::Target: HandleAble<V> + 'static,
         F: for<'n> Fn(OuterHandle<'n, K, V>) -> R + Send + Sync,
         R: Send,
     {
-        // Collect offsite under the &mut node borrow (the root's
-        // conversion, the earliest point — the ROOT's pattern, which
-        // also solves the tag problem: once only raws exist, both
-        // the receiver (`&mut **raw`, a Unique DERIVED from the raw)
-        // and the holder pointer (`raw` itself) live in the same
-        // borrow stack — no sibling retag ever invalidates the other.
-        let child_raws: Vec<*mut K> = {
-            let node: &mut T = self;
-            split(node).into_iter().map(std::ptr::from_mut).collect()
+        // Collect offsite through a SHARED node borrow: the split
+        // hands out `&PersistentCell<K>` — the references may still be
+        // alive from the reader's perspective, which is exactly what
+        // excludes the client deleting the containers through sound
+        // interior mutability. The library then unsafely turns them
+        // into the mint's raws (the chain's exclusivity discipline).
+        let child_nodes: Vec<&PersistentCell<K>> = {
+            let node: &T = self;
+            split(node)
         };
-        // MINT THE BOXES: each slot becomes a Box<V> via the blanket
-        // impl — the receiver derives from the raw (one borrow
-        // stack), the holder pointer is the raw itself.
-        let boxes: Vec<Box<V>> = child_raws
+        // A shared split cannot promise uniqueness — the old `&mut`
+        // split had it from borrowck — and a 'static PersistentCell
+        // can be handed out across DIFFERENT levels and concurrent
+        // fanouts, so the check must be GLOBAL. The tree-wide claims
+        // registry (a DashMap created at the root, Arc-referenced
+        // from every Shared) serializes identical subtasks instead of
+        // dropping them: each child thread repeatedly tries to insert
+        // its slot's address with a short backoff; only after the
+        // insert succeeds does it mint and run, and the claim is
+        // released (RAII, also on unwind) when the subtask ends.
+        let claims: Arc<DashMap<usize, ()>> = Arc::clone(&self.status.claims);
+        // each child's Shared is prepared in the parent (its parking
+        // identity its own, the registry inherited); registration
+        // under the parent's lock, per the convention
+        let prepared: Vec<(&PersistentCell<K>, Arc<Shared>)> = child_nodes
             .into_iter()
-            .map(|raw| {
-                // the receiver comes off the split's raw; the holder
-                // `&mut` is derived at the call — its type carries the
-                // validity and mint-time exclusivity guarantees
-                // SAFETY: the split yielded each child exactly
-                // once, disjointly; exclusive for this mint.
-                let erased: &mut dyn HandleAble<V> = unsafe { (*raw).deref_mut() };
-                // each child gets its OWN Shared (its parking
-                // identity), weakly registered into the parent's vec
-                // — insert under the lock, release (the convention)
-                let child_shared = Arc::new(Shared::new());
+            .map(|child| {
+                let child_shared = Arc::new(self.status.new_child());
                 self.status.register_child(&child_shared);
-                // SAFETY: the holder is the child's K-shaped slot the
-                // receiver derived from; the pointee of that K is the
-                // receiver; yielded exactly once, disjointly, exclusive.
-                unsafe { erased.box_innerhandle(&mut *raw, SharedRef(child_shared)) }
+                (child, child_shared)
             })
             .collect();
-        // wrap each box in the OUTER handle (marker + current) so the
-        // callback can drive AND replace its subtree; then threads.
-        // The brand lifetime is free here — `f`'s higher-ranked bound
-        // instantiates it at the call, and its universality is what
-        // keeps the handle inside the callback.
-        let outers: Vec<OuterHandle<'_, K, V>> = boxes
-            .into_iter()
-            .map(|current| OuterHandle { current, _slot: PhantomData, _brand: PhantomData })
-            .collect();
-        // THEN THREADS: one dedicated scoped thread per outer (std, per
-        // the 23:55 step — rayon left only noise in Miri). The parent
-        // runs main's join loop: park (children first) whenever a
-        // checkpoint is requested, poll the joins between sleeps.
+        // THEN THREADS: one dedicated scoped thread per child. The
+        // parent runs main's join loop: park (children first)
+        // whenever a checkpoint is requested, poll the joins between
+        // sleeps.
         let shared = self.status.clone();
+        let f = &f;
         std::thread::scope(|scope| {
-            let mut joins = Vec::with_capacity(outers.len());
-            for o in outers {
-                joins.push(scope.spawn(|| f(o)));
+            let mut joins = Vec::with_capacity(prepared.len());
+            for (child, child_shared) in prepared {
+                let claims = Arc::clone(&claims);
+                joins.push(scope.spawn(move || -> Result<R, ContentClaimTimeout> {
+                    // THE GLOBAL CLAIM: insert-retry with a short backoff.
+                    // The Shared is preallocated and registered BEFORE
+                    // this loop — so on each failed attempt the
+                    // WAITING subtask must still answer checkpoint
+                    // requests: park here when one is pending, or a
+                    // save arriving during the backoff would deadlock
+                    // the tree (the parent waits for this subtask to
+                    // park; a bare sleep never would).
+                    let key: usize = child as *const PersistentCell<K> as usize;
+                    // the claim is taken through `try_claim`: the registry
+                    // lock is gone before the backoff (which parks)
+                    while !try_claim(&claims, key) {
+                        child_shared.backoff_checkpoint();
+                    }
+                    // release on unwind or completion — a panicked
+                    // subtask must not leave its slot claimed
+                    let _claim = ClaimGuard { claims: Arc::clone(&claims), key };
+                    // LEVEL 2 — THE CONTENT CLAIM, on the SAME map:
+                    // de-duplicate on the `AsPtr` raw of the containee
+                    // (two distinct cells holding container values that
+                    // deref to the same content — a Copy/index
+                    // container). A content duplicate WAITS, but only
+                    // briefly: unlike cell duplicates (which resolve
+                    // when the owning subtask ends), content waits can
+                    // form CROSS-CLAIM CYCLES (A holds content x wants
+                    // y; B holds y wants x) and INTRATHREAD SELF-
+                    // DEADLOCKS (a nested fanout re-claiming content
+                    // its own ancestor already holds) — so the wait is
+                    // bounded, and when the window runs out this child
+                    // gives up through the error gate: nothing is
+                    // minted, and the error returns from the fan-out.
+                    // The claim is released when this subtask returns.
+                    let content_key = claim_content(&claims, &child_shared, || {
+                        // the raw hops re-run per attempt; nothing is
+                        // driven until the claim succeeds — no reference
+                        // is materialized (see `AsPtr`).
+                        // SAFETY: the CELL claim above makes this thread
+                        // the sole driver of the slot (the mint's
+                        // discipline; as_ptr's caller obligation); the
+                        // shared-to-raw cast is the split's own hand-off.
+                        let child_ptr: *mut PersistentCell<K> =
+                            child as *const PersistentCell<K> as *mut PersistentCell<K>;
+                        let target_ptr: *mut K::Target = unsafe {
+                            let k_ptr = AsPtr::as_ptr(child_ptr);
+                            AsPtr::as_ptr(k_ptr)
+                        };
+                        let raw = unsafe { AsPtr::as_ptr(target_ptr) };
+                        raw as *const () as usize
+                    })?;
+                    let _content_claim = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
+                    // THE MINT (only after BOTH uniqueness levels):
+                    // the raw is claimed. The raw hops once more — no
+                    // reference is materialized (see `AsPtr`).
+                    // SAFETY: the claims make this thread the sole driver
+                    // of both the slot and its content; the mint's
+                    // discipline holds (as_ptr's caller obligation).
+                    let child_ptr: *mut PersistentCell<K> =
+                        child as *const PersistentCell<K> as *mut PersistentCell<K>;
+                    let target_ptr: *mut K::Target = unsafe {
+                        let k_ptr = AsPtr::as_ptr(child_ptr);
+                        AsPtr::as_ptr(k_ptr)
+                    };
+                    let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+                    // SAFETY: as above — the receiver derives from the
+                    // claimed raw; transient, dies at return. It is
+                    // the content itself, dispatched through `HandleAble<V>`.
+                    let erased: &mut <K::Target as AsPtr>::Target = unsafe { &mut *state_raw };
+                    // SAFETY: as above; the child's Shared carries the
+                    // inherited registry and the registration.
+                    let current = unsafe {
+                        erased.box_innerhandle(state_raw as *mut (), SharedRef(child_shared.clone()))
+                    };
+                    let outer = OuterHandle {
+                        current,
+                        slot: child as *const PersistentCell<K> as *mut PersistentCell<K>,
+                        shared: child_shared,
+                        _brand: PhantomData,
+                    };
+                    Ok(f(outer))
+                }));
             }
             loop {
                 if shared.is_pending() {
@@ -727,7 +1194,8 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
                 }
                 std::thread::sleep(Duration::from_millis(JOIN_POLL_INTERVAL_MS));
             }
-            // all finished: join in order, propagate a panicked child
+            // all finished: join in order. A child's error gate is the
+            // fan-out's error; a child that panicked is re-raised here.
             joins
                 .into_iter()
                 .map(|j| j.join().expect("panicked child"))
@@ -736,37 +1204,197 @@ impl<T: Sized, V: ?Sized> InnerHandle<T, V> {
     }
 }
 
-impl<T: Sized, V: ?Sized> Deref for InnerHandle<T, V> {
+impl<T: Sized> Deref for InnerHandle<T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // 1) cast into the holder (shared read path)
-        // SAFETY: exclusively-live per the HandleAble contract.
-        let holder: &dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &*self.ptr };
-        // 2) deref that into the erased view
-        let erased: &dyn HandleAble<V> = &**holder;
-        // 3) cast that into &T
-        // SAFETY: the HandleAble contract — the holder holds the `T`
-        // this handle was minted for, exclusively-live.
-        unsafe { &*(erased as *const dyn HandleAble<V> as *const T) }
+        // a FRESH reference off the stored-provenance raw — nothing
+        // persistent is ever a mutable line
+        // SAFETY: the raw is live per the mint's discipline; T is
+        // the pointed object's own type (the dispatch that minted
+        // this handle fixed them together).
+        unsafe { &*self.state }
     }
 }
 
-impl<T: Sized, V: ?Sized> DerefMut for InnerHandle<T, V> {
+impl<T: Sized> DerefMut for InnerHandle<T> {
     fn deref_mut(&mut self) -> &mut T {
-        // 1) cast into the holder
-        // SAFETY: as Deref, exclusive.
-        let holder: &mut dyn DerefMut<Target = dyn HandleAble<V>> = unsafe { &mut *self.ptr };
-        // 2) derefmut that into the erased view
-        let erased: &mut dyn HandleAble<V> = holder.deref_mut();
-        // 3) cast that into &mut T
-        // SAFETY: as Deref — exclusive, the minted-for T.
-        unsafe { &mut *(erased as *mut dyn HandleAble<V> as *mut T) }
+        // SAFETY: as Deref — exclusive, tied to `&mut self`.
+        unsafe { &mut *self.state }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A FAILED claim must not leave its registry shard locked: the
+    /// `Entry` — and with it the shard's write lock — is dropped before
+    /// `try_claim` returns. Probed with `try_entry` from the same
+    /// thread: with the shard still held, every key hashing to it would
+    /// be unlockable.
+    #[test]
+    fn a_failed_claim_leaves_no_registry_shard_locked() {
+        let claims = DashMap::new();
+        assert!(try_claim(&claims, 1), "a free key is claimed");
+        assert!(!try_claim(&claims, 1), "a taken key is not claimed twice");
+        let lockable = (0..4096).filter(|key| claims.try_entry(*key).is_some()).count();
+        assert_eq!(lockable, 4096, "some key's shard is still locked");
+    }
+
+    /// A state the vocabulary below can read through its handle.
+    struct Probe {
+        n: u32,
+    }
+
+    trait ProbeVocab: Send {
+        fn read(&mut self) -> u32;
+    }
+
+    impl ProbeVocab for InnerHandle<Probe> {
+        fn read(&mut self) -> u32 {
+            self.n
+        }
+    }
+
+    type ProbeSlot = Box<PersistentCell<Probe>>;
+
+    /// The key the content claim on `slot`'s content is taken on —
+    /// the two raw hops a claim goes through.
+    fn content_address_of(slot: &mut ProbeSlot) -> usize {
+        let target_ptr: *mut PersistentCell<Probe> = unsafe { AsPtr::as_ptr(std::ptr::addr_of_mut!(*slot)) };
+        let state_raw = unsafe { AsPtr::as_ptr(target_ptr) };
+        state_raw as *const () as usize
+    }
+
+    /// The error gate on `replace`: with the replacement's content
+    /// claimed by another chain, `replace` gives up after
+    /// `CONTENT_CLAIM_WINDOW` — and the slot and the handle are exactly
+    /// as they were: the old state is still the one installed and
+    /// driven. Once the claim is free, the replacement is installed.
+    #[test]
+    fn replace_gives_up_through_the_error_gate_and_changes_nothing() {
+        let mut root = PersistentCell::new(Box::new(PersistentCell::new(Probe { n: 1 })));
+        let (during, outcome, waited, after) = independent_task_root(
+            &mut root,
+            |mut outer: OuterHandle<'_, ProbeSlot, dyn ProbeVocab>, _checkpointer| {
+                let mut replacement = Box::new(PersistentCell::new(Probe { n: 2 }));
+                // the other chain: whoever holds the claim on the
+                // replacement's content — so TAKE the claim, and hold it
+                let claims = Arc::clone(&outer.shared.claims);
+                let key = content_address_of(&mut replacement);
+                assert!(try_claim(&claims, key), "the stand-in takes the claim");
+                let held = ClaimGuard { claims: Arc::clone(&claims), key };
+                let started = std::time::Instant::now();
+                let outcome = outer.replace(replacement);
+                let waited = started.elapsed();
+                let during = outer.read();
+                drop(held);
+                outer.replace(Box::new(PersistentCell::new(Probe { n: 2 }))).unwrap();
+                (during, outcome, waited, outer.read())
+            },
+        );
+        assert_eq!(during, 1, "a lost claim leaves the old state installed and driven");
+        assert_eq!(outcome, Err(ContentClaimTimeout));
+        assert!(waited >= CONTENT_CLAIM_WINDOW, "it waited the window first");
+        assert_eq!(after, 2, "and the replacement installs once the claim is free");
+    }
+
+    /// How often a mutator waiting for a snapshot reaches its safepoint.
+    const SNAPSHOT_POLL: std::time::Duration = std::time::Duration::from_millis(1);
+
+    /// A fan-out phase of probes, for the vocabulary below.
+    struct Phase {
+        children: Vec<PersistentCell<ProbeSlot>>,
+    }
+
+    trait PhaseVocab: Send {
+        fn fan(&mut self, ran: &std::sync::atomic::AtomicBool) -> Result<(), ContentClaimTimeout>;
+        fn park(&mut self);
+    }
+
+    impl PhaseVocab for InnerHandle<Phase> {
+        fn fan(&mut self, ran: &std::sync::atomic::AtomicBool) -> Result<(), ContentClaimTimeout> {
+            self.fanout(
+                &|phase: &Phase| phase.children.iter().collect(),
+                |mut child: OuterHandle<'_, ProbeSlot, dyn ProbeVocab>| {
+                    let saw_a_state = child.read() == 1;
+                    ran.store(saw_a_state, std::sync::atomic::Ordering::SeqCst);
+                },
+            )?;
+            Ok(())
+        }
+
+        fn park(&mut self) {
+            self.safepoint();
+        }
+    }
+
+    /// The leaf's value, read through a checkpoint guard: every layer by
+    /// its own `Deref`.
+    fn leaf_through_guard(guard: &CheckpointGuard<'_, Box<PersistentCell<Phase>>>) -> u32 {
+        // guard -> the root cell -> the box's cell -> the phase
+        let inner: &PersistentCell<Phase> = guard;
+        let phase: &Phase = inner;
+        // the child's cell -> the box's cell -> the probe
+        let child: &PersistentCell<ProbeSlot> = phase.children.first().unwrap();
+        let child_inner: &PersistentCell<Probe> = child;
+        child_inner.n
+    }
+
+    /// The error gate on `fanout`: a child whose content is claimed by
+    /// another chain is never minted — its callback does not run — and
+    /// the error returns from the fan-out. The point of the gate: the
+    /// tree is whole when the caller gets the error — a checkpoint can
+    /// still stop the world and read the leaf through the guard. Once
+    /// the claim is free, the fan-out runs.
+    #[test]
+    fn fanout_gives_up_through_the_error_gate_and_the_tree_can_still_be_snapshotted() {
+        let mut child: ProbeSlot = Box::new(PersistentCell::new(Probe { n: 1 }));
+        let content_key = content_address_of(&mut child);
+        let mut root =
+            PersistentCell::new(Box::new(PersistentCell::new(Phase { children: vec![PersistentCell::new(child)] })));
+        let ran = std::sync::atomic::AtomicBool::new(false);
+        let observed = &ran;
+        let (outcome, ran_while_claimed, snapshot, second) = independent_task_root(
+            &mut root,
+            |mut outer: OuterHandle<'_, Box<PersistentCell<Phase>>, dyn PhaseVocab>, checkpointer| {
+                // the other chain: whoever holds the claim on the child's
+                // content — so TAKE the claim, and hold it
+                let claims = Arc::clone(&outer.shared.claims);
+                assert!(try_claim(&claims, content_key), "the stand-in takes the claim");
+                let held = ClaimGuard { claims: Arc::clone(&claims), key: content_key };
+                let outcome = outer.fan(observed);
+                let ran_while_claimed = observed.load(std::sync::atomic::Ordering::SeqCst);
+                drop(held);
+                // the snapshot: from a checker thread, as a snapshotter
+                // would, while this thread keeps reaching its safepoint
+                let seen: Arc<Mutex<Option<u32>>> = Arc::new(Mutex::new(None));
+                std::thread::scope(|scope| {
+                    let checkpointer = checkpointer.clone();
+                    let reported = Arc::clone(&seen);
+                    let checker = scope.spawn(move || {
+                        let guard = checkpointer.request();
+                        let leaf = leaf_through_guard(&guard);
+                        drop(guard);
+                        *reported.lock().unwrap() = Some(leaf);
+                    });
+                    while seen.lock().unwrap().is_none() {
+                        outer.park();
+                        std::thread::sleep(SNAPSHOT_POLL);
+                    }
+                    checker.join().unwrap();
+                });
+                let snapshot = *seen.lock().unwrap();
+                let second = outer.fan(observed);
+                (outcome, ran_while_claimed, snapshot, second)
+            },
+        );
+        assert_eq!(outcome, Err(ContentClaimTimeout));
+        assert!(!ran_while_claimed, "the child's callback never ran");
+        assert_eq!(snapshot, Some(1), "and the checkpoint read the untouched leaf");
+        assert_eq!(second, Ok(()));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst), "and it runs once the claim is free");
+    }
 
     /// Two registered children, both listed in the Weak snapshot.
     #[test]
@@ -777,6 +1405,34 @@ mod tests {
         parent.register_child(&a);
         parent.register_child(&b);
         assert_eq!(parent.child_weaks().len(), 2);
+    }
+
+    /// A WAITING subtask must still answer checkpoint requests: its
+    /// backoff step parks on a pending request (or a save arriving
+    /// during the wait would deadlock the tree).
+    #[test]
+    fn backoff_parks_on_pending() {
+        let shared = Arc::new(Shared::new());
+        let saw_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let s2 = shared.clone();
+        let flag = saw_parked.clone();
+        let weak = Arc::downgrade(&shared);
+        let requester = std::thread::spawn(move || {
+            // blocks until the waiter parks
+            let _ = request_until_parked(&weak);
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            release_request(&s2); // resume the world (and the waiter)
+        });
+        // the waiting subtask's role: spin until the request is
+        // visible, then the backoff step — which must PARK (the
+        // requester's handshake only completes when it does)
+        while !shared.is_pending() {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        shared.backoff_checkpoint();
+        requester.join().expect("requester");
+        assert!(saw_parked.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!shared.is_pending(), "the world resumed");
     }
 
     /// The handshake dance, thread-to-Weak: a mutator that parks at
