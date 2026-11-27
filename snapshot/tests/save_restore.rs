@@ -14,6 +14,9 @@ use servyi_states::checkpoint::{
 };
 use servyi_states_snapshot as snapshot;
 
+#[path = "../../tests/support/deadline.rs"]
+mod deadline;
+
 /// Steps per work item in the mid-run tests.
 const WORK_STEPS_PER_ITEM: u32 = 6;
 
@@ -321,6 +324,8 @@ fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
 
 #[test]
 fn save_restore_roundtrip() {
+    let _deadline = deadline::Deadline::start();
+
     let (_g, dir) = tempdir();
     let path = dir.join("snap.json");
     let m = Machine {
@@ -347,6 +352,8 @@ fn save_restore_roundtrip() {
 /// resumed run must NOT rerun the finished children.
 #[test]
 fn snapshot_mid_fanout_resumes_without_rerunning_finished_children() {
+    let _deadline = deadline::Deadline::start();
+
     let (_g, dir) = tempdir();
     let path = dir.join("mid.json");
 

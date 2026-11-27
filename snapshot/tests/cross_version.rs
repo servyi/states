@@ -22,6 +22,9 @@ use serde::{Deserialize, Serialize};
 use servyi_states::checkpoint::InnerHandle;
 use servyi_states_snapshot as snapshot;
 
+#[path = "../../tests/support/deadline.rs"]
+mod deadline;
+
 // The old `with_checkpoint_pair` shape over the two-piece root — one
 // definition, shared with the fixtures (see the file).
 #[path = "../../cross-version-fixtures/legacy_pair.rs"]
@@ -197,6 +200,8 @@ fn drive_v2(h: &mut InnerHandle<v2::MachineV2>, io: &CountingIo) -> String {
 
 #[test]
 fn cross_version_restore_produces_prefix_state_then_fixer_completes_it() {
+    let _deadline = deadline::Deadline::start();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("cross.json");
 
@@ -251,6 +256,8 @@ fn cross_version_restore_produces_prefix_state_then_fixer_completes_it() {
 
 #[test]
 fn unfixed_prefix_state_refuses_to_run_and_reports() {
+    let _deadline = deadline::Deadline::start();
+
     // Entering the machine WITHOUT the fixer is detectable: pre-fix items
     // are skipped by the driver (treated as frozen), so the run stalls
     // with unfinished work — surfaced to the caller instead of silently

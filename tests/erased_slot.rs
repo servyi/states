@@ -16,6 +16,9 @@ use servyi_states::checkpoint::{
     HandleAble, InnerHandle, PersistentCell, independent_task_root,
 };
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// Where a leaf's value starts.
 const N_START: u32 = 0;
 /// A leaf's value after its first write.
@@ -119,6 +122,8 @@ fn read_through_guard(guard: &servyi_states::checkpoint::CheckpointGuard<'_, Era
 /// minted handle and both writes are visible.
 #[test]
 fn erased_root_and_child_run_and_checkpoint() {
+    let _deadline = deadline::Deadline::start();
+
     const LEAF_FLAG: usize = 0;
     let mut root = PersistentCell::new(erased(Phase {
         children: vec![PersistentCell::new(erased(Leaf { n: N_START, flag: Some(LEAF_FLAG) }))],
@@ -145,6 +150,8 @@ fn erased_root_and_child_run_and_checkpoint() {
 /// the REPLACEMENT's own `HandleAble`, and the fresh handle drives it.
 #[test]
 fn erased_root_is_replaced_then_driven() {
+    let _deadline = deadline::Deadline::start();
+
     let mut root = PersistentCell::new(erased(Leaf { n: N_START, flag: None }));
     let result = independent_task_root(&mut root, |mut outer, _checkpointer| {
         outer

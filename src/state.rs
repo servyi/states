@@ -265,6 +265,8 @@ mod tests {
 
     #[test]
     fn linear_machine_completes() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let mut root = PersistentCell::new(Box::new(PersistentCell::new(Context::new(
             ContextId::root(),
             Box::new(Countdown { left: LINEAR_START }),
@@ -305,6 +307,8 @@ mod tests {
     /// spawn order.
     #[test]
     fn parallel_children_run_and_return_in_spawn_order() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let hashes: Mutex<Vec<u64>> = Mutex::new(Vec::new());
         let mut phase = ParallelState::<u64, Env>::new(ContextId::root());
         for steps in WORK_STEPS {
@@ -336,6 +340,8 @@ mod tests {
 
     #[test]
     fn spawn_allocates_distinct_child_context_ids() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let parent = ContextId::root().new_child();
         let mut phase = ParallelState::<u32, Env>::new(&parent);
         let mut seen = Vec::new();
@@ -381,6 +387,8 @@ mod tests {
 
     #[test]
     fn machine_env_may_borrow_for_the_run() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let providers = Providers { label: String::from(BORROWED_LABEL) };
         let env = MachineEnv { providers: &providers };
         let mut root = PersistentCell::new(Box::new(PersistentCell::new(Context::new(

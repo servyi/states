@@ -11,6 +11,9 @@ use servyi_states::checkpoint::{
     AsPtr, InnerHandle, PersistentCell, independent_task_root,
 };
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// Where the counter starts.
 const START: u32 = 0;
 /// The write before the checkpoint — a mint `&mut` would go `Unique`
@@ -62,6 +65,8 @@ impl CountDriven for InnerHandle<Cell32> {
 /// Write, checkpoint-read, write — on a concrete slot.
 #[test]
 fn concrete_slot_write_checkpoint_write_is_tb_clean() {
+    let _deadline = deadline::Deadline::start();
+
     let mut root: PersistentCell<Box<Cell32>> = PersistentCell::new(Box::new(Cell32(START)));
     let final_value = independent_task_root::<Box<Cell32>, dyn CountDriven, u32>(
         &mut root,

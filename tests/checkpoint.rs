@@ -16,6 +16,9 @@ use servyi_states::checkpoint::{
     Checkpointer, InnerHandle, OuterHandle, PersistentCell, independent_task_root,
 };
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// Steps after which the machine holds (parks at safepoints, no
 /// progress) until released — the deterministic mid-run point.
 const HOLD_AT: usize = 6;
@@ -458,6 +461,8 @@ fn tempdir() -> (tempfile::TempDir, std::path::PathBuf) {
 /// safepoint serves the world.
 #[test]
 fn freeze_window_allows_access_then_safepoint() {
+    let _deadline = deadline::Deadline::start();
+
     let mut root: PersistentCell<Box<PersistentCell<Vec<u32>>>> =
         PersistentCell::new(Box::new(PersistentCell::new(vec![7_u32])));
     let out: Vec<u32>;
@@ -506,6 +511,8 @@ impl VecDriven for InnerHandle<Vec<u32>> {
 
 #[test]
 fn snapshotter_reads_live_tree_through_guard() {
+    let _deadline = deadline::Deadline::start();
+
     let mut root: PersistentCell<Box<PersistentCell<u32>>> =
         PersistentCell::new(Box::new(PersistentCell::new(41_u32)));
     let observed: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -570,6 +577,8 @@ impl CountDriven for InnerHandle<u32> {
 
 #[test]
 fn concurrent_requesters_serialize_instead_of_deadlocking() {
+    let _deadline = deadline::Deadline::start();
+
     let mut root: PersistentCell<Box<PersistentCell<u32>>> =
         PersistentCell::new(Box::new(PersistentCell::new(0_u32)));
     independent_task_root(
@@ -617,6 +626,8 @@ fn concurrent_requesters_serialize_instead_of_deadlocking() {
 
 #[test]
 fn full_run_with_stw_checkpoints_and_nested_fanout() {
+    let _deadline = deadline::Deadline::start();
+
     let io = Io::new();
     let machine = Machine {
         items: vec![
@@ -644,6 +655,8 @@ fn full_run_with_stw_checkpoints_and_nested_fanout() {
 
 #[test]
 fn mid_run_snapshot_resumes() {
+    let _deadline = deadline::Deadline::start();
+
     // The full-run IO count, measured (not derived): the resume assertion
     // compares against it.
     let full_io = Io::new();

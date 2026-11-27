@@ -1420,6 +1420,8 @@ mod tests {
     /// be unlockable.
     #[test]
     fn a_failed_claim_leaves_no_registry_shard_locked() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let claims = DashMap::new();
         assert!(try_claim(&claims, PROBE_KEY), "a free key is claimed");
         assert!(!try_claim(&claims, PROBE_KEY), "a taken key is not claimed twice");
@@ -1469,6 +1471,8 @@ mod tests {
     /// driven. Once the claim is free, the replacement is installed.
     #[test]
     fn replace_gives_up_through_the_error_gate_and_changes_nothing() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let mut root = PersistentCell::new(Box::new(PersistentCell::new(Probe { n: ORIGINAL })));
         let (during, outcome, waited, after) = independent_task_root(
             &mut root,
@@ -1549,6 +1553,8 @@ mod tests {
     /// claim is free, the fan-out runs.
     #[test]
     fn fanout_gives_up_through_the_error_gate_and_the_tree_can_still_be_snapshotted() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let mut child: ProbeSlot = Box::new(PersistentCell::new(Probe { n: ORIGINAL }));
         let content_key = content_address_of(&mut child);
         let mut root =
@@ -1599,6 +1605,8 @@ mod tests {
     /// Two registered children, both listed in the Weak snapshot.
     #[test]
     fn registry_lists_children() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let parent = Arc::new(Shared::new());
         let a = Arc::new(Shared::new());
         let b = Arc::new(Shared::new());
@@ -1612,6 +1620,8 @@ mod tests {
     /// during the wait would deadlock the tree).
     #[test]
     fn backoff_parks_on_pending() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let shared = Arc::new(Shared::new());
         let saw_parked = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let s2 = shared.clone();
@@ -1640,6 +1650,8 @@ mod tests {
     /// and the requester's release lets the mutator run again.
     #[test]
     fn handshake_parks_and_resumes() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let shared = Arc::new(Shared::new());
         let weak = Arc::downgrade(&shared);
         let mutator = shared.clone();
@@ -1671,6 +1683,8 @@ mod tests {
     /// instead of blocking — the real death-detection path.
     #[test]
     fn gone_mutator_never_blocks() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let weak = {
             let shared = Arc::new(Shared::new());
             Arc::downgrade(&shared)
@@ -1687,6 +1701,8 @@ mod tests {
     /// lookup itself is the skip).
     #[test]
     fn dropped_child_is_gone() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let parent = Arc::new(Shared::new());
         let transient = Arc::new(Shared::new());
         let keeper = Arc::new(Shared::new());
@@ -1709,6 +1725,8 @@ mod tests {
     /// lock releases the ownerless pending so parked mutators resume.
     #[test]
     fn poisoned_gate_recovers_stale_pending() {
+        let _deadline = crate::deadline::Deadline::start();
+
         let shared = Arc::new(Shared::new());
         let weak = Arc::downgrade(&shared);
         let gate = Arc::new(Mutex::new(()));

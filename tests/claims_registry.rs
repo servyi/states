@@ -10,6 +10,9 @@ use servyi_states::checkpoint::{
     HandleAble, InnerHandle, PersistentCell, independent_task_root,
 };
 
+#[path = "support/deadline.rs"]
+mod deadline;
+
 /// How long the subtask that WINS a contested cell keeps it, parking at
 /// its safepoints the while.
 const WINNER_RUNS_FOR: Duration = Duration::from_millis(300);
@@ -77,6 +80,8 @@ const FINISHED_POLL: Duration = Duration::from_millis(10);
 /// suite (the stuck thread is simply left behind).
 #[test]
 fn subtasks_waiting_for_a_claim_still_park_for_a_checkpoint() {
+    let _deadline = deadline::Deadline::start();
+
     let stopped = Arc::new(AtomicBool::new(false));
     let report = Arc::clone(&stopped);
     let scenario = std::thread::spawn(move || {

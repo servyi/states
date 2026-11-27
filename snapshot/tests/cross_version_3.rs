@@ -22,6 +22,9 @@
 #![allow(inline_literal)]
 use std::process::Command;
 
+#[path = "../../tests/support/deadline.rs"]
+mod deadline;
+
 struct Run {
     out: String,
     err: String,
@@ -134,6 +137,8 @@ fn build_fixture(version: u8) -> String {
 
 #[test]
 fn validator_catches_the_defects_the_manual_read_found() {
+    let _deadline = deadline::Deadline::start();
+
     // Regression proof for the structural validator itself: the OLD trace
     // shape (skip fired per loop iteration; no finish events) must FAIL
     // validation, so this class of issue can never silently pass again.
@@ -165,6 +170,8 @@ fn validator_catches_the_defects_the_manual_read_found() {
 
 #[test]
 fn path_v1_saved_by_version1_restored_by_version2() {
+    let _deadline = deadline::Deadline::start();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("a.json");
 
@@ -196,6 +203,8 @@ fn path_v1_saved_by_version1_restored_by_version2() {
 
 #[test]
 fn path_v1_saved_by_version1_restored_by_version3() {
+    let _deadline = deadline::Deadline::start();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("b.json");
 
@@ -215,6 +224,8 @@ fn path_v1_saved_by_version1_restored_by_version3() {
 
 #[test]
 fn path_v2_saved_by_version2_restored_by_version3() {
+    let _deadline = deadline::Deadline::start();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("c.json");
 
@@ -242,6 +253,8 @@ fn path_v2_saved_by_version2_restored_by_version3() {
 
 #[test]
 fn control_v3_saved_and_restored_by_version3_is_lossless() {
+    let _deadline = deadline::Deadline::start();
+
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("d.json");
 
