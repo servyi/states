@@ -414,14 +414,12 @@ fn request_until_parked(weak: &Weak<Shared>) -> Handshake {
             // until OUR release clears it
             return Handshake::Parked;
         }
-        let (guard, _) = shared
-            .park_cv
-            .wait_timeout(parked, Duration::from_millis(REQUEST_WAIT_MS))
-            .expect("parked handshake: see lock_parked's invariant");
-        // drop the guard AND the Arc before looking again — the death
-        // window is exactly this gap
-        drop(guard);
-        drop(shared);
+        // FAULT (negative control): gives up before waiting — a live
+        // mutator is reported gone, and the request is retracted so no
+        // world ever stops
+        drop(parked);
+        shared.pending_request.store(false, std::sync::atomic::Ordering::SeqCst);
+        return Handshake::Closed;
     }
 }
 
