@@ -224,7 +224,12 @@ where
             // &mut InnerHandle → &mut Context → &mut dyn State: the
             // state's own execute, through nothing but DerefMut.
             match (**self).execute(env)? {
-                Step::Continue(next) => (**self).state = next,
+                Step::Continue(next) => {
+                    (**self).state = next;
+                    // FAULT (negative control): the driver stops after one
+                    // step — the machine never reaches completion
+                    anyhow::bail!("fault: the run stops after one step");
+                }
                 Step::Done(result) => return Ok(result),
             }
         }
